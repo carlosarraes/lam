@@ -8,7 +8,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "lam", version, about = "Look At Me — queue a blocker for Carlos and wait for his answer")]
+#[command(
+    name = "lam",
+    version,
+    about = "Look At Me — queue a blocker for Carlos and wait for his answer"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -83,12 +87,26 @@ fn main() {
 
 fn run(cmd: Cmd) -> Result<i32> {
     match cmd {
-        Cmd::Init { server, token, topic } => commands::init(server, token, topic),
-        Cmd::Push { title, body, priority, choices, wait } => commands::push(title, body, priority, choices, wait),
+        Cmd::Init {
+            server,
+            token,
+            topic,
+        } => commands::init(server, token, topic),
+        Cmd::Push {
+            title,
+            body,
+            priority,
+            choices,
+            wait,
+        } => commands::push(title, body, priority, choices, wait),
         Cmd::Wait { id, timeout } => commands::wait(&id, &timeout),
         Cmd::List { all, json } => commands::list(all, json),
         Cmd::Show { id } => commands::show(&id),
-        Cmd::Done { id, choice, message } => commands::done(&id, choice, message),
+        Cmd::Done {
+            id,
+            choice,
+            message,
+        } => commands::done(&id, choice, message),
         Cmd::Dismiss { id } => commands::dismiss(&id),
         Cmd::Watch => watch::run(),
     }

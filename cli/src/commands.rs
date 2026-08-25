@@ -18,12 +18,24 @@ fn print_json(v: &impl serde::Serialize) -> Result<()> {
 }
 
 pub fn init(server: String, token: String, topic: String) -> Result<i32> {
-    let path = Config { server, token, topic, ntfy: None }.save()?;
+    let path = Config {
+        server,
+        token,
+        topic,
+        ntfy: None,
+    }
+    .save()?;
     eprintln!("wrote {}", path.display());
     Ok(0)
 }
 
-pub fn push(title: String, body: String, priority: String, choices: Vec<String>, wait: bool) -> Result<i32> {
+pub fn push(
+    title: String,
+    body: String,
+    priority: String,
+    choices: Vec<String>,
+    wait: bool,
+) -> Result<i32> {
     if choices.len() > 3 {
         bail!("at most 3 choices");
     }
@@ -51,7 +63,9 @@ fn project_name() -> String {
         .find(|p| p.join(".git").exists())
         .map(|p| p.to_path_buf())
         .unwrap_or(cwd);
-    root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    root.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 pub fn parse_duration(s: &str) -> Result<Duration> {
@@ -67,7 +81,11 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
 }
 
 fn exit_for(item: &Item) -> i32 {
-    if item.status == "dismissed" { EXIT_DISMISSED } else { EXIT_RESOLVED }
+    if item.status == "dismissed" {
+        EXIT_DISMISSED
+    } else {
+        EXIT_RESOLVED
+    }
 }
 
 pub fn wait(id: &str, timeout: &str) -> Result<i32> {
@@ -101,8 +119,24 @@ pub fn list(all: bool, json: bool) -> Result<i32> {
             .cloned()
             .collect::<Vec<_>>()
             .join(":");
-        let answer = i.response_choice.as_deref().or(i.response_text.as_deref()).unwrap_or("");
-        println!("{:<6} {:<9} {:<8} {:<24} {}{}", i.id, i.status, i.priority, src, i.title, if answer.is_empty() { String::new() } else { format!(" → {answer}") });
+        let answer = i
+            .response_choice
+            .as_deref()
+            .or(i.response_text.as_deref())
+            .unwrap_or("");
+        println!(
+            "{:<6} {:<9} {:<8} {:<24} {}{}",
+            i.id,
+            i.status,
+            i.priority,
+            src,
+            i.title,
+            if answer.is_empty() {
+                String::new()
+            } else {
+                format!(" → {answer}")
+            }
+        );
     }
     Ok(0)
 }
@@ -113,7 +147,13 @@ pub fn show(id: &str) -> Result<i32> {
 }
 
 pub fn done(id: &str, choice: Option<String>, message: Option<String>) -> Result<i32> {
-    let item = client()?.resolve(id, &Resolution { choice, text: message })?;
+    let item = client()?.resolve(
+        id,
+        &Resolution {
+            choice,
+            text: message,
+        },
+    )?;
     print_json(&item)?;
     Ok(0)
 }

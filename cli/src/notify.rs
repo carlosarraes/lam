@@ -15,7 +15,9 @@ pub fn desktop(title: &str, body: &str, critical: bool) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
         let urgency = if critical { "critical" } else { "normal" };
-        Command::new("notify-send").args(["-a", "lam", "-u", urgency, title, body]).status()?;
+        Command::new("notify-send")
+            .args(["-a", "lam", "-u", urgency, title, body])
+            .status()?;
     }
     let _ = critical;
     Ok(())

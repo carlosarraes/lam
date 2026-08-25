@@ -16,7 +16,10 @@ async fn setup() -> (MockServer, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("config.toml"),
-        format!("server = \"{}\"\ntoken = \"tok\"\ntopic = \"top\"\n", server.uri()),
+        format!(
+            "server = \"{}\"\ntoken = \"tok\"\ntopic = \"top\"\n",
+            server.uri()
+        ),
     )
     .unwrap();
     (server, dir)
@@ -40,8 +43,15 @@ async fn push_prints_id_and_sends_bearer() {
         .expect(1)
         .mount(&server)
         .await;
-    let out = lam(&dir, &["push", "hello", "-c", "yes", "-c", "no", "-p", "critical"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = lam(
+        &dir,
+        &["push", "hello", "-c", "yes", "-c", "no", "-p", "critical"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "abc12");
     let req = &server.received_requests().await.unwrap()[0];
     let body: serde_json::Value = req.body_json().unwrap();
@@ -54,7 +64,10 @@ async fn push_prints_id_and_sends_bearer() {
 #[tokio::test]
 async fn push_rejects_four_choices() {
     let (_server, dir) = setup().await;
-    let out = lam(&dir, &["push", "x", "-c", "a", "-c", "b", "-c", "c", "-c", "d"]);
+    let out = lam(
+        &dir,
+        &["push", "x", "-c", "a", "-c", "b", "-c", "c", "-c", "d"],
+    );
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("at most 3"));
 }
@@ -71,7 +84,11 @@ async fn wait_polls_until_closed_and_exits_by_status() {
         .await;
     Mock::given(method("GET"))
         .and(path("/items/abc12/wait"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(item("abc12", "resolved", Some("yes"))))
+        .respond_with(ResponseTemplate::new(200).set_body_json(item(
+            "abc12",
+            "resolved",
+            Some("yes"),
+        )))
         .mount(&server)
         .await;
     let out = lam(&dir, &["wait", "abc12"]);
@@ -95,7 +112,12 @@ async fn wait_times_out_with_exit_3() {
         .respond_with(ResponseTemplate::new(204))
         .mount(&server)
         .await;
-    assert_eq!(lam(&dir, &["wait", "slow1", "--timeout", "0s"]).status.code(), Some(3));
+    assert_eq!(
+        lam(&dir, &["wait", "slow1", "--timeout", "0s"])
+            .status
+            .code(),
+        Some(3)
+    );
 }
 
 #[tokio::test]
@@ -103,12 +125,20 @@ async fn done_and_list() {
     let (server, dir) = setup().await;
     Mock::given(method("POST"))
         .and(path("/items/abc12/resolve"))
-        .and(body_json(serde_json::json!({ "choice": "yes", "text": "because" })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(item("abc12", "resolved", Some("yes"))))
+        .and(body_json(
+            serde_json::json!({ "choice": "yes", "text": "because" }),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(item(
+            "abc12",
+            "resolved",
+            Some("yes"),
+        )))
         .expect(1)
         .mount(&server)
         .await;
-    assert!(lam(&dir, &["done", "abc12", "yes", "-m", "because"]).status.success());
+    assert!(lam(&dir, &["done", "abc12", "yes", "-m", "because"])
+        .status
+        .success());
 
     Mock::given(method("GET"))
         .and(path("/items"))

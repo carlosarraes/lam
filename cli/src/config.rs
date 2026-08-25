@@ -17,7 +17,10 @@ impl Config {
         if let Ok(p) = std::env::var("LAM_CONFIG") {
             return Ok(PathBuf::from(p));
         }
-        Ok(dirs::config_dir().context("no config dir")?.join("lam").join("config.toml"))
+        Ok(dirs::config_dir()
+            .context("no config dir")?
+            .join("lam")
+            .join("config.toml"))
     }
 
     pub fn load() -> Result<Self> {
@@ -52,7 +55,8 @@ mod tests {
 
     #[test]
     fn parses_and_normalizes() {
-        let c = Config::parse("server = \"https://x.dev/\"\ntoken = \"t\"\ntopic = \"top\"\n").unwrap();
+        let c =
+            Config::parse("server = \"https://x.dev/\"\ntoken = \"t\"\ntopic = \"top\"\n").unwrap();
         assert_eq!(c.server, "https://x.dev");
         assert_eq!(c.ntfy_url(), "https://x.dev");
         let c = Config::parse("server = \"https://x.dev\"\ntoken = \"t\"\ntopic = \"top\"\nntfy = \"https://n.io/\"\n").unwrap();

@@ -41,6 +41,7 @@ pub struct Resolution {
     pub text: Option<String>,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum Wait {
     Closed(Item),
     Pending,
@@ -62,11 +63,15 @@ impl Client {
     }
 
     fn get(&self, path: &str) -> RequestBuilder {
-        self.http.get(format!("{}{}", self.base, path)).bearer_auth(&self.token)
+        self.http
+            .get(format!("{}{}", self.base, path))
+            .bearer_auth(&self.token)
     }
 
     fn post(&self, path: &str) -> RequestBuilder {
-        self.http.post(format!("{}{}", self.base, path)).bearer_auth(&self.token)
+        self.http
+            .post(format!("{}{}", self.base, path))
+            .bearer_auth(&self.token)
     }
 
     fn ok(res: Response) -> Result<Response> {
@@ -104,10 +109,20 @@ impl Client {
     }
 
     pub fn resolve(&self, id: &str, res: &Resolution) -> Result<Item> {
-        Ok(Self::ok(self.post(&format!("/items/{id}/resolve")).json(res).send()?)?.json()?)
+        Ok(Self::ok(
+            self.post(&format!("/items/{id}/resolve"))
+                .json(res)
+                .send()?,
+        )?
+        .json()?)
     }
 
     pub fn dismiss(&self, id: &str) -> Result<Item> {
-        Ok(Self::ok(self.post(&format!("/items/{id}/dismiss")).json(&()).send()?)?.json()?)
+        Ok(Self::ok(
+            self.post(&format!("/items/{id}/dismiss"))
+                .json(&())
+                .send()?,
+        )?
+        .json()?)
     }
 }
