@@ -34,7 +34,10 @@ pub fn run() -> Result<i32> {
                     let Ok(line) = line else { break };
                     if let Ok(ev) = serde_json::from_str::<NtfyEvent>(&line) {
                         if ev.event == "message" {
-                            let _ = notify::desktop(&ev.title, &ev.message, ev.priority >= 5);
+                            eprintln!("lam watch: {}", ev.title);
+                            if let Err(e) = notify::desktop(&ev.title, &ev.message, ev.priority >= 5) {
+                                eprintln!("lam watch: notify failed: {e}");
+                            }
                         }
                     }
                 }
