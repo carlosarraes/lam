@@ -3,22 +3,22 @@
 Agents queue blockers; Carlos answers from phone or PC; agents read the answer back.
 
 ```
-agent ──lam push──▶ lam-api (CF Worker + D1) ──▶ ntfy.sh ──▶ phone (buttons) / `lam watch` (desktop)
-  ▲                       ▲                                          │
-  └──── lam wait ─────────┴──────── button / reply page / lam done ──┘
+agent ──lam push──▶ lam-api (CF Worker: Effect + D1 + Topic DO) ──ntfy protocol──▶ ntfy app on phone / `lam watch` on desktop
+  ▲                       ▲                                                                   │
+  └──── lam wait ─────────┴─────────────── button / reply page / lam done ────────────────────┘
 ```
 
 ## Layout
 
-- `worker/` — Cloudflare Worker (Hono, D1). `npm test`, `npm run deploy`.
+- `worker/` — Cloudflare Worker written with Effect (`@effect/platform` HttpRouter, `Effect.Service`s, Schema). D1 holds items; a `Topic` Durable Object serves an ntfy-compatible topic (publish, `/json` stream, `/ws`, `?poll=1&since=`) so no ntfy.sh account is needed. `npm test`, `npm run deploy`.
 - `cli/` — Rust CLI. `cargo test`, `cargo build --release`.
 - `skill/lam/` — agent-facing skill; symlink into `~/.claude/skills/lam`.
 
 ## Setup
 
-1. Worker: `cd worker && npx wrangler deploy && npx wrangler d1 migrations apply lam --remote`, then `wrangler secret put` for `LAM_TOKEN`, `LAM_HMAC_SECRET`, `NTFY_TOPIC`, `NTFY_TOKEN` (ntfy.sh account token — required, Workers' shared egress IPs exhaust the anonymous quota).
-2. CLI: `lam init --server https://lam-api.<acct>.workers.dev --token <LAM_TOKEN> --topic <NTFY_TOPIC>` → `~/.config/lam/config.toml`.
-3. Phone: ntfy app, subscribe to the topic.
+1. Worker: `cd worker && npx wrangler deploy && npx wrangler d1 migrations apply lam --remote`, then `printf %s '<value>' | npx wrangler secret put <NAME>` for `LAM_TOKEN`, `LAM_HMAC_SECRET`, `NTFY_TOPIC` (an unguessable topic name — it is the only access control on the topic).
+2. CLI: `lam init --server https://lam-api.<acct>.workers.dev --token <LAM_TOKEN> --topic <NTFY_TOPIC>` → `~/.config/lam/config.toml` (`~/Library/Application Support/lam/` on macOS).
+3. Phone: install the ntfy app (Play/F-Droid), *Add subscription* → topic `<NTFY_TOPIC>` → *Use another server* → `https://lam-api.<acct>.workers.dev`. No account. The app keeps one streaming connection ("instant delivery").
 4. Desktop: run `lam watch` (systemd user unit / launchd).
 
 ## CLI

@@ -24,7 +24,7 @@ fn default_priority() -> u8 {
 /// Tails the ntfy topic's JSON stream forever, mirroring each message to the desktop.
 pub fn run() -> Result<i32> {
     let cfg = Config::load()?;
-    let url = format!("{}/{}/json", cfg.ntfy, cfg.topic);
+    let url = format!("{}/{}/json", cfg.ntfy_url(), cfg.topic);
     let http = reqwest::blocking::Client::builder().timeout(None).build()?;
     eprintln!("lam watch: {url}");
     loop {

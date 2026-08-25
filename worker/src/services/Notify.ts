@@ -1,0 +1,50 @@
+import { Effect } from "effect";
+import type { Item, Priority } from "../domain/Item";
+import type { Draft } from "../ntfy/message";
+import { Auth } from "./Auth";
+import { TopicClient } from "./TopicClient";
+
+const NTFY_PRIORITY: Record<Priority, number> = { low: 2, normal: 3, critical: 5 };
+
+const source = (item: Item) => [item.source_host, item.source_project].filter(Boolean).join(":");
+
+/** Turns item lifecycle events into pushes on the topic. */
+export class Notify extends Effect.Service<Notify>()("lam/Notify", {
+  effect: Effect.gen(function* () {
+    const auth = yield* Auth;
+    const topic = yield* TopicClient;
+    const publish = (draft: Draft) =>
+      topic.publish(draft).pipe(Effect.asVoid, Effect.tapError((e) => Effect.logError("publish failed", e)), Effect.ignore);
+
+    return {
+      itemCreated: (item: Item, baseUrl: string) =>
+        Effect.gen(function* () {
+          const t = yield* auth.itemToken(item.id);
+          const actions: Draft["actions"] = (item.choices.length ? item.choices : ["Done"]).map((c) => ({
+            action: "http",
+            label: c,
+            url: `${baseUrl}/a/${item.id}/${encodeURIComponent(c)}?t=${t}`,
+            clear: true,
+          }));
+          actions.push({ action: "view", label: "Reply", url: `${baseUrl}/r/${item.id}?t=${t}`, clear: true });
+          const src = source(item);
+          yield* publish({
+            title: `${item.title} [${item.id}]`,
+            message: [src && `(${src})`, item.body].filter(Boolean).join("\n") || item.title,
+            priority: NTFY_PRIORITY[item.priority],
+            tags: [item.priority === "critical" ? "rotating_light" : "eyes"],
+            actions,
+          });
+        }),
+
+      itemClosed: (item: Item) =>
+        publish({
+          title: `${item.title} [${item.id}]`,
+          message: `${item.status} via ${item.response_by}: ${item.response_choice ?? item.response_text ?? item.status}`,
+          priority: 1,
+          tags: ["white_check_mark"],
+        }),
+    };
+  }),
+  dependencies: [Auth.Default, TopicClient.Default],
+}) {}

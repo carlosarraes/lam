@@ -9,7 +9,7 @@ export default defineConfig(async () => {
       cloudflareTest({
         wrangler: { configPath: "./wrangler.jsonc" },
         miniflare: {
-          bindings: { TEST_MIGRATIONS: migrations, LAM_TOKEN: "test-token", LAM_HMAC_SECRET: "test-secret", NTFY_TOPIC: "test-topic", NTFY_TOKEN: "tk_test" },
+          bindings: { TEST_MIGRATIONS: migrations, LAM_TOKEN: "test-token", LAM_HMAC_SECRET: "test-secret", NTFY_TOPIC: "test-topic" },
         },
       }),
     ],

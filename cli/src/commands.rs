@@ -18,7 +18,7 @@ fn print_json(v: &impl serde::Serialize) -> Result<()> {
 }
 
 pub fn init(server: String, token: String, topic: String) -> Result<i32> {
-    let path = Config { server, token, topic, ntfy: "https://ntfy.sh".into() }.save()?;
+    let path = Config { server, token, topic, ntfy: None }.save()?;
     eprintln!("wrote {}", path.display());
     Ok(0)
 }

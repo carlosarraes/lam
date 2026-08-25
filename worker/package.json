@@ -15,6 +15,7 @@
     "wrangler": "^4.125.0"
   },
   "dependencies": {
-    "hono": "^4.13.4"
+    "@effect/platform": "^0.97.1",
+    "effect": "^3.22.1"
   }
 }
