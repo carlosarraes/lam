@@ -49,7 +49,7 @@ deploy HOST: build
         rsync -aq --delete --exclude target --exclude node_modules --exclude .wrangler --exclude .dev.vars --exclude .git ./ {{HOST}}:.cache/lam-src/
         ssh -o BatchMode=yes {{HOST}} 'export PATH="$HOME/.cargo/bin:$PATH"; cd ~/.cache/lam-src/cli && cargo build --release -q && cp target/release/{{binary}} ~/.local/bin/{{binary}}'
     fi
-    rsync -aq --delete skill/lam/ {{HOST}}:.claude/skills/lam/
+    tar -C skill -cf - lam | ssh -o BatchMode=yes {{HOST}} 'rm -rf ~/.claude/skills/lam && tar -C ~/.claude/skills -xf -' 
     case "$remote" in
         Darwin*) cfg='Library/Application Support/lam' ;;
         *)       cfg='.config/lam' ;;
