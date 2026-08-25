@@ -54,6 +54,7 @@ describe("POST /items", () => {
     const captured = ntfyCalls.at(-1)!;
     expect(captured.headers.title).toBe(`PR 42 [${item.id}]`);
     expect(captured.headers.priority).toBe("5");
+    expect(captured.headers.authorization).toBe("Bearer tk_test");
     const t = await itemToken("test-secret", item.id);
     expect(captured.headers.actions).toBe(
       `http, waive, http://lam/a/${item.id}/waive?t=${t}, clear=true; http, require, http://lam/a/${item.id}/require?t=${t}, clear=true; view, Reply, http://lam/r/${item.id}?t=${t}, clear=true`,

@@ -33,6 +33,7 @@ export interface Env {
   LAM_HMAC_SECRET: string;
   NTFY_TOPIC: string;
   NTFY_URL?: string;
+  NTFY_TOKEN?: string;
 }
 
 export const PRIORITIES: Priority[] = ["low", "normal", "critical"];
