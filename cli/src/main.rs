@@ -14,8 +14,22 @@ use clap::{Parser, Subcommand};
     about = "Look At Me — queue a blocker for Carlos and wait for his answer"
 )]
 struct Cli {
+    /// Print the usage guide written for AI agents (same content as the `lam` skill)
+    #[arg(long)]
+    llm: bool,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
+}
+
+const SKILL: &str = include_str!("../../skill/lam/SKILL.md");
+
+/// The skill's markdown body without its YAML frontmatter.
+fn llm_guide() -> &'static str {
+    SKILL
+        .strip_prefix("---")
+        .and_then(|rest| rest.split_once("\n---\n"))
+        .map(|(_, body)| body.trim_start())
+        .unwrap_or(SKILL)
 }
 
 #[derive(Subcommand)]
@@ -75,7 +89,16 @@ enum Cmd {
 
 fn main() {
     let cli = Cli::parse();
-    let code = match run(cli.cmd) {
+    if cli.llm {
+        print!("{}", llm_guide());
+        std::process::exit(0);
+    }
+    let Some(cmd) = cli.cmd else {
+        use clap::CommandFactory;
+        Cli::command().print_help().ok();
+        std::process::exit(2);
+    };
+    let code = match run(cmd) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("lam: {e:#}");
@@ -109,5 +132,18 @@ fn run(cmd: Cmd) -> Result<i32> {
         } => commands::done(&id, choice, message),
         Cmd::Dismiss { id } => commands::dismiss(&id),
         Cmd::Watch => watch::run(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn llm_guide_strips_frontmatter() {
+        let g = llm_guide();
+        assert!(g.starts_with("# lam"), "{g}");
+        assert!(!g.contains("description:"));
+        assert!(g.contains("lam push"));
     }
 }

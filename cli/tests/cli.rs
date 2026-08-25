@@ -159,3 +159,13 @@ async fn done_and_list() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("404"));
 }
+
+#[tokio::test]
+async fn llm_flag_prints_guide_without_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = lam(&dir, &["--llm"]);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("# lam"));
+    assert!(text.contains("--wait"));
+}

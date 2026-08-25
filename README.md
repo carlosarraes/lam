@@ -30,3 +30,4 @@ agent ──lam push──▶ lam-api (CF Worker: Effect + D1 + Topic DO) ──
 | `lam list [--all] [--json]`, `lam show <id>` | |
 | `lam done <id> [choice] [-m text]`, `lam dismiss <id>` | Carlos's side |
 | `lam watch` | mirror ntfy → desktop notifications |
+| `lam --llm` | print the agent guide (the `lam` skill) — for agents that don't have the skill installed |
