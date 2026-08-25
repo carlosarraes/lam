@@ -26,17 +26,18 @@ const replyPage = (id: string, title: string, t: string) => `<!doctype html><met
 <textarea name=text rows=5 autofocus style="width:100%;font:inherit"></textarea>
 <button style="margin-top:.5rem;padding:.6rem 1.2rem;font:inherit">Send</button></form>`;
 
-export const phone = HttpRouter.empty.pipe(
-  HttpRouter.get(
-    "/a/:id/:choice",
-    Effect.gen(function* () {
+// ntfy `http` action buttons POST by default; GET is kept for manual use.
+const pressButton = Effect.gen(function* () {
       const { id, choice } = yield* HttpRouter.schemaPathParams(Schema.Struct({ id: Schema.String, choice: Schema.String }));
       const label = decodeURIComponent(choice);
       const item = yield* (yield* Items).close(id, { status: "resolved", choice: label === "Done" ? undefined : label, by: "phone" });
       yield* background((yield* Notify).itemClosed(item));
       return HttpServerResponse.text(`ok: ${item.title} → ${label}`);
-    }),
-  ),
+    });
+
+export const phone = HttpRouter.empty.pipe(
+  HttpRouter.get("/a/:id/:choice", pressButton),
+  HttpRouter.post("/a/:id/:choice", pressButton),
   HttpRouter.get(
     "/r/:id",
     Effect.gen(function* () {

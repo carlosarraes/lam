@@ -76,13 +76,15 @@ describe("resolution", () => {
   it("phone button resolves with choice and publishes closed message", async () => {
     const item = await push({ title: "q", choices: ["yes", "no"] });
     const t = await itemToken("test-secret", item.id);
-    const res = await SELF.fetch(`http://lam/a/${item.id}/yes?t=${t}`);
+    // the ntfy app sends http actions as POST
+    const res = await SELF.fetch(`http://lam/a/${item.id}/yes?t=${t}`, { method: "POST" });
     expect(res.status).toBe(200);
     const got = await (await SELF.fetch(`http://lam/items/${item.id}`, { headers: AUTH })).json<any>();
     expect(got).toMatchObject({ status: "resolved", response_choice: "yes", response_by: "phone" });
     expect(got.resolved_at).toBeTruthy();
     expect((await lastMessage()).message).toBe("resolved via phone: yes");
     expect((await SELF.fetch(`http://lam/a/${item.id}/no?t=${t}`)).status).toBe(409);
+    expect((await SELF.fetch(`http://lam/a/${item.id}/no?t=${t}`, { method: "POST" })).status).toBe(409);
   });
   it("cli resolve with text; wait returns immediately once closed", async () => {
     const item = await push();
