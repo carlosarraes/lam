@@ -15,12 +15,16 @@ pub struct Item {
     pub source_project: String,
     pub priority: String,
     pub choices: Vec<String>,
+    #[serde(default)]
+    pub link: String,
     pub status: String,
     pub response_choice: Option<String>,
     pub response_text: Option<String>,
     pub response_by: Option<String>,
     pub created_at: String,
     pub resolved_at: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -31,6 +35,10 @@ pub struct NewItem {
     pub source_project: String,
     pub priority: String,
     pub choices: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u64>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -106,6 +114,28 @@ impl Client {
             return Ok(Wait::Pending);
         }
         Ok(Wait::Closed(res.json()?))
+    }
+
+    /// Long-poll across several items; Closed with whichever closes first.
+    pub fn wait_any_once(&self, ids: &[String]) -> Result<Wait> {
+        let res = Self::ok(
+            self.get("/items/wait")
+                .query(&[("ids", ids.join(","))])
+                .send()?,
+        )?;
+        if res.status() == StatusCode::NO_CONTENT {
+            return Ok(Wait::Pending);
+        }
+        Ok(Wait::Closed(res.json()?))
+    }
+
+    pub fn retract(&self, id: &str) -> Result<Item> {
+        Ok(Self::ok(
+            self.post(&format!("/items/{id}/retract"))
+                .json(&())
+                .send()?,
+        )?
+        .json()?)
     }
 
     pub fn resolve(&self, id: &str, res: &Resolution) -> Result<Item> {

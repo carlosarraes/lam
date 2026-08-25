@@ -53,6 +53,21 @@ export const api = HttpRouter.empty.pipe(
     }),
   ),
   HttpRouter.get(
+    "/items/wait",
+    Effect.gen(function* () {
+      const { ids } = yield* HttpServerRequest.schemaSearchParams(Schema.Struct({ ids: Schema.NonEmptyString }));
+      const wanted = ids.split(",").filter(Boolean);
+      const items = yield* Items;
+      const deadline = Date.now() + WAIT_MS;
+      while (true) {
+        const closed = (yield* items.list(undefined, wanted)).find((i) => i.status !== "open");
+        if (closed) return yield* HttpServerResponse.json(closed);
+        if (Date.now() + POLL_MS > deadline) return HttpServerResponse.empty({ status: 204 });
+        yield* Effect.sleep(POLL_MS);
+      }
+    }),
+  ),
+  HttpRouter.get(
     "/items/:id",
     Effect.gen(function* () {
       const { id } = yield* HttpRouter.schemaPathParams(IdParam);
@@ -79,6 +94,15 @@ export const api = HttpRouter.empty.pipe(
       const { id } = yield* HttpRouter.schemaPathParams(IdParam);
       const res = yield* HttpServerRequest.schemaBodyJson(Resolution).pipe(Effect.orElseSucceed(() => ({} as Resolution)));
       const item = yield* (yield* Items).close(id, { status: "resolved", choice: res.choice, text: res.text, by: "cli" });
+      yield* background((yield* Notify).itemClosed(item));
+      return yield* HttpServerResponse.json(item);
+    }),
+  ),
+  HttpRouter.post(
+    "/items/:id/retract",
+    Effect.gen(function* () {
+      const { id } = yield* HttpRouter.schemaPathParams(IdParam);
+      const item = yield* (yield* Items).close(id, { status: "retracted", by: "cli" });
       yield* background((yield* Notify).itemClosed(item));
       return yield* HttpServerResponse.json(item);
     }),

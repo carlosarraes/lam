@@ -110,6 +110,46 @@ describe("resolution", () => {
   });
 });
 
+describe("link, ttl, retract, wait-any", () => {
+  it("link becomes an Open button; invalid link rejected", async () => {
+    expect((await SELF.fetch("http://lam/items", json({ title: "x", link: "ftp://nope" }))).status).toBe(400);
+    const item = await push({ title: "PR", choices: ["yes"], link: "https://github.com/x/pr/1" });
+    expect(item.link).toBe("https://github.com/x/pr/1");
+    const labels = (await lastMessage()).actions.map((a: any) => a.label);
+    expect(labels).toEqual(["yes", "Open", "Reply"]);
+  });
+  it("ttl expires items: derived status, hidden from open list, cannot be closed", async () => {
+    const item = await push({ title: "short", ttl: 1 });
+    expect(item.expires_at).toBeTruthy();
+    expect(item.status).toBe("open");
+    await new Promise((r) => setTimeout(r, 1100));
+    const got = await (await SELF.fetch(`http://lam/items/${item.id}`, { headers: AUTH })).json<any>();
+    expect(got.status).toBe("expired");
+    const open = await (await SELF.fetch("http://lam/items?status=open", { headers: AUTH })).json<any[]>();
+    expect(open.find((i) => i.id === item.id)).toBeUndefined();
+    expect((await SELF.fetch(`http://lam/items/${item.id}/resolve`, json({}))).status).toBe(409);
+    const w = await SELF.fetch(`http://lam/items/${item.id}/wait`, { headers: AUTH });
+    expect((await w.json<any>()).status).toBe("expired");
+    expect((await SELF.fetch("http://lam/items", json({ title: "x", ttl: 0 }))).status).toBe(400);
+  });
+  it("retract closes with status retracted and notifies", async () => {
+    const item = await push({ title: "self-solved" });
+    const res = await SELF.fetch(`http://lam/items/${item.id}/retract`, { method: "POST", headers: AUTH });
+    expect((await res.json<any>()).status).toBe("retracted");
+    expect((await lastMessage()).message).toBe("retracted via cli: retracted");
+    expect((await SELF.fetch(`http://lam/items/${item.id}/retract`, { method: "POST", headers: AUTH })).status).toBe(409);
+  });
+  it("wait?ids= returns the first closed item among many", async () => {
+    const a = await push({ title: "a" });
+    const b = await push({ title: "b" });
+    await SELF.fetch(`http://lam/items/${b.id}/resolve`, json({ choice: "ok" }));
+    const w = await SELF.fetch(`http://lam/items/wait?ids=${a.id},${b.id}`, { headers: AUTH });
+    expect(w.status).toBe(200);
+    expect((await w.json<any>()).id).toBe(b.id);
+    expect((await SELF.fetch("http://lam/items/wait", { headers: AUTH })).status).toBe(400);
+  });
+});
+
 describe("ntfy-compatible topic", () => {
   it("serves only the configured topic", async () => {
     expect((await SELF.fetch("http://lam/other/json?poll=1")).status).toBe(404);

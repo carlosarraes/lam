@@ -1,4 +1,5 @@
 use std::process::Command;
+
 use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -45,7 +46,20 @@ async fn push_prints_id_and_sends_bearer() {
         .await;
     let out = lam(
         &dir,
-        &["push", "hello", "-c", "yes", "-c", "no", "-p", "critical"],
+        &[
+            "push",
+            "hello",
+            "-c",
+            "yes",
+            "-c",
+            "no",
+            "-p",
+            "critical",
+            "--link",
+            "https://x/pr/1",
+            "--ttl",
+            "30m",
+        ],
     );
     assert!(
         out.status.success(),
@@ -58,6 +72,8 @@ async fn push_prints_id_and_sends_bearer() {
     assert_eq!(body["title"], "hello");
     assert_eq!(body["priority"], "critical");
     assert_eq!(body["choices"], serde_json::json!(["yes", "no"]));
+    assert_eq!(body["link"], "https://x/pr/1");
+    assert_eq!(body["ttl"], 1800);
     assert!(!body["source_host"].as_str().unwrap().is_empty());
 }
 
@@ -168,4 +184,91 @@ async fn llm_flag_prints_guide_without_config() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.starts_with("# lam"));
     assert!(text.contains("--wait"));
+}
+
+#[tokio::test]
+async fn wait_exit_codes_for_expired_and_retracted() {
+    let (server, dir) = setup().await;
+    for (id, status, code) in [("exp01", "expired", 4), ("ret01", "retracted", 5)] {
+        Mock::given(method("GET"))
+            .and(path(format!("/items/{id}/wait")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(item(id, status, None)))
+            .mount(&server)
+            .await;
+        assert_eq!(
+            lam(&dir, &["wait", id]).status.code(),
+            Some(code),
+            "{status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn wait_many_ids_uses_wait_any_endpoint() {
+    let (server, dir) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/items/wait"))
+        .and(query_param("ids", "aaa11,bbb22"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(item(
+            "bbb22",
+            "resolved",
+            Some("ok"),
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let out = lam(&dir, &["wait", "aaa11", "bbb22"]);
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["id"], "bbb22");
+}
+
+#[tokio::test]
+async fn wait_any_collects_my_open_items() {
+    let (server, dir) = setup().await;
+    let host = hostname::get().unwrap().to_string_lossy().into_owned();
+    let mut mine = item("mine1", "open", None);
+    mine["source_host"] = serde_json::json!(host);
+    mine["source_project"] = serde_json::json!("lam");
+    let theirs = item("other", "open", None);
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .and(query_param("status", "open"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vec![mine, theirs]))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/items/mine1/wait"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(item(
+            "mine1",
+            "resolved",
+            Some("yes"),
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_lam"))
+        .env("LAM_CONFIG", dir.path().join("config.toml"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["wait", "--any"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[tokio::test]
+async fn retract_posts() {
+    let (server, dir) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/items/abc12/retract"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(item("abc12", "retracted", None)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert!(lam(&dir, &["retract", "abc12"]).status.success());
 }

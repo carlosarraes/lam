@@ -7,6 +7,8 @@ use crate::config::Config;
 pub const EXIT_RESOLVED: i32 = 0;
 pub const EXIT_DISMISSED: i32 = 2;
 pub const EXIT_TIMEOUT: i32 = 3;
+pub const EXIT_EXPIRED: i32 = 4;
+pub const EXIT_RETRACTED: i32 = 5;
 
 fn client() -> Result<Client> {
     Client::new(&Config::load()?)
@@ -29,27 +31,44 @@ pub fn init(server: String, token: String, topic: String) -> Result<i32> {
     Ok(0)
 }
 
-pub fn push(
-    title: String,
-    body: String,
-    priority: String,
-    choices: Vec<String>,
-    wait: bool,
-) -> Result<i32> {
-    if choices.len() > 3 {
+pub struct PushArgs {
+    pub title: String,
+    pub body: String,
+    pub priority: String,
+    pub choices: Vec<String>,
+    pub link: Option<String>,
+    pub ttl: Option<String>,
+    pub wait: bool,
+}
+
+pub fn push(a: PushArgs) -> Result<i32> {
+    if a.choices.len() > 3 {
         bail!("at most 3 choices");
     }
+    if let Some(l) = &a.link {
+        if !l.starts_with("http://") && !l.starts_with("https://") {
+            bail!("--link must be an http(s) URL");
+        }
+    }
+    let ttl = a
+        .ttl
+        .as_deref()
+        .map(parse_duration)
+        .transpose()?
+        .map(|d| d.as_secs());
     let item = client()?.push(&NewItem {
-        title,
-        body,
+        title: a.title,
+        body: a.body,
         source_host: hostname::get()?.to_string_lossy().into_owned(),
         source_project: project_name(),
-        priority,
-        choices,
+        priority: a.priority,
+        choices: a.choices,
+        link: a.link,
+        ttl,
     })?;
-    if wait {
+    if a.wait {
         eprintln!("pushed {} — waiting", item.id);
-        return self::wait(&item.id, "2h");
+        return self::wait(&[item.id], false, "2h");
     }
     println!("{}", item.id);
     Ok(0)
@@ -81,24 +100,45 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
 }
 
 fn exit_for(item: &Item) -> i32 {
-    if item.status == "dismissed" {
-        EXIT_DISMISSED
-    } else {
-        EXIT_RESOLVED
+    match item.status.as_str() {
+        "dismissed" => EXIT_DISMISSED,
+        "expired" => EXIT_EXPIRED,
+        "retracted" => EXIT_RETRACTED,
+        _ => EXIT_RESOLVED,
     }
 }
 
-pub fn wait(id: &str, timeout: &str) -> Result<i32> {
+/// Items this agent pushed: same host and project as the current invocation.
+fn my_open_ids(c: &Client) -> Result<Vec<String>> {
+    let host = hostname::get()?.to_string_lossy().into_owned();
+    let project = project_name();
+    Ok(c.list(Some("open"))?
+        .into_iter()
+        .filter(|i| i.source_host == host && i.source_project == project)
+        .map(|i| i.id)
+        .collect())
+}
+
+pub fn wait(ids: &[String], any: bool, timeout: &str) -> Result<i32> {
     let deadline = Instant::now() + parse_duration(timeout)?;
     let c = client()?;
+    let ids: Vec<String> = if any { my_open_ids(&c)? } else { ids.to_vec() };
+    if ids.is_empty() {
+        bail!("no open items to wait on");
+    }
     loop {
-        match c.wait_once(id)? {
+        let round = if ids.len() == 1 {
+            c.wait_once(&ids[0])?
+        } else {
+            c.wait_any_once(&ids)?
+        };
+        match round {
             Wait::Closed(item) => {
                 print_json(&item)?;
                 return Ok(exit_for(&item));
             }
             Wait::Pending if Instant::now() >= deadline => {
-                eprintln!("lam: timed out waiting for {id}");
+                eprintln!("lam: timed out waiting for {}", ids.join(","));
                 return Ok(EXIT_TIMEOUT);
             }
             Wait::Pending => {}
@@ -155,6 +195,11 @@ pub fn done(id: &str, choice: Option<String>, message: Option<String>) -> Result
         },
     )?;
     print_json(&item)?;
+    Ok(0)
+}
+
+pub fn retract(id: &str) -> Result<i32> {
+    print_json(&client()?.retract(id)?)?;
     Ok(0)
 }
 

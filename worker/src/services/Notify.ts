@@ -26,6 +26,7 @@ export class Notify extends Effect.Service<Notify>()("lam/Notify", {
             url: `${baseUrl}/a/${item.id}/${encodeURIComponent(c)}?t=${t}`,
             clear: true,
           }));
+          if (item.link) actions.push({ action: "view", label: "Open", url: item.link, clear: false });
           actions.push({ action: "view", label: "Reply", url: `${baseUrl}/r/${item.id}?t=${t}`, clear: true });
           const src = source(item);
           yield* publish({
@@ -42,7 +43,7 @@ export class Notify extends Effect.Service<Notify>()("lam/Notify", {
           title: `${item.title} [${item.id}]`,
           message: `${item.status} via ${item.response_by}: ${item.response_choice ?? item.response_text ?? item.status}`,
           priority: 1,
-          tags: ["white_check_mark"],
+          tags: [item.status === "retracted" ? "leftwards_arrow_with_hook" : "white_check_mark"],
         }),
     };
   }),

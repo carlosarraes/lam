@@ -53,14 +53,25 @@ enum Cmd {
         /// Up to 3 choices shown as buttons
         #[arg(short, long = "choice")]
         choices: Vec<String>,
+        /// URL shown as an "Open" button on the phone
+        #[arg(short, long)]
+        link: Option<String>,
+        /// Expire the item after this long (e.g. 2h); expired items leave the queue
+        #[arg(long)]
+        ttl: Option<String>,
         /// Block until answered (same as `lam wait`)
         #[arg(short, long)]
         wait: bool,
     },
-    /// Block until the item is resolved/dismissed; prints the item as JSON.
-    /// Exit 0 resolved, 2 dismissed, 3 timeout
+    /// Block until an item closes; prints it as JSON.
+    /// Exit 0 resolved, 2 dismissed, 3 timeout, 4 expired, 5 retracted
     Wait {
-        id: String,
+        /// One id, or several to return whichever closes first
+        #[arg(required_unless_present = "any")]
+        ids: Vec<String>,
+        /// Wait on every open item pushed from this host and project
+        #[arg(long, conflicts_with = "ids")]
+        any: bool,
         /// e.g. 30m, 2h, 90s
         #[arg(long, default_value = "2h")]
         timeout: String,
@@ -83,6 +94,8 @@ enum Cmd {
     },
     /// Dismiss an item without answering
     Dismiss { id: String },
+    /// Withdraw your own item because the world already resolved it
+    Retract { id: String },
     /// Subscribe to ntfy and mirror pushes as desktop notifications
     Watch,
 }
@@ -120,9 +133,19 @@ fn run(cmd: Cmd) -> Result<i32> {
             body,
             priority,
             choices,
+            link,
+            ttl,
             wait,
-        } => commands::push(title, body, priority, choices, wait),
-        Cmd::Wait { id, timeout } => commands::wait(&id, &timeout),
+        } => commands::push(commands::PushArgs {
+            title,
+            body,
+            priority,
+            choices,
+            link,
+            ttl,
+            wait,
+        }),
+        Cmd::Wait { ids, any, timeout } => commands::wait(&ids, any, &timeout),
         Cmd::List { all, json } => commands::list(all, json),
         Cmd::Show { id } => commands::show(&id),
         Cmd::Done {
@@ -131,6 +154,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             message,
         } => commands::done(&id, choice, message),
         Cmd::Dismiss { id } => commands::dismiss(&id),
+        Cmd::Retract { id } => commands::retract(&id),
         Cmd::Watch => watch::run(),
     }
 }

@@ -25,8 +25,9 @@ agent ──lam push──▶ lam-api (CF Worker: Effect + D1 + Topic DO) ──
 
 | cmd | |
 |---|---|
-| `lam push <title> [-b body] [-p low\|normal\|critical] [-c choice]… [--wait]` | prints id |
-| `lam wait <id> [--timeout 2h]` | prints JSON; exit 0 resolved / 2 dismissed / 3 timeout |
+| `lam push <title> [-b body] [-p low\|normal\|critical] [-c choice]… [--link URL] [--ttl 2h] [--wait]` | prints id |
+| `lam wait <id>… \| --any [--timeout 2h]` | first item to close, as JSON; exit 0 resolved / 2 dismissed / 3 timeout / 4 expired / 5 retracted |
+| `lam retract <id>` | agent withdraws its own ask |
 | `lam list [--all] [--json]`, `lam show <id>` | |
 | `lam done <id> [choice] [-m text]`, `lam dismiss <id>` | Carlos's side |
 | `lam watch` | mirror ntfy → desktop notifications |
