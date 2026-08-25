@@ -1,0 +1,7 @@
+node_modules/
+.wrangler/
+.dev.vars
+target/
+worker-configuration.d.ts
+TASKS.md
+CHANGELOG.md
