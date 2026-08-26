@@ -26,6 +26,11 @@ pub enum Action {
     },
     Dismiss(String),
     OpenLink(String),
+    SetCheck {
+        id: String,
+        index: usize,
+        done: bool,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -37,6 +42,8 @@ enum Mode {
 pub struct App {
     items: Vec<Item>,
     selected: usize,
+    /// Cursor within the selected item's checks.
+    check_sel: usize,
     show_all: bool,
     mode: Mode,
     status: String,
@@ -48,6 +55,7 @@ impl App {
         Self {
             items: vec![],
             selected: 0,
+            check_sel: 0,
             show_all: false,
             mode: Mode::Normal,
             status: "connecting".into(),
@@ -103,12 +111,31 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.selected + 1 < self.items.len() {
                     self.selected += 1;
+                    self.check_sel = 0;
                 }
                 None
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
+                self.check_sel = 0;
                 None
+            }
+            KeyCode::Tab => {
+                if let Some(i) = self.open_current() {
+                    if !i.checks.is_empty() {
+                        self.check_sel = (self.check_sel + 1) % i.checks.len();
+                    }
+                }
+                None
+            }
+            KeyCode::Char(' ') => {
+                let item = self.open_current()?;
+                let check = item.checks.get(self.check_sel)?;
+                Some(Action::SetCheck {
+                    id: item.id.clone(),
+                    index: self.check_sel,
+                    done: !check.done,
+                })
             }
             KeyCode::Char('a') => {
                 self.show_all = !self.show_all;
@@ -128,7 +155,7 @@ impl App {
             }
             KeyCode::Enter => self
                 .open_current()
-                .filter(|i| i.choices.is_empty())
+                .filter(|i| i.choices.is_empty() && i.checks.is_empty())
                 .map(|i| Action::Resolve {
                     id: i.id.clone(),
                     choice: None,
@@ -155,7 +182,7 @@ impl App {
         let [header, list, detail, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(6),
+            Constraint::Length(6 + self.current().map_or(0, |i| i.checks.len() as u16)),
             Constraint::Length(2),
         ])
         .areas(f.area());
@@ -205,6 +232,22 @@ impl App {
                         Style::default().fg(Color::Blue),
                     )));
                 }
+                for (n, c) in i.checks.iter().enumerate() {
+                    let cursor = if n == self.check_sel && i.status == "open" {
+                        "▸"
+                    } else {
+                        " "
+                    };
+                    let style = if c.done {
+                        Style::default().fg(Color::DarkGray)
+                    } else {
+                        Style::default()
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("{cursor} [{}] {}", if c.done { "x" } else { " " }, c.label),
+                        style,
+                    )));
+                }
                 if let Some(answer) = i.response_choice.as_deref().or(i.response_text.as_deref()) {
                     lines.push(Line::raw(format!(
                         "{} via {}: {answer}",
@@ -239,7 +282,13 @@ impl App {
                     .enumerate()
                     .map(|(n, c)| format!("[{}] {c}", n + 1))
                     .collect();
-                if i.choices.is_empty() {
+                if !i.checks.is_empty() {
+                    keys.push(format!(
+                        "[Tab] next check   [Space] toggle ({}/{})",
+                        i.checks_done(),
+                        i.checks.len()
+                    ));
+                } else if i.choices.is_empty() {
                     keys.push("[Enter] done".into());
                 }
                 if !i.link.is_empty() {
@@ -286,7 +335,11 @@ fn row(i: &Item) -> ListItem<'_> {
     ListItem::new(Line::from(vec![
         Span::raw(format!("{icon} {:<6} ", i.id)),
         Span::styled(format!("{src:<22} "), Style::default().fg(Color::Cyan)),
-        Span::raw(i.title.clone()),
+        Span::raw(if i.checks.is_empty() {
+            i.title.clone()
+        } else {
+            format!("{} [{}/{}]", i.title, i.checks_done(), i.checks.len())
+        }),
     ]))
     .style(style)
 }
@@ -370,6 +423,7 @@ fn event_loop(
                 .map(|_| ()),
             Action::Dismiss(id) => client.dismiss(&id).map(|_| ()),
             Action::OpenLink(url) => open_link(&url),
+            Action::SetCheck { id, index, done } => client.set_check(&id, index, done).map(|_| ()),
         };
         if let Err(e) = outcome {
             app.set_status(format!("error: {e}"));
@@ -406,6 +460,8 @@ mod tests {
             priority: "normal".into(),
             choices: choices.iter().map(|s| s.to_string()).collect(),
             link: link.into(),
+            checks: vec![],
+            version: 0,
             status: status.into(),
             response_choice: None,
             response_text: None,
@@ -497,6 +553,51 @@ mod tests {
         assert_eq!(a.handle(key('a')), Some(Action::Refresh));
         assert!(a.show_all());
         assert_eq!(a.handle(key('q')), Some(Action::Quit));
+    }
+
+    #[test]
+    fn checklist_keys_toggle_and_cycle() {
+        let mut a = App::new("host".into());
+        let mut i = item("chk", "open", &[], "");
+        i.checks = vec![
+            crate::client::Check {
+                label: "one".into(),
+                done: false,
+                at: None,
+            },
+            crate::client::Check {
+                label: "two".into(),
+                done: true,
+                at: None,
+            },
+        ];
+        a.set_items(vec![i]);
+        assert_eq!(
+            a.handle(KeyEvent::from(KeyCode::Enter)),
+            None,
+            "Enter is not 'done' on a checklist"
+        );
+        assert_eq!(
+            a.handle(key(' ')),
+            Some(Action::SetCheck {
+                id: "chk".into(),
+                index: 0,
+                done: true
+            })
+        );
+        a.handle(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(
+            a.handle(key(' ')),
+            Some(Action::SetCheck {
+                id: "chk".into(),
+                index: 1,
+                done: false
+            })
+        );
+        a.handle(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(a.check_sel, 0, "Tab wraps");
+        a.set_items(vec![item("plain", "open", &[], "")]);
+        assert_eq!(a.handle(key(' ')), None);
     }
 
     #[test]

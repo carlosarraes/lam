@@ -36,6 +36,7 @@ pub struct PushArgs {
     pub body: String,
     pub priority: String,
     pub choices: Vec<String>,
+    pub checks: Vec<String>,
     pub link: Option<String>,
     pub ttl: Option<String>,
     pub wait: bool,
@@ -44,6 +45,9 @@ pub struct PushArgs {
 pub fn push(a: PushArgs) -> Result<i32> {
     if a.choices.len() > 3 {
         bail!("at most 3 choices");
+    }
+    if !a.choices.is_empty() && !a.checks.is_empty() {
+        bail!("--choice and --check are mutually exclusive");
     }
     if let Some(l) = &a.link {
         if !l.starts_with("http://") && !l.starts_with("https://") {
@@ -63,6 +67,7 @@ pub fn push(a: PushArgs) -> Result<i32> {
         source_project: project_name(),
         priority: a.priority,
         choices: a.choices,
+        checks: a.checks,
         link: a.link,
         ttl,
     })?;
@@ -126,11 +131,16 @@ pub fn wait(ids: &[String], any: bool, timeout: &str) -> Result<i32> {
     if ids.is_empty() {
         bail!("no open items to wait on");
     }
+    // Snapshot versions first so a check ticked from now on counts as a change.
+    let since: Vec<u64> = ids
+        .iter()
+        .map(|id| c.show(id).map(|i| i.version))
+        .collect::<Result<_>>()?;
     loop {
         let round = if ids.len() == 1 {
-            c.wait_once(&ids[0])?
+            c.wait_once(&ids[0], Some(since[0]))?
         } else {
-            c.wait_any_once(&ids)?
+            c.wait_any_once(&ids, Some(&since))?
         };
         match round {
             Wait::Closed(item) => {
@@ -159,6 +169,12 @@ pub fn list(all: bool, json: bool) -> Result<i32> {
             .cloned()
             .collect::<Vec<_>>()
             .join(":");
+        let progress = if i.checks.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}/{}]", i.checks_done(), i.checks.len())
+        };
+        let title = format!("{}{progress}", i.title);
         let answer = i
             .response_choice
             .as_deref()
@@ -170,7 +186,7 @@ pub fn list(all: bool, json: bool) -> Result<i32> {
             i.status,
             i.priority,
             src,
-            i.title,
+            title,
             if answer.is_empty() {
                 String::new()
             } else {
@@ -195,6 +211,19 @@ pub fn done(id: &str, choice: Option<String>, message: Option<String>) -> Result
         },
     )?;
     print_json(&item)?;
+    Ok(0)
+}
+
+pub fn check_add(id: &str, label: &str) -> Result<i32> {
+    print_json(&client()?.add_check(id, label)?)?;
+    Ok(0)
+}
+
+pub fn check_set(id: &str, n: usize, done: bool) -> Result<i32> {
+    if n == 0 {
+        bail!("checks are numbered from 1");
+    }
+    print_json(&client()?.set_check(id, n - 1, done)?)?;
     Ok(0)
 }
 

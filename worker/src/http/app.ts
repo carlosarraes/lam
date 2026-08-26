@@ -16,6 +16,7 @@ export const app = HttpRouter.empty.pipe(
     Forbidden: () => Effect.succeed(error(403, "forbidden")),
     NotFound: () => Effect.succeed(error(404, "not found")),
     AlreadyClosed: () => Effect.succeed(error(409, "already closed")),
+    Conflict: () => Effect.succeed(error(409, "concurrent update, retry")),
     BadRequest: (e) => Effect.succeed(error(400, e.message)),
     ParseError: (e) => Effect.succeed(error(400, e.message)),
     RequestError: (e) => Effect.succeed(error(400, e.message)),

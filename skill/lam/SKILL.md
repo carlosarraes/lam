@@ -27,7 +27,14 @@ lam wait --any                # every open item you pushed from this host+projec
 
 # the world already resolved it (he did the thing without tapping): withdraw your own ask
 lam retract "$ID"
+
+# multi-part ask: one check per thing he has to do; he ticks them one by one, item resolves on the last tick
+ID=$(lam push "Trigger CodeRabbit on tonight's PRs" --check "PR #2597" --check "PR #2598" --link https://github.com/org/repo/pulls)
+lam wait "$ID"                 # returns on EVERY change: read .checks[].done, act on what is ticked, then wait again
+lam check add "$ID" "PR #2601" # a new part became ready: append instead of pushing a second item
 ```
+
+Checklist loop: `lam wait` exits 0 both on progress and on resolution — check `status`: `open` means "some check flipped, act on it and call `lam wait` again"; anything else is final. `--check` and `--choice` are exclusive.
 
 `wait` prints the item as JSON. Read `response_choice` (button pressed) and `response_text` (free text). Exit codes: `0` resolved, `2` dismissed (he doesn't want to deal with it — stop and report), `3` timeout (fall back to `lam list` later; do not re-push the same question), `4` expired (TTL passed — decide whether to re-push), `5` retracted.
 
@@ -35,4 +42,4 @@ lam retract "$ID"
 - Title = the decision. Body = where to act ("Reply in Claude Code: …"). Host and project are attached automatically.
 - Always pass `--link` when there is a URL to act on, and `--ttl` when the ask stops mattering after a while — stale items make the queue untrustworthy.
 - The phone notification shows at most 3 buttons; with 3 choices the Open/Reply buttons are still available inside the ntfy app.
-- `lam list` shows open items; `lam show <id>` shows one. Never resolve items yourself with `lam done` — that is Carlos's side. `lam retract` is the only closing action that is yours.
+- `lam list` shows open items; `lam show <id>` shows one. Never resolve items yourself with `lam done` or tick checks with `lam check tick` — that is Carlos's side. `lam retract` and `lam check add` are the only mutations that are yours.

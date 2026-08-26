@@ -150,6 +150,68 @@ describe("link, ttl, retract, wait-any", () => {
   });
 });
 
+describe("checklists", () => {
+  const checkPost = (id: string, i: number, done: boolean) =>
+    SELF.fetch(`http://lam/items/${id}/checks/${i}`, json({ done }));
+
+  it("push with checks: exclusive with choices, listed in the push, Checks button", async () => {
+    expect((await SELF.fetch("http://lam/items", json({ title: "x", choices: ["a"], checks: ["b"] }))).status).toBe(400);
+    const item = await push({ title: "PRs", checks: ["PR 1", "PR 2"], link: "https://x" });
+    expect(item.checks).toEqual([{ label: "PR 1", done: false, at: null }, { label: "PR 2", done: false, at: null }]);
+    expect(item.version).toBe(0);
+    const msg = await lastMessage();
+    expect(msg.message).toContain("☐ PR 1\n☐ PR 2");
+    expect(msg.actions.map((a: any) => a.label)).toEqual(["Open", "Checks"]);
+  });
+
+  it("ticks bump version, wait?since returns on change, all ticked auto-resolves", async () => {
+    const item = await push({ title: "PRs", checks: ["a", "b"] });
+    const t1 = await (await checkPost(item.id, 0, true)).json<any>();
+    expect(t1).toMatchObject({ status: "open", version: 1 });
+    expect(t1.checks[0].done).toBe(true);
+    expect(t1.checks[0].at).toBeTruthy();
+    const w1 = await (await SELF.fetch(`http://lam/items/${item.id}/wait?since=0`, { headers: AUTH })).json<any>();
+    expect(w1.version).toBe(1);
+    // untick is allowed while open
+    const t2 = await (await checkPost(item.id, 0, false)).json<any>();
+    expect(t2.checks[0]).toEqual({ label: "a", done: false, at: null });
+    await checkPost(item.id, 0, true);
+    const done = await (await checkPost(item.id, 1, true)).json<any>();
+    expect(done).toMatchObject({ status: "resolved", response_by: "cli", version: 4 });
+    expect((await lastMessage()).message).toBe("resolved via cli: 2/2 checks");
+    expect((await checkPost(item.id, 0, false)).status).toBe(409);
+    expect((await checkPost(item.id, 9, true)).status).toBe(409);
+  });
+
+  it("bad index is 400; add check appends and notifies; wait-any honours since", async () => {
+    const item = await push({ title: "PRs", checks: ["a"] });
+    expect((await checkPost(item.id, 5, true)).status).toBe(400);
+    const added = await (await SELF.fetch(`http://lam/items/${item.id}/checks`, json({ label: "b" }))).json<any>();
+    expect(added.checks.map((c: any) => c.label)).toEqual(["a", "b"]);
+    expect(added.version).toBe(1);
+    expect((await lastMessage()).message).toBe("new check: b (0/2)");
+    const other = await push({ title: "other" });
+    const w = await SELF.fetch(`http://lam/items/wait?ids=${other.id},${item.id}&since=0,0`, { headers: AUTH });
+    expect((await w.json<any>()).id).toBe(item.id);
+  });
+
+  it("phone page toggles checks via form and closes on last tick", async () => {
+    const item = await push({ title: "PRs", checks: ["a", "b"] });
+    const t = await itemToken("test-secret", item.id);
+    const page = await (await SELF.fetch(`http://lam/r/${item.id}?t=${t}`)).text();
+    expect(page).toContain("☐ a");
+    expect(page).toContain("0/2 done");
+    const r = await SELF.fetch(`http://lam/r/${item.id}/checks/0?t=${t}`, { method: "POST", body: new URLSearchParams({ done: "true" }), redirect: "manual" });
+    expect(r.status).toBe(303);
+    expect(r.headers.get("location")).toBe(`/r/${item.id}?t=${t}`);
+    expect((await SELF.fetch(`http://lam/r/${item.id}/checks/1?t=bad`, { method: "POST", body: new URLSearchParams({ done: "true" }) })).status).toBe(403);
+    const last = await SELF.fetch(`http://lam/r/${item.id}/checks/1?t=${t}`, { method: "POST", body: new URLSearchParams({ done: "true" }) });
+    expect(last.status).toBe(200);
+    const got = await (await SELF.fetch(`http://lam/items/${item.id}`, { headers: AUTH })).json<any>();
+    expect(got).toMatchObject({ status: "resolved", response_by: "phone" });
+  });
+});
+
 describe("ntfy-compatible topic", () => {
   it("serves only the configured topic", async () => {
     expect((await SELF.fetch("http://lam/other/json?poll=1")).status).toBe(404);

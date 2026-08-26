@@ -6,7 +6,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 fn item(id: &str, status: &str, choice: Option<&str>) -> serde_json::Value {
     serde_json::json!({
         "id": id, "title": "t", "body": "", "source_host": "h", "source_project": "p",
-        "priority": "normal", "choices": [], "status": status,
+        "priority": "normal", "choices": [], "checks": [], "version": 0, "status": status,
         "response_choice": choice, "response_text": null, "response_by": choice.map(|_| "phone"),
         "created_at": "2026-08-25T00:00:00Z", "resolved_at": null
     })
@@ -14,6 +14,13 @@ fn item(id: &str, status: &str, choice: Option<&str>) -> serde_json::Value {
 
 async fn setup() -> (MockServer, tempfile::TempDir) {
     let server = MockServer::start().await;
+    // `wait` snapshots each item's version via GET /items/:id before polling.
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex(r"^/items/[a-z0-9]{5}$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(item("any", "open", None)))
+        .with_priority(255)
+        .mount(&server)
+        .await;
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("config.toml"),

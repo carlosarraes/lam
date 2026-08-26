@@ -25,11 +25,12 @@ agent ──lam push──▶ lam-api (CF Worker: Effect + D1 + Topic DO) ──
 
 | cmd | |
 |---|---|
-| `lam push <title> [-b body] [-p low\|normal\|critical] [-c choice]… [--link URL] [--ttl 2h] [--wait]` | prints id |
-| `lam wait <id>… \| --any [--timeout 2h]` | first item to close, as JSON; exit 0 resolved / 2 dismissed / 3 timeout / 4 expired / 5 retracted |
-| `lam retract <id>` | agent withdraws its own ask |
+| `lam push <title> [-b body] [-p low\|normal\|critical] [-c choice]… \| [--check part]… [--link URL] [--ttl 2h] [--wait]` | prints id; `--check` makes a checklist that resolves when all parts are ticked |
+| `lam wait <id>… \| --any [--timeout 2h]` | first item to change (a check ticked) or close, as JSON; exit 0 resolved/changed / 2 dismissed / 3 timeout / 4 expired / 5 retracted |
+| `lam retract <id>`, `lam check add <id> <label>` | agent withdraws its ask / appends a check |
+| `lam check tick\|untick <id> <n>` | Carlos's side, from the terminal |
 | `lam list [--all] [--json]`, `lam show <id>` | |
 | `lam done <id> [choice] [-m text]`, `lam dismiss <id>` | Carlos's side |
-| `lam` / `lam tui` | interactive queue in the terminal: `1-3` choose, `Enter` done, `r` reply text, `d` dismiss, `o` open link, `a` show all, live updates |
+| `lam` / `lam tui` | interactive queue in the terminal: `1-3` choose, `Enter` done, `Tab`/`Space` tick checks, `r` reply text, `d` dismiss, `o` open link, `a` show all, live updates |
 | `lam watch` | mirror ntfy → desktop notifications |
 | `lam --llm` | print the agent guide (the `lam` skill) — for agents that don't have the skill installed |

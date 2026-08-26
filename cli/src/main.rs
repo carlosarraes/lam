@@ -54,6 +54,9 @@ enum Cmd {
         /// Up to 3 choices shown as buttons
         #[arg(short, long = "choice")]
         choices: Vec<String>,
+        /// Sub-item the human ticks off; the item resolves when all are done (exclusive with --choice)
+        #[arg(long = "check")]
+        checks: Vec<String>,
         /// URL shown as an "Open" button on the phone
         #[arg(short, long)]
         link: Option<String>,
@@ -64,8 +67,8 @@ enum Cmd {
         #[arg(short, long)]
         wait: bool,
     },
-    /// Block until an item closes; prints it as JSON.
-    /// Exit 0 resolved, 2 dismissed, 3 timeout, 4 expired, 5 retracted
+    /// Block until an item changes (a check ticked) or closes; prints it as JSON.
+    /// Exit 0 resolved/changed, 2 dismissed, 3 timeout, 4 expired, 5 retracted
     Wait {
         /// One id, or several to return whichever closes first
         #[arg(required_unless_present = "any")]
@@ -97,10 +100,23 @@ enum Cmd {
     Dismiss { id: String },
     /// Withdraw your own item because the world already resolved it
     Retract { id: String },
+    /// Manage checks on an open checklist item
+    #[command(subcommand)]
+    Check(CheckCmd),
     /// Subscribe to ntfy and mirror pushes as desktop notifications
     Watch,
     /// Interactive queue: answer items from the terminal (default when no command is given)
     Tui,
+}
+
+#[derive(Subcommand)]
+enum CheckCmd {
+    /// Append a check to an open item (agent side); re-notifies
+    Add { id: String, label: String },
+    /// Tick a check (1-based index) — Carlos's side
+    Tick { id: String, n: usize },
+    /// Untick a check (1-based index)
+    Untick { id: String, n: usize },
 }
 
 fn main() {
@@ -131,6 +147,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             body,
             priority,
             choices,
+            checks,
             link,
             ttl,
             wait,
@@ -139,6 +156,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             body,
             priority,
             choices,
+            checks,
             link,
             ttl,
             wait,
@@ -153,6 +171,9 @@ fn run(cmd: Cmd) -> Result<i32> {
         } => commands::done(&id, choice, message),
         Cmd::Dismiss { id } => commands::dismiss(&id),
         Cmd::Retract { id } => commands::retract(&id),
+        Cmd::Check(CheckCmd::Add { id, label }) => commands::check_add(&id, &label),
+        Cmd::Check(CheckCmd::Tick { id, n }) => commands::check_set(&id, n, true),
+        Cmd::Check(CheckCmd::Untick { id, n }) => commands::check_set(&id, n, false),
         Cmd::Watch => watch::run(),
         Cmd::Tui => tui::run(),
     }

@@ -6,6 +6,13 @@ use std::time::Duration;
 
 use crate::config::Config;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Check {
+    pub label: String,
+    pub done: bool,
+    pub at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Item {
     pub id: String,
@@ -16,6 +23,8 @@ pub struct Item {
     pub priority: String,
     pub choices: Vec<String>,
     #[serde(default)]
+    pub checks: Vec<Check>,
+    #[serde(default)]
     pub link: String,
     pub status: String,
     pub response_choice: Option<String>,
@@ -25,6 +34,14 @@ pub struct Item {
     pub resolved_at: Option<String>,
     #[serde(default)]
     pub expires_at: Option<String>,
+    #[serde(default)]
+    pub version: u64,
+}
+
+impl Item {
+    pub fn checks_done(&self) -> usize {
+        self.checks.iter().filter(|c| c.done).count()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -35,6 +52,7 @@ pub struct NewItem {
     pub source_project: String,
     pub priority: String,
     pub choices: Vec<String>,
+    pub checks: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -107,9 +125,13 @@ impl Client {
         Ok(Self::ok(self.get(&format!("/items/{id}")).send()?)?.json()?)
     }
 
-    /// One long-poll round trip; the server holds ~25s before answering Pending.
-    pub fn wait_once(&self, id: &str) -> Result<Wait> {
-        let res = Self::ok(self.get(&format!("/items/{id}/wait")).send()?)?;
+    /// One long-poll round trip; returns Closed when the item closed or, with `since`, when its version moved past it.
+    pub fn wait_once(&self, id: &str, since: Option<u64>) -> Result<Wait> {
+        let mut req = self.get(&format!("/items/{id}/wait"));
+        if let Some(v) = since {
+            req = req.query(&[("since", v.to_string())]);
+        }
+        let res = Self::ok(req.send()?)?;
         if res.status() == StatusCode::NO_CONTENT {
             return Ok(Wait::Pending);
         }
@@ -117,16 +139,39 @@ impl Client {
     }
 
     /// Long-poll across several items; Closed with whichever closes first.
-    pub fn wait_any_once(&self, ids: &[String]) -> Result<Wait> {
-        let res = Self::ok(
-            self.get("/items/wait")
-                .query(&[("ids", ids.join(","))])
-                .send()?,
-        )?;
+    pub fn wait_any_once(&self, ids: &[String], since: Option<&[u64]>) -> Result<Wait> {
+        let mut req = self.get("/items/wait").query(&[("ids", ids.join(","))]);
+        if let Some(v) = since {
+            let joined = v
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            req = req.query(&[("since", joined)]);
+        }
+        let res = Self::ok(req.send()?)?;
         if res.status() == StatusCode::NO_CONTENT {
             return Ok(Wait::Pending);
         }
         Ok(Wait::Closed(res.json()?))
+    }
+
+    pub fn set_check(&self, id: &str, index: usize, done: bool) -> Result<Item> {
+        Ok(Self::ok(
+            self.post(&format!("/items/{id}/checks/{index}"))
+                .json(&serde_json::json!({ "done": done }))
+                .send()?,
+        )?
+        .json()?)
+    }
+
+    pub fn add_check(&self, id: &str, label: &str) -> Result<Item> {
+        Ok(Self::ok(
+            self.post(&format!("/items/{id}/checks"))
+                .json(&serde_json::json!({ "label": label }))
+                .send()?,
+        )?
+        .json()?)
     }
 
     pub fn retract(&self, id: &str) -> Result<Item> {
