@@ -13,7 +13,7 @@ default:
 build:
     cd cli && cargo build --release
     mkdir -p {{bin_dir}} ~/.claude/skills
-    cp cli/target/release/{{binary}} {{bin_dir}}/{{binary}}
+    rm -f {{bin_dir}}/{{binary}} && cp cli/target/release/{{binary}} {{bin_dir}}/{{binary}}
     ln -sfn "$PWD/skill/lam" ~/.claude/skills/lam
     @echo "installed {{bin_dir}}/{{binary}} (v{{version}} {{commit}})"
 
@@ -42,6 +42,8 @@ deploy HOST: build
     set -euo pipefail
     ssh -o BatchMode=yes {{HOST}} 'mkdir -p ~/.local/bin ~/.claude/skills'
     remote=$(ssh -o BatchMode=yes {{HOST}} 'uname -sm')
+    # Replace, never overwrite in place: macOS SIGKILLs a signed binary whose inode was rewritten.
+    ssh -o BatchMode=yes {{HOST}} 'rm -f ~/.local/bin/{{binary}}'
     if [ "$remote" = "$(uname -sm)" ]; then
         scp -q cli/target/release/{{binary}} {{HOST}}:~/.local/bin/{{binary}}
     else
