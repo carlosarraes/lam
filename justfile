@@ -48,7 +48,8 @@ deploy HOST: build
         scp -q cli/target/release/{{binary}} {{HOST}}:~/.local/bin/{{binary}}
     else
         echo "{{HOST}} is $remote; building from source there"
-        rsync -aq --delete --exclude target --exclude node_modules --exclude .wrangler --exclude .dev.vars --exclude .git ./ {{HOST}}:.cache/lam-src/
+        ssh -o BatchMode=yes {{HOST}} 'rm -rf ~/.cache/lam-src && mkdir -p ~/.cache/lam-src'
+        tar --exclude=./target --exclude=./node_modules --exclude=./.wrangler --exclude=./.dev.vars --exclude=./.git --exclude='./cli/target' --exclude='./worker/node_modules' -cf - . | ssh -o BatchMode=yes {{HOST}} 'tar -C ~/.cache/lam-src -xf -'
         ssh -o BatchMode=yes {{HOST}} 'export PATH="$HOME/.cargo/bin:$PATH"; cd ~/.cache/lam-src/cli && cargo build --release -q && cp target/release/{{binary}} ~/.local/bin/{{binary}}'
     fi
     tar -C skill -cf - lam | ssh -o BatchMode=yes {{HOST}} 'rm -rf ~/.claude/skills/lam && tar -C ~/.claude/skills -xf -' 
