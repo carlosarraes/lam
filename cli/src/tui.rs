@@ -380,6 +380,9 @@ fn event_loop(
 }
 
 fn open_link(url: &str) -> Result<()> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        anyhow::bail!("refusing to open non-http link: {url}");
+    }
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else {
