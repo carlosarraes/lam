@@ -19,7 +19,7 @@ agent ──lam push──▶ lam-api (CF Worker: Effect + D1 + Topic DO) ──
 1. Worker: `cd worker && npx wrangler deploy && npx wrangler d1 migrations apply lam --remote`, then `printf %s '<value>' | npx wrangler secret put <NAME>` for `LAM_TOKEN`, `LAM_HMAC_SECRET`, `NTFY_TOPIC` (an unguessable topic name — it is the only access control on the topic).
 2. CLI: `lam init --server https://lam-api.<acct>.workers.dev --token <LAM_TOKEN> --topic <NTFY_TOPIC>` → `~/.config/lam/config.toml` (`~/Library/Application Support/lam/` on macOS).
 3. Phone: install the ntfy app (Play/F-Droid), *Add subscription* → topic `<NTFY_TOPIC>` → *Use another server* → `https://lam-api.<acct>.workers.dev`. No account. The app keeps one streaming connection ("instant delivery").
-4. Desktop: run `lam watch` (systemd user unit / launchd).
+4. Desktop: `lam` opens the TUI to answer items; run `lam watch` (systemd user unit / launchd) for notifications.
 
 ## CLI
 
@@ -30,5 +30,6 @@ agent ──lam push──▶ lam-api (CF Worker: Effect + D1 + Topic DO) ──
 | `lam retract <id>` | agent withdraws its own ask |
 | `lam list [--all] [--json]`, `lam show <id>` | |
 | `lam done <id> [choice] [-m text]`, `lam dismiss <id>` | Carlos's side |
+| `lam` / `lam tui` | interactive queue in the terminal: `1-3` choose, `Enter` done, `r` reply text, `d` dismiss, `o` open link, `a` show all, live updates |
 | `lam watch` | mirror ntfy → desktop notifications |
 | `lam --llm` | print the agent guide (the `lam` skill) — for agents that don't have the skill installed |

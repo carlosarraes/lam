@@ -2,6 +2,7 @@ mod client;
 mod commands;
 mod config;
 mod notify;
+mod tui;
 mod watch;
 
 use anyhow::Result;
@@ -98,6 +99,8 @@ enum Cmd {
     Retract { id: String },
     /// Subscribe to ntfy and mirror pushes as desktop notifications
     Watch,
+    /// Interactive queue: answer items from the terminal (default when no command is given)
+    Tui,
 }
 
 fn main() {
@@ -106,12 +109,7 @@ fn main() {
         print!("{}", llm_guide());
         std::process::exit(0);
     }
-    let Some(cmd) = cli.cmd else {
-        use clap::CommandFactory;
-        Cli::command().print_help().ok();
-        std::process::exit(2);
-    };
-    let code = match run(cmd) {
+    let code = match run(cli.cmd.unwrap_or(Cmd::Tui)) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("lam: {e:#}");
@@ -156,6 +154,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Dismiss { id } => commands::dismiss(&id),
         Cmd::Retract { id } => commands::retract(&id),
         Cmd::Watch => watch::run(),
+        Cmd::Tui => tui::run(),
     }
 }
 
