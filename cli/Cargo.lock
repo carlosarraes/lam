@@ -956,6 +956,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "hostname",
+ "libc",
  "ratatui",
  "reqwest",
  "serde",

@@ -718,7 +718,13 @@ fn open_link(url: &str) -> Result<()> {
     } else {
         "xdg-open"
     };
-    std::process::Command::new(opener).arg(url).spawn()?;
+    // Null stdio: a browser helper writing to stderr would corrupt the alternate screen.
+    std::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
     Ok(())
 }
 
