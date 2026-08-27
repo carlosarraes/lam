@@ -2,7 +2,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 use std::cell::Cell;
@@ -100,15 +100,13 @@ impl App {
         self.scroll = (self.scroll as i32 + delta).clamp(0, max.max(0)) as u16;
     }
 
-    /// The item's body as markdown, with the link and checklist appended so the reader is the whole ask.
+    /// The item's body as markdown with its checklist. The link is appended after rendering —
+    /// as markdown it would print twice, once as text and once as the destination.
     fn reader_markdown(item: &Item) -> String {
         let mut md = format!("# {}\n\n", item.title);
         if !item.body.is_empty() {
             md.push_str(&item.body);
             md.push_str("\n\n");
-        }
-        if !item.link.is_empty() {
-            md.push_str(&format!("<{}>\n\n", item.link));
         }
         for c in &item.checks {
             md.push_str(&format!(
@@ -118,6 +116,17 @@ impl App {
             ));
         }
         md
+    }
+
+    /// The reader document: markdown restyled into lam's palette, then the link.
+    fn reader_document(item: &Item) -> Text<'static> {
+        let mut doc = adopt_palette(tui_markdown::from_str(&Self::reader_markdown(item)));
+        if !item.link.is_empty() {
+            doc.lines.push(Line::raw(""));
+            doc.lines
+                .push(Line::from(Span::styled(item.link.clone(), LINK)));
+        }
+        doc
     }
 
     /// Items matching the current filter, which matches on agent name or title.
@@ -406,23 +415,15 @@ impl App {
                 META,
             ))],
         };
-        let md;
-        let rendered;
         let pane = if let (true, Some(item)) = (self.reader, self.current()) {
-            md = Self::reader_markdown(item);
-            rendered = tui_markdown::from_str(&md);
-            self.doc_lines.set(rendered.lines.len() as u16);
-            let border = if self.reader {
-                Borders::LEFT
-            } else {
-                Borders::TOP
-            };
-            Paragraph::new(rendered.clone())
+            let doc = Self::reader_document(item);
+            self.doc_lines.set(doc.lines.len() as u16);
+            Paragraph::new(doc)
                 .wrap(Wrap { trim: false })
                 .scroll((self.scroll, 0))
                 .block(
                     Block::default()
-                        .borders(border)
+                        .borders(Borders::LEFT)
                         .border_style(RULE)
                         .padding(Padding::horizontal(1)),
                 )
@@ -494,6 +495,42 @@ const DIM: Style = Style::new().fg(Color::DarkGray);
 const RULE: Style = Style::new().fg(Color::DarkGray);
 const LINK: Style = Style::new().fg(Color::Cyan);
 const SELECTION: Color = Color::Rgb(0x2a, 0x24, 0x16);
+
+/// tui-markdown paints H1 on a cyan block (a line-level style) and inline code on black, which
+/// fights any terminal theme. Drop every background and restate the hierarchy in lam's palette.
+fn adopt_palette(text: Text<'_>) -> Text<'static> {
+    const MD_HEADING_BG: Option<Color> = Some(Color::Cyan);
+    const MD_CODE_BG: Option<Color> = Some(Color::Black);
+    let lines = text
+        .lines
+        .into_iter()
+        .map(|line| {
+            let line_style = if line.style.bg == MD_HEADING_BG {
+                ACCENT
+            } else {
+                let mut style = line.style;
+                style.bg = None;
+                style
+            };
+            let spans = line
+                .spans
+                .into_iter()
+                .map(|span| {
+                    let style = if span.style.bg == MD_CODE_BG {
+                        Style::new().fg(Color::Magenta)
+                    } else {
+                        let mut style = span.style;
+                        style.bg = None;
+                        style
+                    };
+                    Span::styled(span.content.into_owned(), style)
+                })
+                .collect::<Vec<_>>();
+            Line::from(spans).style(line_style)
+        })
+        .collect::<Vec<_>>();
+    Text::from(lines)
+}
 
 /// A footer hint: the key in accent, the label dimmed.
 fn key<'a>(k: &str, label: &str) -> Vec<Span<'a>> {
@@ -928,12 +965,60 @@ mod tests {
         let md = App::reader_markdown(&i);
         assert!(md.starts_with("# Approve MON-3120?"));
         assert!(md.contains("## Summary\n\nTwo files changed."));
-        assert!(md.contains("<https://x/pr/1>"));
         assert!(md.contains("- [x] PR 1"));
         assert!(md.contains("- [ ] PR 2"));
-        // and it survives the renderer
-        let text = tui_markdown::from_str(&md);
-        assert!(text.lines.len() > 3, "rendered {} lines", text.lines.len());
+        assert!(
+            !md.contains("https://"),
+            "the link is added after rendering, not as markdown"
+        );
+
+        let doc = App::reader_document(&i);
+        let flat: Vec<String> = doc
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let link_lines: Vec<&String> = flat
+            .iter()
+            .filter(|l| l.contains("https://x/pr/1"))
+            .collect();
+        assert_eq!(
+            link_lines.len(),
+            1,
+            "the link appears exactly once: {flat:?}"
+        );
+        assert!(flat.iter().any(|l| l.contains("Approve MON-3120?")));
+
+        // no line or span may keep a background: those are the crate's cyan/black blocks
+        for line in &doc.lines {
+            assert!(
+                matches!(line.style.bg, None | Some(Color::Reset)),
+                "line background leaked"
+            );
+            for span in &line.spans {
+                assert!(
+                    matches!(span.style.bg, None | Some(Color::Reset)),
+                    "background leaked into the reader: {:?}",
+                    span.style
+                );
+            }
+        }
+        let heading = doc
+            .lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .iter()
+                    .any(|s| s.content.contains("Approve MON-3120?"))
+            })
+            .expect("heading line");
+        assert_eq!(
+            heading.style.fg,
+            Some(Color::Yellow),
+            "H1 is amber, not a cyan block"
+        );
+        assert!(heading.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(heading.style.bg, None);
     }
 
     #[test]
