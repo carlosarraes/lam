@@ -3,8 +3,9 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use ratatui::Frame;
+use std::cell::Cell;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -48,6 +49,11 @@ pub struct App {
     /// Cursor within the selected item's checks.
     check_sel: usize,
     show_all: bool,
+    /// Side-by-side markdown reader for long bodies (`m`).
+    reader: bool,
+    scroll: u16,
+    /// Rendered length of the reader document, recorded while drawing so scrolling can clamp.
+    doc_lines: Cell<u16>,
     mode: Mode,
     status: String,
     host: String,
@@ -61,6 +67,9 @@ impl App {
             selected: 0,
             check_sel: 0,
             show_all: false,
+            reader: false,
+            scroll: 0,
+            doc_lines: Cell::new(0),
             mode: Mode::Normal,
             status: "connecting".into(),
             host,
@@ -75,6 +84,40 @@ impl App {
     fn clamp(&mut self) {
         self.selected = self.selected.min(self.visible().len().saturating_sub(1));
         self.check_sel = 0;
+        self.scroll = 0;
+    }
+
+    fn nav_hint(&self) -> &'static str {
+        if self.reader {
+            "j/k move · J/K scroll · g/G top/end · m close · / filter · q quit"
+        } else {
+            "j/k move · m read · / filter · a all · R refresh · q quit"
+        }
+    }
+
+    fn scroll_by(&mut self, delta: i32) {
+        let max = self.doc_lines.get().saturating_sub(1) as i32;
+        self.scroll = (self.scroll as i32 + delta).clamp(0, max.max(0)) as u16;
+    }
+
+    /// The item's body as markdown, with the link and checklist appended so the reader is the whole ask.
+    fn reader_markdown(item: &Item) -> String {
+        let mut md = format!("# {}\n\n", item.title);
+        if !item.body.is_empty() {
+            md.push_str(&item.body);
+            md.push_str("\n\n");
+        }
+        if !item.link.is_empty() {
+            md.push_str(&format!("<{}>\n\n", item.link));
+        }
+        for c in &item.checks {
+            md.push_str(&format!(
+                "- [{}] {}\n",
+                if c.done { "x" } else { " " },
+                c.label
+            ));
+        }
+        md
     }
 
     /// Items matching the current filter, which matches on agent name or title.
@@ -153,12 +196,14 @@ impl App {
                 if self.selected + 1 < self.visible().len() {
                     self.selected += 1;
                     self.check_sel = 0;
+                    self.scroll = 0;
                 }
                 None
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
                 self.check_sel = 0;
+                self.scroll = 0;
                 None
             }
             KeyCode::Tab => {
@@ -181,6 +226,27 @@ impl App {
             KeyCode::Char('a') => {
                 self.show_all = !self.show_all;
                 Some(Action::Refresh)
+            }
+            KeyCode::Char('m') => {
+                self.reader = !self.reader;
+                self.scroll = 0;
+                None
+            }
+            KeyCode::Char('J') | KeyCode::PageDown => {
+                self.scroll_by(if key.code == KeyCode::PageDown { 10 } else { 1 });
+                None
+            }
+            KeyCode::Char('K') | KeyCode::PageUp => {
+                self.scroll_by(if key.code == KeyCode::PageUp { -10 } else { -1 });
+                None
+            }
+            KeyCode::Char('g') => {
+                self.scroll = 0;
+                None
+            }
+            KeyCode::Char('G') => {
+                self.scroll_by(i32::MAX / 2);
+                None
             }
             KeyCode::Char('/') => {
                 self.mode = Mode::Filter;
@@ -224,16 +290,25 @@ impl App {
     }
 
     fn draw(&self, f: &mut Frame) {
-        let checks = self.current().map_or(0, |i| i.checks.len() as u16);
-        let [header, list, detail, footer] = Layout::vertical([
+        let visible = self.visible();
+        // The list asks for exactly its rows (plus its rule) and never more than a third of the
+        // screen, so the body — which is where the agent's message lives — keeps the rest.
+        let list_h = (visible.len() as u16 + 1).clamp(3, (f.area().height / 3).max(3));
+        let [header, body, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(6 + checks),
             Constraint::Length(2),
         ])
         .areas(f.area());
-
-        let visible = self.visible();
+        let (list, detail) = if self.reader {
+            let [l, r] =
+                Layout::horizontal([Constraint::Length(34), Constraint::Min(20)]).areas(body);
+            (l, r)
+        } else {
+            let [l, d] =
+                Layout::vertical([Constraint::Length(list_h), Constraint::Min(3)]).areas(body);
+            (l, d)
+        };
         let open = visible.iter().filter(|i| i.status == "open").count();
         let live = self.status == "live";
         let [head_l, head_r] =
@@ -300,9 +375,7 @@ impl App {
                     ),
                     META,
                 ))];
-                if !i.body.is_empty() {
-                    lines.push(Line::raw(i.body.clone()));
-                }
+                lines.extend(i.body.lines().map(|l| Line::raw(l.to_string())));
                 if !i.link.is_empty() {
                     lines.push(Line::from(Span::styled(i.link.clone(), LINK)));
                 }
@@ -333,12 +406,33 @@ impl App {
                 META,
             ))],
         };
-        f.render_widget(
+        let md;
+        let rendered;
+        let pane = if let (true, Some(item)) = (self.reader, self.current()) {
+            md = Self::reader_markdown(item);
+            rendered = tui_markdown::from_str(&md);
+            self.doc_lines.set(rendered.lines.len() as u16);
+            let border = if self.reader {
+                Borders::LEFT
+            } else {
+                Borders::TOP
+            };
+            Paragraph::new(rendered.clone())
+                .wrap(Wrap { trim: false })
+                .scroll((self.scroll, 0))
+                .block(
+                    Block::default()
+                        .borders(border)
+                        .border_style(RULE)
+                        .padding(Padding::horizontal(1)),
+                )
+        } else {
+            self.doc_lines.set(0);
             Paragraph::new(text)
                 .wrap(Wrap { trim: false })
-                .block(Block::default().borders(Borders::TOP).border_style(RULE)),
-            detail,
-        );
+                .block(Block::default().borders(Borders::TOP).border_style(RULE))
+        };
+        f.render_widget(pane, detail);
 
         let footer_text = match (&self.mode, self.current()) {
             (Mode::Filter, _) => vec![
@@ -380,18 +474,12 @@ impl App {
                 spans.extend(key("d", "dismiss"));
                 vec![
                     Line::from(spans),
-                    Line::from(Span::styled(
-                        "j/k move · / filter · a all · R refresh · q quit",
-                        DIM,
-                    )),
+                    Line::from(Span::styled(self.nav_hint(), DIM)),
                 ]
             }
             _ => vec![
                 Line::raw(""),
-                Line::from(Span::styled(
-                    "j/k move · / filter · a all · R refresh · q quit",
-                    DIM,
-                )),
+                Line::from(Span::styled(self.nav_hint(), DIM)),
             ],
         };
         f.render_widget(Paragraph::new(footer_text), footer);
@@ -789,6 +877,63 @@ mod tests {
             2,
             "Esc clears back to the previous filter"
         );
+    }
+
+    #[test]
+    fn reader_toggles_and_scrolls_within_the_document() {
+        let mut a = app();
+        assert_eq!(a.handle(key('m')), None);
+        assert!(a.reader);
+        a.doc_lines.set(30);
+
+        a.handle(key('J'));
+        a.handle(key('J'));
+        assert_eq!(a.scroll, 2);
+        a.handle(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(a.scroll, 12);
+        a.handle(key('G'));
+        assert_eq!(a.scroll, 29, "G stops at the last line, never past it");
+        a.handle(key('K'));
+        assert_eq!(a.scroll, 28);
+        a.handle(key('g'));
+        assert_eq!(a.scroll, 0);
+        a.handle(key('K'));
+        assert_eq!(a.scroll, 0, "scrolling up at the top is a no-op");
+
+        a.handle(key('J'));
+        a.handle(key('j'));
+        assert_eq!(a.scroll, 0, "a new item starts at the top of its document");
+
+        a.handle(key('m'));
+        assert!(!a.reader);
+    }
+
+    #[test]
+    fn reader_markdown_carries_title_link_and_checks() {
+        let mut i = item("aaa", "open", &[], "https://x/pr/1");
+        i.title = "Approve MON-3120?".into();
+        i.body = "## Summary\n\nTwo files changed.".into();
+        i.checks = vec![
+            crate::client::Check {
+                label: "PR 1".into(),
+                done: true,
+                at: None,
+            },
+            crate::client::Check {
+                label: "PR 2".into(),
+                done: false,
+                at: None,
+            },
+        ];
+        let md = App::reader_markdown(&i);
+        assert!(md.starts_with("# Approve MON-3120?"));
+        assert!(md.contains("## Summary\n\nTwo files changed."));
+        assert!(md.contains("<https://x/pr/1>"));
+        assert!(md.contains("- [x] PR 1"));
+        assert!(md.contains("- [ ] PR 2"));
+        // and it survives the renderer
+        let text = tui_markdown::from_str(&md);
+        assert!(text.lines.len() > 3, "rendered {} lines", text.lines.len());
     }
 
     #[test]

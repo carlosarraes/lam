@@ -23,6 +23,8 @@ agent ──lam push──▶ lam-api (CF Worker: Effect + D1 + Topic DO) ──
 
 Pushing the same name+title+body while the original is still open returns the existing item (HTTP 200, same id) instead of queueing a second one, so a retry after a lost response never double-notifies.
 
+Item bodies are markdown. In the TUI, `m` opens a side-by-side reader (list left, rendered markdown right) with `J`/`K`, `PgUp`/`PgDn` and `g`/`G` to scroll — so an agent can send a whole plan, not a teaser.
+
 ## Agent names
 
 Every item records **who asked**. `lam push` resolves the name in this order: `--name` → `$LAM_NAME` → the multiplexer (`tmux display-message -p -t "$TMUX_PANE" '#S:#W'`, zellij session, or screen `$STY`) → error. Pane-targeting matters: an agent working in a background tmux window would otherwise report whichever window you are looking at.
@@ -37,6 +39,6 @@ Every item records **who asked**. `lam push` resolves the name in this order: `-
 | `lam check tick\|untick <id> <n>` | Carlos's side, from the terminal |
 | `lam list [--all] [--json]`, `lam show <id>` | |
 | `lam done <id> [choice] [-m text]`, `lam dismiss <id>` | Carlos's side |
-| `lam` / `lam tui` | interactive queue in the terminal: `1-3` choose, `Enter` done, `Tab`/`Space` tick checks, `r` reply text, `d` dismiss, `o` open link, `/` filter by agent, `a` show all, live updates |
+| `lam` / `lam tui` | interactive queue in the terminal: `1-3` choose, `Enter` done, `Tab`/`Space` tick checks, `r` reply text, `d` dismiss, `o` open link, `m` markdown reader, `/` filter by agent, `a` show all, live updates |
 | `lam watch` | mirror ntfy → desktop notifications |
 | `lam --llm` | print the agent guide (the `lam` skill) — for agents that don't have the skill installed |

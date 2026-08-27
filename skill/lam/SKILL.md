@@ -43,6 +43,7 @@ Checklist loop: `lam wait` exits 0 both on progress and on resolution — check 
 `wait` prints the item as JSON. Read `response_choice` (button pressed) and `response_text` (free text). Exit codes: `0` resolved, `2` dismissed (he doesn't want to deal with it — stop and report), `3` timeout (fall back to `lam list` later; do not re-push the same question), `4` expired (TTL passed — decide whether to re-push), `5` retracted.
 
 - `-p critical` only for actual blockers; `normal` for "look when convenient".
+- The body may be **markdown** — headings, bullets, tables, fenced code. Carlos reads it rendered in the terminal (`m` opens a reader pane), so send the whole plan or diff summary when the decision needs it rather than a one-line teaser. The phone shows the same text unrendered, so keep the first line meaningful.
 - A push with the same name, title and body as an item that is still open returns **that item's id** and does not notify again — so a retry after a failed-looking push is safe, and re-asking an open question is a no-op.
 - Never invent a name that hides who you are: the inferred `session:window` is what Carlos looks for when several agents are running.
 - Title = the decision. Body = where to act ("Reply in Claude Code: …"). Host and project are attached automatically.
