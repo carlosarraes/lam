@@ -179,177 +179,226 @@ impl App {
     }
 
     fn draw(&self, f: &mut Frame) {
+        let checks = self.current().map_or(0, |i| i.checks.len() as u16);
         let [header, list, detail, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(6 + self.current().map_or(0, |i| i.checks.len() as u16)),
+            Constraint::Length(6 + checks),
             Constraint::Length(2),
         ])
         .areas(f.area());
 
         let open = self.items.iter().filter(|i| i.status == "open").count();
+        let live = self.status == "live";
+        let [head_l, head_r] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(40)]).areas(header);
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(" lam ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(format!(
-                    "— {open} open{}",
-                    if self.show_all { " (showing all)" } else { "" }
-                )),
-                Span::raw(format!("   {}  ● {}", self.host, self.status)),
+                Span::styled("lam", BOLD),
+                Span::styled(format!("  {open} open"), META),
+                Span::styled(if self.show_all { "  · all" } else { "" }, DIM),
             ])),
-            header,
+            head_l,
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{}  ", self.host), META),
+                Span::styled(
+                    "●",
+                    if live {
+                        Style::default().fg(Color::Green)
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    },
+                ),
+                Span::styled(format!(" {}", self.status), META),
+            ]))
+            .right_aligned(),
+            head_r,
         );
 
         let rows: Vec<ListItem> = self.items.iter().map(row).collect();
         let mut state = ListState::default().with_selected(Some(self.selected));
         f.render_stateful_widget(
             List::new(rows)
-                .block(Block::default().borders(Borders::TOP))
-                .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-                .highlight_symbol("▸ "),
+                .block(Block::default().borders(Borders::TOP).border_style(RULE))
+                .highlight_style(Style::default().bg(SELECTION)),
             list,
             &mut state,
         );
 
         let text = match self.current() {
             Some(i) => {
-                let src = [i.source_host.as_str(), i.source_project.as_str()]
-                    .iter()
-                    .filter(|s| !s.is_empty())
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(":");
                 let mut lines = vec![Line::from(Span::styled(
-                    format!("({src})  {}", i.title),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    format!(
+                        "{} · {} · {} ago",
+                        source(i),
+                        i.priority,
+                        age(&i.created_at)
+                    ),
+                    META,
                 ))];
                 if !i.body.is_empty() {
                     lines.push(Line::raw(i.body.clone()));
                 }
                 if !i.link.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        i.link.clone(),
-                        Style::default().fg(Color::Blue),
-                    )));
+                    lines.push(Line::from(Span::styled(i.link.clone(), LINK)));
                 }
                 for (n, c) in i.checks.iter().enumerate() {
-                    let cursor = if n == self.check_sel && i.status == "open" {
-                        "▸"
-                    } else {
-                        " "
-                    };
-                    let style = if c.done {
-                        Style::default().fg(Color::DarkGray)
-                    } else {
-                        Style::default()
-                    };
-                    lines.push(Line::from(Span::styled(
-                        format!("{cursor} [{}] {}", if c.done { "x" } else { " " }, c.label),
-                        style,
-                    )));
+                    let cursor = n == self.check_sel && i.status == "open";
+                    lines.push(Line::from(vec![
+                        Span::styled(if cursor { "▸ " } else { "  " }, ACCENT),
+                        Span::styled(
+                            format!("{} {}", if c.done { "✔" } else { "○" }, c.label),
+                            if c.done { DIM } else { Style::default() },
+                        ),
+                    ]));
                 }
                 if let Some(answer) = i.response_choice.as_deref().or(i.response_text.as_deref()) {
-                    lines.push(Line::raw(format!(
-                        "{} via {}: {answer}",
-                        i.status,
-                        i.response_by.as_deref().unwrap_or("?")
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "{} via {}: {answer}",
+                            i.status,
+                            i.response_by.as_deref().unwrap_or("?")
+                        ),
+                        META,
                     )));
                 }
                 lines
             }
-            None => vec![Line::raw("nothing here — all caught up")],
+            None => vec![Line::from(Span::styled(
+                "nothing here — all caught up",
+                META,
+            ))],
         };
         f.render_widget(
             Paragraph::new(text)
                 .wrap(Wrap { trim: false })
-                .block(Block::default().borders(Borders::TOP)),
+                .block(Block::default().borders(Borders::TOP).border_style(RULE)),
             detail,
         );
 
         let footer_text = match (&self.mode, self.current()) {
             (Mode::Reply(t), _) => vec![
                 Line::from(vec![
-                    Span::styled("reply> ", Style::default().fg(Color::Yellow)),
+                    Span::styled("reply› ", ACCENT),
                     Span::raw(t.clone()),
-                    Span::raw("█"),
+                    Span::styled("█", ACCENT),
                 ]),
-                Line::raw("Enter send · Esc cancel"),
+                Line::from([key("Enter", "send"), key("Esc", "cancel")].concat()),
             ],
             (_, Some(i)) if i.status == "open" => {
-                let mut keys: Vec<String> = i
+                let mut spans: Vec<Span> = i
                     .choices
                     .iter()
                     .enumerate()
-                    .map(|(n, c)| format!("[{}] {c}", n + 1))
+                    .flat_map(|(n, c)| key(&(n + 1).to_string(), c))
                     .collect();
                 if !i.checks.is_empty() {
-                    keys.push(format!(
-                        "[Tab] next check   [Space] toggle ({}/{})",
-                        i.checks_done(),
-                        i.checks.len()
+                    spans.extend(key("Tab", "next check"));
+                    spans.extend(key(
+                        "Space",
+                        &format!("toggle {}/{}", i.checks_done(), i.checks.len()),
                     ));
                 } else if i.choices.is_empty() {
-                    keys.push("[Enter] done".into());
+                    spans.extend(key("Enter", "done"));
                 }
                 if !i.link.is_empty() {
-                    keys.push("[o] open link".into());
+                    spans.extend(key("o", "open"));
                 }
-                keys.push("[r] reply text".into());
-                keys.push("[d] dismiss".into());
+                spans.extend(key("r", "reply"));
+                spans.extend(key("d", "dismiss"));
                 vec![
-                    Line::from(Span::styled(
-                        keys.join("   "),
-                        Style::default().fg(Color::Green),
-                    )),
-                    Line::raw("j/k move · a all/open · R refresh · q quit"),
+                    Line::from(spans),
+                    Line::from(Span::styled("j/k move · a all · R refresh · q quit", DIM)),
                 ]
             }
             _ => vec![
                 Line::raw(""),
-                Line::raw("j/k move · a all/open · R refresh · q quit"),
+                Line::from(Span::styled("j/k move · a all · R refresh · q quit", DIM)),
             ],
         };
         f.render_widget(Paragraph::new(footer_text), footer);
     }
 }
 
-fn row(i: &Item) -> ListItem<'_> {
-    let icon = match (i.status.as_str(), i.priority.as_str()) {
-        ("open", "critical") => "🚨",
-        ("open", _) => "👀",
-        ("resolved", _) => "✅",
-        ("retracted", _) => "↩ ",
-        _ => "✖ ",
-    };
-    let src = [i.source_host.as_str(), i.source_project.as_str()]
+// Palette: one accent (amber) for "pressable" and attention; priority in red/blue so amber stays unique.
+const ACCENT: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
+const META: Style = Style::new().fg(Color::Gray);
+const DIM: Style = Style::new().fg(Color::DarkGray);
+const RULE: Style = Style::new().fg(Color::DarkGray);
+const LINK: Style = Style::new().fg(Color::Cyan);
+const SELECTION: Color = Color::Rgb(0x2a, 0x24, 0x16);
+
+/// A footer hint: the key in accent, the label dimmed.
+fn key<'a>(k: &str, label: &str) -> Vec<Span<'a>> {
+    vec![
+        Span::styled(k.to_string(), ACCENT),
+        Span::styled(format!(" {label}   "), META),
+    ]
+}
+
+fn source(i: &Item) -> String {
+    [i.source_host.as_str(), i.source_project.as_str()]
         .iter()
         .filter(|s| !s.is_empty())
         .cloned()
         .collect::<Vec<_>>()
-        .join(":");
-    let style = if i.status == "open" {
-        Style::default()
-    } else {
-        Style::default().fg(Color::DarkGray)
+        .join(":")
+}
+
+/// Compact relative age like `2m`, `1h`, `3d` from an RFC 3339 timestamp.
+pub fn age(created_at: &str) -> String {
+    let Ok(t) = chrono::DateTime::parse_from_rfc3339(created_at) else {
+        return String::new();
     };
+    let secs = (chrono::Utc::now() - t.with_timezone(&chrono::Utc))
+        .num_seconds()
+        .max(0);
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
+fn row(i: &Item) -> ListItem<'_> {
+    let open = i.status == "open";
+    let gutter = match (open, i.priority.as_str()) {
+        (true, "critical") => Style::default().fg(Color::Red),
+        (true, "low") => DIM,
+        (true, _) => Style::default().fg(Color::Blue),
+        (false, _) => RULE,
+    };
+    let title = if i.checks.is_empty() {
+        i.title.clone()
+    } else {
+        format!("{}  {}/{}", i.title, i.checks_done(), i.checks.len())
+    };
+    let text = if open { Style::default() } else { DIM };
     ListItem::new(Line::from(vec![
-        Span::raw(format!("{icon} {:<6} ", i.id)),
-        Span::styled(format!("{src:<22} "), Style::default().fg(Color::Cyan)),
-        Span::raw(if i.checks.is_empty() {
-            i.title.clone()
-        } else {
-            format!("{} [{}/{}]", i.title, i.checks_done(), i.checks.len())
-        }),
+        Span::styled("▍ ", gutter),
+        Span::styled(format!("{:<6} ", i.id), if open { META } else { DIM }),
+        Span::styled(format!("{:<18} ", source(i)), if open { LINK } else { DIM }),
+        Span::styled(title, text),
+        Span::styled(format!("   {}", age(&i.created_at)), DIM),
     ]))
-    .style(style)
 }
 
 enum Msg {
-    Push,
+    /// A push arrived; `fresh` is true for new items (not closed/updated notices).
+    Push {
+        fresh: bool,
+        title: String,
+        body: String,
+        critical: bool,
+    },
     Status(String),
 }
 
-pub fn run() -> Result<i32> {
+pub fn run(silent: bool) -> Result<i32> {
     let cfg = Config::load()?;
     let client = Client::new(&cfg)?;
     let mut app = App::new(hostname::get()?.to_string_lossy().into_owned());
@@ -359,8 +408,14 @@ pub fn run() -> Result<i32> {
     std::thread::spawn(move || {
         watch::subscribe(
             &stream_cfg,
-            |_| {
-                let _ = tx.send(Msg::Push);
+            |ev| {
+                let fresh = ev.tags.iter().any(|t| t == "eyes" || t == "rotating_light");
+                let _ = tx.send(Msg::Push {
+                    fresh,
+                    title: ev.title,
+                    body: ev.message,
+                    critical: ev.priority >= 5,
+                });
             },
             |s| {
                 let _ = tx.send(Msg::Status(s.to_string()));
@@ -369,7 +424,7 @@ pub fn run() -> Result<i32> {
     });
 
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &mut app, &client, &rx);
+    let result = event_loop(&mut terminal, &mut app, &client, &rx, silent);
     ratatui::restore();
     result.map(|_| 0)
 }
@@ -386,6 +441,7 @@ fn event_loop(
     app: &mut App,
     client: &Client,
     rx: &mpsc::Receiver<Msg>,
+    silent: bool,
 ) -> Result<()> {
     refresh(app, client);
     let mut last_refresh = Instant::now();
@@ -394,7 +450,19 @@ fn event_loop(
 
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                Msg::Push => refresh(app, client),
+                Msg::Push {
+                    fresh,
+                    title,
+                    body,
+                    critical,
+                } => {
+                    if fresh && !silent {
+                        // Bell reaches you through ssh; the desktop notification only where there is a display.
+                        let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x07");
+                        let _ = crate::notify::desktop(&title, &body, critical);
+                    }
+                    refresh(app, client);
+                }
                 Msg::Status(s) => app.set_status(s),
             }
         }
@@ -598,6 +666,15 @@ mod tests {
         assert_eq!(a.check_sel, 0, "Tab wraps");
         a.set_items(vec![item("plain", "open", &[], "")]);
         assert_eq!(a.handle(key(' ')), None);
+    }
+
+    #[test]
+    fn age_is_compact_and_tolerant() {
+        let t = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        assert_eq!(age(&t), "5m");
+        let t = (chrono::Utc::now() - chrono::Duration::hours(26)).to_rfc3339();
+        assert_eq!(age(&t), "1d");
+        assert_eq!(age("garbage"), "");
     }
 
     #[test]

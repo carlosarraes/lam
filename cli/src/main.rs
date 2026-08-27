@@ -106,7 +106,11 @@ enum Cmd {
     /// Subscribe to ntfy and mirror pushes as desktop notifications
     Watch,
     /// Interactive queue: answer items from the terminal (default when no command is given)
-    Tui,
+    Tui {
+        /// No bell or desktop notification when new items arrive
+        #[arg(long)]
+        silent: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -125,7 +129,7 @@ fn main() {
         print!("{}", llm_guide());
         std::process::exit(0);
     }
-    let code = match run(cli.cmd.unwrap_or(Cmd::Tui)) {
+    let code = match run(cli.cmd.unwrap_or(Cmd::Tui { silent: false })) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("lam: {e:#}");
@@ -175,7 +179,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Check(CheckCmd::Tick { id, n }) => commands::check_set(&id, n, true),
         Cmd::Check(CheckCmd::Untick { id, n }) => commands::check_set(&id, n, false),
         Cmd::Watch => watch::run(),
-        Cmd::Tui => tui::run(),
+        Cmd::Tui { silent } => tui::run(silent),
     }
 }
 

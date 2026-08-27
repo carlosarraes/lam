@@ -15,6 +15,8 @@ pub struct NtfyEvent {
     pub message: String,
     #[serde(default = "default_priority")]
     pub priority: u8,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 fn default_priority() -> u8 {
