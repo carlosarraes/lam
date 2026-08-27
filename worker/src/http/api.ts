@@ -47,7 +47,11 @@ export const api = HttpRouter.empty.pipe(
     "/items",
     Effect.gen(function* () {
       const input = yield* HttpServerRequest.schemaBodyJson(NewItem);
-      const item = yield* (yield* Items).create(input);
+      const items = yield* Items;
+      // A retry of a push whose response was lost must not queue (and notify) twice.
+      const existing = yield* items.findDuplicate(input);
+      if (Option.isSome(existing)) return yield* HttpServerResponse.json(existing.value, { status: 200 });
+      const item = yield* items.create(input);
       const baseUrl = yield* origin;
       yield* background((yield* Notify).itemCreated(item, baseUrl));
       return yield* HttpServerResponse.json(item, { status: 201 });

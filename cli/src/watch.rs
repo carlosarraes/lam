@@ -57,6 +57,7 @@ pub fn subscribe(
 /// `lam watch`: mirror every push to the desktop.
 pub fn run() -> Result<i32> {
     let cfg = Config::load()?;
+    let _lock = notify::claim_watch();
     eprintln!("lam watch: {}/{}/json", cfg.ntfy_url(), cfg.topic);
     subscribe(
         &cfg,

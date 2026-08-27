@@ -6,7 +6,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 fn item(id: &str, status: &str, choice: Option<&str>) -> serde_json::Value {
     serde_json::json!({
         "id": id, "title": "t", "body": "", "source_host": "h", "source_project": "p",
-        "priority": "normal", "choices": [], "checks": [], "version": 0, "status": status,
+        "name": "test:agent", "priority": "normal", "choices": [], "checks": [], "version": 0, "status": status,
         "response_choice": choice, "response_text": null, "response_by": choice.map(|_| "phone"),
         "created_at": "2026-08-25T00:00:00Z", "resolved_at": null
     })
@@ -36,6 +36,7 @@ async fn setup() -> (MockServer, tempfile::TempDir) {
 fn lam(dir: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_lam"))
         .env("LAM_CONFIG", dir.path().join("config.toml"))
+        .env("LAM_NAME", "test:agent")
         .args(args)
         .output()
         .unwrap()
@@ -79,6 +80,7 @@ async fn push_prints_id_and_sends_bearer() {
     assert_eq!(body["title"], "hello");
     assert_eq!(body["priority"], "critical");
     assert_eq!(body["choices"], serde_json::json!(["yes", "no"]));
+    assert_eq!(body["name"], "test:agent");
     assert_eq!(body["link"], "https://x/pr/1");
     assert_eq!(body["ttl"], 1800);
     assert!(!body["source_host"].as_str().unwrap().is_empty());
@@ -233,11 +235,9 @@ async fn wait_many_ids_uses_wait_any_endpoint() {
 #[tokio::test]
 async fn wait_any_collects_my_open_items() {
     let (server, dir) = setup().await;
-    let host = hostname::get().unwrap().to_string_lossy().into_owned();
-    let mut mine = item("mine1", "open", None);
-    mine["source_host"] = serde_json::json!(host);
-    mine["source_project"] = serde_json::json!("lam");
-    let theirs = item("other", "open", None);
+    let mine = item("mine1", "open", None);
+    let mut theirs = item("other", "open", None);
+    theirs["name"] = serde_json::json!("other:agent");
     Mock::given(method("GET"))
         .and(path("/items"))
         .and(query_param("status", "open"))
@@ -254,12 +254,7 @@ async fn wait_any_collects_my_open_items() {
         .expect(1)
         .mount(&server)
         .await;
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_lam"))
-        .env("LAM_CONFIG", dir.path().join("config.toml"))
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .args(["wait", "--any"])
-        .output()
-        .unwrap();
+    let out = lam(&dir, &["wait", "--any"]);
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -278,4 +273,40 @@ async fn retract_posts() {
         .mount(&server)
         .await;
     assert!(lam(&dir, &["retract", "abc12"]).status.success());
+}
+
+#[tokio::test]
+async fn push_without_any_name_source_fails_with_guidance() {
+    let (_server, dir) = setup().await;
+    let out = Command::new(env!("CARGO_BIN_EXE_lam"))
+        .env("LAM_CONFIG", dir.path().join("config.toml"))
+        .env_remove("LAM_NAME")
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .env_remove("ZELLIJ_SESSION_NAME")
+        .env_remove("STY")
+        .args(["push", "who am i"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--name"), "{err}");
+    assert!(err.contains("LAM_NAME"), "{err}");
+}
+
+#[tokio::test]
+async fn explicit_name_flag_wins_over_env() {
+    let (server, dir) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/items"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(item("abc12", "open", None)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert!(lam(&dir, &["push", "x", "--name", "sweep:2"])
+        .status
+        .success());
+    let req = &server.received_requests().await.unwrap()[0];
+    let body: serde_json::Value = req.body_json().unwrap();
+    assert_eq!(body["name"], "sweep:2");
 }

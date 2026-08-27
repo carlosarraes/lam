@@ -1,6 +1,7 @@
 mod client;
 mod commands;
 mod config;
+mod name;
 mod notify;
 mod tui;
 mod watch;
@@ -47,6 +48,9 @@ enum Cmd {
     /// Queue an item; prints its id
     Push {
         title: String,
+        /// Who is asking; inferred from tmux/zellij/screen as session:window, or $LAM_NAME
+        #[arg(short = 'n', long)]
+        name: Option<String>,
         #[arg(short, long, default_value = "")]
         body: String,
         #[arg(short, long, default_value = "normal", value_parser = ["low", "normal", "critical"])]
@@ -73,9 +77,12 @@ enum Cmd {
         /// One id, or several to return whichever closes first
         #[arg(required_unless_present = "any")]
         ids: Vec<String>,
-        /// Wait on every open item pushed from this host and project
+        /// Wait on every open item pushed under this agent's name
         #[arg(long, conflicts_with = "ids")]
         any: bool,
+        /// Name to scope --any to; defaults to this agent's inferred name
+        #[arg(short = 'n', long)]
+        name: Option<String>,
         /// e.g. 30m, 2h, 90s
         #[arg(long, default_value = "2h")]
         timeout: String,
@@ -148,6 +155,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         } => commands::init(server, token, topic),
         Cmd::Push {
             title,
+            name,
             body,
             priority,
             choices,
@@ -157,6 +165,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             wait,
         } => commands::push(commands::PushArgs {
             title,
+            name,
             body,
             priority,
             choices,
@@ -165,7 +174,12 @@ fn run(cmd: Cmd) -> Result<i32> {
             ttl,
             wait,
         }),
-        Cmd::Wait { ids, any, timeout } => commands::wait(&ids, any, &timeout),
+        Cmd::Wait {
+            ids,
+            any,
+            name,
+            timeout,
+        } => commands::wait(&ids, any, name, &timeout),
         Cmd::List { all, json } => commands::list(all, json),
         Cmd::Show { id } => commands::show(&id),
         Cmd::Done {

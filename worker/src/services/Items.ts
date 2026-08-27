@@ -1,4 +1,4 @@
-import { Effect, Schema } from "effect";
+import { Effect, Option, Schema } from "effect";
 import { Env } from "../Env";
 import { AlreadyClosed, BadRequest, Conflict, DbError, Item, ItemRow, NotFound, type NewItem, type ResponseBy, type Status } from "../domain/Item";
 
@@ -71,14 +71,26 @@ export class Items extends Effect.Service<Items>()("lam/Items", {
         yield* db((d) =>
           d
             .prepare(
-              `INSERT INTO items (id, title, body, source_host, source_project, priority, choices, checks, link, status, created_at, expires_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`,
+              `INSERT INTO items (id, name, title, body, source_host, source_project, priority, choices, checks, link, status, created_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`,
             )
-            .bind(item.id, item.title, item.body, item.source_host, item.source_project, item.priority, JSON.stringify(item.choices), JSON.stringify(item.checks), item.link, item.created_at, item.expires_at)
+            .bind(item.id, item.name, item.title, item.body, item.source_host, item.source_project, item.priority, JSON.stringify(item.choices), JSON.stringify(item.checks), item.link, item.created_at, item.expires_at)
             .run(),
         );
         return item;
       }),
+
+    /** An open, unexpired item with identical content — a retry of a push whose response was lost. */
+    findDuplicate: (input: NewItem) =>
+      db((d) =>
+        d
+          .prepare(
+            `SELECT * FROM items WHERE status = 'open' AND name = ? AND title = ? AND body = ?
+             AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC LIMIT 1`,
+          )
+          .bind(input.name, input.title, input.body, new Date().toISOString())
+          .first(),
+      ).pipe(Effect.flatMap((row) => (row ? Effect.map(decodeRow(row), Option.some) : Effect.succeed(Option.none<Item>())))),
 
     get: (id: string) =>
       db((d) => d.prepare("SELECT * FROM items WHERE id = ?").bind(id).first()).pipe(

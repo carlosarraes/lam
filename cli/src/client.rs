@@ -16,6 +16,8 @@ pub struct Check {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Item {
     pub id: String,
+    #[serde(default)]
+    pub name: String,
     pub title: String,
     pub body: String,
     pub source_host: String,
@@ -46,6 +48,7 @@ impl Item {
 
 #[derive(Debug, Serialize)]
 pub struct NewItem {
+    pub name: String,
     pub title: String,
     pub body: String,
     pub source_host: String,

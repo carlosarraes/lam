@@ -37,10 +37,13 @@ pub enum Action {
 enum Mode {
     Normal,
     Reply(String),
+    /// Live-filtering by agent name or title.
+    Filter,
 }
 
 pub struct App {
     items: Vec<Item>,
+    filter: String,
     selected: usize,
     /// Cursor within the selected item's checks.
     check_sel: usize,
@@ -54,6 +57,7 @@ impl App {
     pub fn new(host: String) -> Self {
         Self {
             items: vec![],
+            filter: String::new(),
             selected: 0,
             check_sel: 0,
             show_all: false,
@@ -65,7 +69,24 @@ impl App {
 
     pub fn set_items(&mut self, items: Vec<Item>) {
         self.items = items;
-        self.selected = self.selected.min(self.items.len().saturating_sub(1));
+        self.clamp();
+    }
+
+    fn clamp(&mut self) {
+        self.selected = self.selected.min(self.visible().len().saturating_sub(1));
+        self.check_sel = 0;
+    }
+
+    /// Items matching the current filter, which matches on agent name or title.
+    fn visible(&self) -> Vec<&Item> {
+        if self.filter.is_empty() {
+            return self.items.iter().collect();
+        }
+        let f = self.filter.to_lowercase();
+        self.items
+            .iter()
+            .filter(|i| i.name.to_lowercase().contains(&f) || i.title.to_lowercase().contains(&f))
+            .collect()
     }
 
     pub fn set_status(&mut self, s: impl Into<String>) {
@@ -77,11 +98,31 @@ impl App {
     }
 
     fn current(&self) -> Option<&Item> {
-        self.items.get(self.selected)
+        self.visible().get(self.selected).copied()
     }
 
     /// Translates a key press into an Action. Returns None when only internal state changed.
     pub fn handle(&mut self, key: KeyEvent) -> Option<Action> {
+        if matches!(self.mode, Mode::Filter) {
+            match key.code {
+                KeyCode::Esc => {
+                    self.filter.clear();
+                    self.mode = Mode::Normal;
+                    self.clamp();
+                }
+                KeyCode::Enter => self.mode = Mode::Normal,
+                KeyCode::Backspace => {
+                    self.filter.pop();
+                    self.clamp();
+                }
+                KeyCode::Char(c) => {
+                    self.filter.push(c);
+                    self.clamp();
+                }
+                _ => {}
+            }
+            return None;
+        }
         if let Mode::Reply(text) = &mut self.mode {
             match key.code {
                 KeyCode::Esc => self.mode = Mode::Normal,
@@ -109,7 +150,7 @@ impl App {
                 Some(Action::Quit)
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                if self.selected + 1 < self.items.len() {
+                if self.selected + 1 < self.visible().len() {
                     self.selected += 1;
                     self.check_sel = 0;
                 }
@@ -140,6 +181,10 @@ impl App {
             KeyCode::Char('a') => {
                 self.show_all = !self.show_all;
                 Some(Action::Refresh)
+            }
+            KeyCode::Char('/') => {
+                self.mode = Mode::Filter;
+                None
             }
             KeyCode::Char('R') => Some(Action::Refresh),
             KeyCode::Char('d') => self.open_current().map(|i| Action::Dismiss(i.id.clone())),
@@ -188,7 +233,8 @@ impl App {
         ])
         .areas(f.area());
 
-        let open = self.items.iter().filter(|i| i.status == "open").count();
+        let visible = self.visible();
+        let open = visible.iter().filter(|i| i.status == "open").count();
         let live = self.status == "live";
         let [head_l, head_r] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(40)]).areas(header);
@@ -197,6 +243,22 @@ impl App {
                 Span::styled("lam", BOLD),
                 Span::styled(format!("  {open} open"), META),
                 Span::styled(if self.show_all { "  · all" } else { "" }, DIM),
+                Span::styled(
+                    if self.filter.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  /{}", self.filter)
+                    },
+                    ACCENT,
+                ),
+                Span::styled(
+                    if matches!(self.mode, Mode::Filter) {
+                        "█"
+                    } else {
+                        ""
+                    },
+                    ACCENT,
+                ),
             ])),
             head_l,
         );
@@ -217,7 +279,7 @@ impl App {
             head_r,
         );
 
-        let rows: Vec<ListItem> = self.items.iter().map(row).collect();
+        let rows: Vec<ListItem> = visible.iter().map(|i| row(i)).collect();
         let mut state = ListState::default().with_selected(Some(self.selected));
         f.render_stateful_widget(
             List::new(rows)
@@ -279,6 +341,14 @@ impl App {
         );
 
         let footer_text = match (&self.mode, self.current()) {
+            (Mode::Filter, _) => vec![
+                Line::from(vec![
+                    Span::styled("filter› ", ACCENT),
+                    Span::raw(self.filter.clone()),
+                    Span::styled("█", ACCENT),
+                ]),
+                Line::from([key("Enter", "keep"), key("Esc", "clear")].concat()),
+            ],
             (Mode::Reply(t), _) => vec![
                 Line::from(vec![
                     Span::styled("reply› ", ACCENT),
@@ -310,12 +380,18 @@ impl App {
                 spans.extend(key("d", "dismiss"));
                 vec![
                     Line::from(spans),
-                    Line::from(Span::styled("j/k move · a all · R refresh · q quit", DIM)),
+                    Line::from(Span::styled(
+                        "j/k move · / filter · a all · R refresh · q quit",
+                        DIM,
+                    )),
                 ]
             }
             _ => vec![
                 Line::raw(""),
-                Line::from(Span::styled("j/k move · a all · R refresh · q quit", DIM)),
+                Line::from(Span::styled(
+                    "j/k move · / filter · a all · R refresh · q quit",
+                    DIM,
+                )),
             ],
         };
         f.render_widget(Paragraph::new(footer_text), footer);
@@ -339,7 +415,11 @@ fn key<'a>(k: &str, label: &str) -> Vec<Span<'a>> {
     ]
 }
 
+/// Who is asking: the agent's name, falling back to host:project for pre-name items.
 fn source(i: &Item) -> String {
+    if !i.name.is_empty() {
+        return i.name.clone();
+    }
     [i.source_host.as_str(), i.source_project.as_str()]
         .iter()
         .filter(|s| !s.is_empty())
@@ -381,7 +461,7 @@ fn row(i: &Item) -> ListItem<'_> {
     ListItem::new(Line::from(vec![
         Span::styled("▍ ", gutter),
         Span::styled(format!("{:<6} ", i.id), if open { META } else { DIM }),
-        Span::styled(format!("{:<18} ", source(i)), if open { LINK } else { DIM }),
+        Span::styled(format!("{:<20} ", source(i)), if open { LINK } else { DIM }),
         Span::styled(title, text),
         Span::styled(format!("   {}", age(&i.created_at)), DIM),
     ]))
@@ -457,9 +537,12 @@ fn event_loop(
                     critical,
                 } => {
                     if fresh && !silent {
-                        // Bell reaches you through ssh; the desktop notification only where there is a display.
+                        // The bell reaches you through ssh; the desktop popup is left to
+                        // `lam watch` when it owns notifications here, so it never fires twice.
                         let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x07");
-                        let _ = crate::notify::desktop(&title, &body, critical);
+                        if !crate::notify::watch_running() {
+                            let _ = crate::notify::desktop(&title, &body, critical);
+                        }
                     }
                     refresh(app, client);
                 }
@@ -521,6 +604,7 @@ mod tests {
     fn item(id: &str, status: &str, choices: &[&str], link: &str) -> Item {
         Item {
             id: id.into(),
+            name: "0:lam".into(),
             title: "t".into(),
             body: String::new(),
             source_host: "h".into(),
@@ -666,6 +750,45 @@ mod tests {
         assert_eq!(a.check_sel, 0, "Tab wraps");
         a.set_items(vec![item("plain", "open", &[], "")]);
         assert_eq!(a.handle(key(' ')), None);
+    }
+
+    #[test]
+    fn slash_filters_by_name_and_esc_restores() {
+        let mut a = App::new("host".into());
+        let mut alpha = item("aaa", "open", &[], "");
+        alpha.name = "0:alpha".into();
+        let mut beta = item("bbb", "open", &[], "");
+        beta.name = "1:beta".into();
+        a.set_items(vec![alpha, beta]);
+
+        assert_eq!(a.handle(key('/')), None);
+        for c in "beta".chars() {
+            a.handle(key(c));
+        }
+        assert_eq!(a.visible().len(), 1);
+        assert_eq!(a.current().unwrap().id, "bbb");
+        assert_eq!(
+            a.handle(key('q')),
+            None,
+            "typing q while filtering must not quit"
+        );
+        a.handle(KeyEvent::from(KeyCode::Backspace));
+
+        a.handle(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(a.visible().len(), 1, "Enter keeps the filter");
+        assert_eq!(
+            a.handle(key('d')),
+            Some(Action::Dismiss("bbb".into())),
+            "actions target the filtered item"
+        );
+
+        a.handle(key('/'));
+        a.handle(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(
+            a.visible().len(),
+            2,
+            "Esc clears back to the previous filter"
+        );
     }
 
     #[test]

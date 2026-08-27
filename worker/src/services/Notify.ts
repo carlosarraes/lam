@@ -6,7 +6,8 @@ import { TopicClient } from "./TopicClient";
 
 const NTFY_PRIORITY: Record<Priority, number> = { low: 2, normal: 3, critical: 5 };
 
-const source = (item: Item) => [item.source_host, item.source_project].filter(Boolean).join(":");
+/** Who to blame on screen: the agent's name, falling back to host:project for pre-name items. */
+const source = (item: Item) => item.name || [item.source_host, item.source_project].filter(Boolean).join(":");
 
 /** Turns item lifecycle events into pushes on the topic. */
 export class Notify extends Effect.Service<Notify>()("lam/Notify", {

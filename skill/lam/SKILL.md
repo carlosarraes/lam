@@ -11,6 +11,10 @@ description: Use when blocked on a decision only Carlos can make (approval, choi
 
 Genuine blockers only: a decision, an approval, a secret, a "wave finished while he's away". Never for FYI progress. One item per blocking event, not per agent.
 
+## Who you are
+
+Every item carries a **name** so Carlos can tell concurrent agents apart. Inside tmux, zellij or screen it is inferred as `session:window` — you do not have to think about it. Only when `lam push` errors with "who is asking?" do you pass `--name <session:window-ish label>` (or export `LAM_NAME` once at the start of your run).
+
 ## How
 
 ```bash
@@ -23,7 +27,7 @@ lam wait "$ID" --timeout 1h
 
 # several asks in flight: block until whichever closes first (prints that item)
 lam wait "$ID1" "$ID2"        # explicit ids
-lam wait --any                # every open item you pushed from this host+project
+lam wait --any                # every open item under your name
 
 # the world already resolved it (he did the thing without tapping): withdraw your own ask
 lam retract "$ID"
@@ -39,6 +43,8 @@ Checklist loop: `lam wait` exits 0 both on progress and on resolution — check 
 `wait` prints the item as JSON. Read `response_choice` (button pressed) and `response_text` (free text). Exit codes: `0` resolved, `2` dismissed (he doesn't want to deal with it — stop and report), `3` timeout (fall back to `lam list` later; do not re-push the same question), `4` expired (TTL passed — decide whether to re-push), `5` retracted.
 
 - `-p critical` only for actual blockers; `normal` for "look when convenient".
+- A push with the same name, title and body as an item that is still open returns **that item's id** and does not notify again — so a retry after a failed-looking push is safe, and re-asking an open question is a no-op.
+- Never invent a name that hides who you are: the inferred `session:window` is what Carlos looks for when several agents are running.
 - Title = the decision. Body = where to act ("Reply in Claude Code: …"). Host and project are attached automatically.
 - Always pass `--link` when there is a URL to act on, and `--ttl` when the ask stops mattering after a while — stale items make the queue untrustworthy.
 - The phone notification shows at most 3 buttons; with 3 choices the Open/Reply buttons are still available inside the ntfy app.

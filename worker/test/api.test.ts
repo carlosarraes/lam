@@ -20,8 +20,12 @@ async function topicMessages(since = "all"): Promise<any[]> {
 }
 const lastMessage = async () => (await topicMessages()).at(-1)!;
 
-async function push(body: object = { title: "hi" }) {
-  const res = await SELF.fetch("http://lam/items", json(body));
+let seq = 0;
+
+/** Pushes an item whose title is made unique, so the duplicate guard never fires by accident. */
+async function push(body: { title?: string } & object = {}) {
+  const { title = "item", ...rest } = body;
+  const res = await SELF.fetch("http://lam/items", json({ name: "0:agent", title: `${title} #${++seq}`, ...rest }));
   expect(res.status).toBe(201);
   return res.json<any>();
 }
@@ -38,18 +42,27 @@ describe("auth", () => {
 
 describe("POST /items", () => {
   it("validates title, priority, choices", async () => {
-    for (const bad of [{}, { title: "x", priority: "urgent" }, { title: "x", choices: ["a", "b", "c", "d"] }, { title: "x", choices: [""] }]) {
+    for (const bad of [{}, { name: "n" }, { name: "n", title: "x", priority: "urgent" }, { name: "n", title: "x", choices: ["a", "b", "c", "d"] }, { name: "n", title: "x", choices: [""] }]) {
       expect((await SELF.fetch("http://lam/items", json(bad))).status).toBe(400);
     }
   });
+  it("accepts a push from an older binary that sends no name", async () => {
+    const res = await SELF.fetch("http://lam/items", json({ title: "legacy", source_host: "mac", source_project: "platform" }));
+    expect(res.status).toBe(201);
+    const item = await res.json<any>();
+    expect(item.name).toBe("");
+    expect((await lastMessage()).message).toBe("(mac:platform)");
+  });
+
   it("creates an item and publishes to the topic with action buttons", async () => {
-    const res = await SELF.fetch("http://lam/items", json({ title: "PR 42", body: "decide", priority: "critical", choices: ["waive", "require"], source_host: "mac", source_project: "platform" }));
+    const res = await SELF.fetch("http://lam/items", json({ name: "mp:2529", title: "PR 42", body: "decide", priority: "critical", choices: ["waive", "require"], source_host: "mac", source_project: "platform" }));
     const item = await res.json<any>();
     expect(item.id).toMatch(/^[a-z2-9]{5}$/);
     expect(item.status).toBe("open");
     const msg = await lastMessage();
     const t = await itemToken("test-secret", item.id);
-    expect(msg).toMatchObject({ event: "message", topic: "test-topic", title: `PR 42 [${item.id}]`, message: "(mac:platform)\ndecide", priority: 5, tags: ["rotating_light"] });
+    expect(msg).toMatchObject({ event: "message", topic: "test-topic", title: `PR 42 [${item.id}]`, message: "(mp:2529)\ndecide", priority: 5, tags: ["rotating_light"] });
+    expect(item.name).toBe("mp:2529");
     expect(msg.id).toMatch(/^[A-Za-z0-9]{12}$/);
     expect(msg.actions.map((a: any) => ({ ...a, id: undefined }))).toEqual([
       { action: "http", label: "waive", url: `http://lam/a/${item.id}/waive?t=${t}`, clear: true },
@@ -57,6 +70,36 @@ describe("POST /items", () => {
       { action: "view", label: "Reply", url: `http://lam/r/${item.id}?t=${t}`, clear: true },
     ]);
     expect(msg.actions.every((a: any) => typeof a.id === "string" && a.id)).toBe(true);
+  });
+});
+
+describe("duplicate pushes", () => {
+  it("an identical push while the first is open returns the same item and does not notify twice", async () => {
+    const body = { name: "0:agent", title: "PR #2720 green", body: "trigger review" };
+    const first = await SELF.fetch("http://lam/items", json(body));
+    expect(first.status).toBe(201);
+    const a = await first.json<any>();
+    await settle();
+    const before = (await topicMessages()).length;
+
+    const second = await SELF.fetch("http://lam/items", json(body));
+    expect(second.status).toBe(200);
+    expect((await second.json<any>()).id).toBe(a.id);
+    await settle();
+    expect((await topicMessages()).length).toBe(before);
+  });
+
+  it("a different body, a different agent, or a closed original all push a new item", async () => {
+    const base = { name: "0:agent", title: "same title", body: "b" };
+    const a = await (await SELF.fetch("http://lam/items", json(base))).json<any>();
+    const other = await SELF.fetch("http://lam/items", json({ ...base, body: "different" }));
+    expect(other.status).toBe(201);
+    const otherAgent = await SELF.fetch("http://lam/items", json({ ...base, name: "1:other" }));
+    expect(otherAgent.status).toBe(201);
+    await SELF.fetch(`http://lam/items/${a.id}/dismiss`, { method: "POST", headers: AUTH });
+    const afterClose = await SELF.fetch("http://lam/items", json(base));
+    expect(afterClose.status).toBe(201);
+    expect((await afterClose.json<any>()).id).not.toBe(a.id);
   });
 });
 

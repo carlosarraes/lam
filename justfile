@@ -30,9 +30,11 @@ check:
     cd cli && cargo fmt --all --check && cargo clippy --all-targets -- -D warnings
     just test
 
-# Deploy the Worker and apply pending D1 migrations
+# Apply pending D1 migrations, then deploy the Worker.
+# Schema goes first so new code never runs against an old table; note that applying a migration
+# makes the database briefly unavailable, so pushes can fail while it runs.
 deploy-worker:
-    cd worker && npx wrangler deploy && npx wrangler d1 migrations apply lam --remote
+    cd worker && npx wrangler d1 migrations apply lam --remote && npx wrangler deploy
 
 # Install lam on another machine from ~/.ssh/config: copies the binary when OS/arch match,
 # otherwise syncs the source and builds there; then copies the CLI config and the skill.

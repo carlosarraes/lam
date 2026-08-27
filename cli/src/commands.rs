@@ -33,6 +33,7 @@ pub fn init(server: String, token: String, topic: String) -> Result<i32> {
 
 pub struct PushArgs {
     pub title: String,
+    pub name: Option<String>,
     pub body: String,
     pub priority: String,
     pub choices: Vec<String>,
@@ -54,6 +55,7 @@ pub fn push(a: PushArgs) -> Result<i32> {
             bail!("--link must be an http(s) URL");
         }
     }
+    let name = crate::name::resolve(a.name)?;
     let ttl = a
         .ttl
         .as_deref()
@@ -61,6 +63,7 @@ pub fn push(a: PushArgs) -> Result<i32> {
         .transpose()?
         .map(|d| d.as_secs());
     let item = client()?.push(&NewItem {
+        name,
         title: a.title,
         body: a.body,
         source_host: hostname::get()?.to_string_lossy().into_owned(),
@@ -73,7 +76,7 @@ pub fn push(a: PushArgs) -> Result<i32> {
     })?;
     if a.wait {
         eprintln!("pushed {} — waiting", item.id);
-        return self::wait(&[item.id], false, "2h");
+        return self::wait(&[item.id], false, None, "2h");
     }
     println!("{}", item.id);
     Ok(0)
@@ -113,21 +116,23 @@ fn exit_for(item: &Item) -> i32 {
     }
 }
 
-/// Items this agent pushed: same host and project as the current invocation.
-fn my_open_ids(c: &Client) -> Result<Vec<String>> {
-    let host = hostname::get()?.to_string_lossy().into_owned();
-    let project = project_name();
+/// Items this agent pushed, by name.
+fn my_open_ids(c: &Client, name: &str) -> Result<Vec<String>> {
     Ok(c.list(Some("open"))?
         .into_iter()
-        .filter(|i| i.source_host == host && i.source_project == project)
+        .filter(|i| i.name == name)
         .map(|i| i.id)
         .collect())
 }
 
-pub fn wait(ids: &[String], any: bool, timeout: &str) -> Result<i32> {
+pub fn wait(ids: &[String], any: bool, name: Option<String>, timeout: &str) -> Result<i32> {
     let deadline = Instant::now() + parse_duration(timeout)?;
     let c = client()?;
-    let ids: Vec<String> = if any { my_open_ids(&c)? } else { ids.to_vec() };
+    let ids: Vec<String> = if any {
+        my_open_ids(&c, &crate::name::resolve(name)?)?
+    } else {
+        ids.to_vec()
+    };
     if ids.is_empty() {
         bail!("no open items to wait on");
     }
@@ -163,7 +168,7 @@ pub fn list(all: bool, json: bool) -> Result<i32> {
         return Ok(0);
     }
     for i in &items {
-        let src = [i.source_host.as_str(), i.source_project.as_str()]
+        let src = [i.name.as_str()]
             .iter()
             .filter(|s| !s.is_empty())
             .cloned()

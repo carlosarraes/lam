@@ -18,6 +18,8 @@ export type Check = typeof Check.Type;
 
 export class Item extends Schema.Class<Item>("Item")({
   id: Schema.String,
+  /** Who is asking: `session:window` from the agent's multiplexer, or an explicit label. */
+  name: Schema.String,
   title: Schema.String,
   body: Schema.String,
   source_host: Schema.String,
@@ -56,6 +58,8 @@ export const ItemRow = Schema.Struct({
 });
 
 export const NewItem = Schema.Struct({
+  /** The CLI always sends this; the API tolerates its absence so an older binary mid-run keeps working. */
+  name: Schema.optionalWith(Schema.String, { default: () => "" }),
   title: Schema.NonEmptyTrimmedString,
   body: Schema.optionalWith(Schema.String, { default: () => "" }),
   source_host: Schema.optionalWith(Schema.String, { default: () => "" }),
