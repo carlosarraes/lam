@@ -78,16 +78,28 @@ impl App {
         vec![]
     }
 
-    /// The trailing list row that says where the history ends, or that more is on the way.
-    fn history_note(&self) -> Option<&'static str> {
-        if self.tab != Tab::History {
-            return None;
+    /// The nav hint, plus where history stands. This rides in the footer rather than as a
+    /// trailing list row because ratatui scrolls to keep the selected *item* in view: a marker
+    /// one past the last item is never reachable, so at the bottom you would never see it.
+    fn nav_line(&self) -> Line<'static> {
+        let mut spans = vec![Span::styled(self.nav_hint(), DIM)];
+        if self.tab == Tab::History {
+            let note = match (self.history_loading, self.history_end) {
+                (true, _) => Some(format!(
+                    "   ⋯ loading older ({} so far)",
+                    self.history.items.len()
+                )),
+                (_, true) => Some(format!(
+                    "   · {} closed, nothing older",
+                    self.history.items.len()
+                )),
+                _ => None,
+            };
+            if let Some(note) = note {
+                spans.push(Span::styled(note, DIM));
+            }
         }
-        match (self.history_loading, self.history_end) {
-            (true, _) => Some("  ⋯ loading older"),
-            (_, true) => Some("  · nothing older"),
-            _ => None,
-        }
+        Line::from(spans)
     }
 
     pub(super) fn draw(&self, f: &mut Frame) {
@@ -168,11 +180,10 @@ impl App {
             head_r,
         );
 
-        let mut rows: Vec<ListItem> = visible.iter().map(|i| row(i, self.tab)).collect();
-        // Appended after the mapping, so the selected index still lines up with `visible`.
-        if let Some(note) = self.history_note() {
-            rows.push(ListItem::new(Line::from(Span::styled(note, DIM))));
-        }
+        let rows: Vec<ListItem> = visible
+            .iter()
+            .map(|i| row(i, self.tab, list.width))
+            .collect();
         let mut state = ListState::default().with_selected(Some(self.pane().selected));
         f.render_stateful_widget(
             List::new(rows)
@@ -297,15 +308,9 @@ impl App {
                 }
                 spans.extend(key("r", "reply"));
                 spans.extend(key("d", "dismiss"));
-                vec![
-                    Line::from(spans),
-                    Line::from(Span::styled(self.nav_hint(), DIM)),
-                ]
+                vec![Line::from(spans), self.nav_line()]
             }
-            _ => vec![
-                Line::raw(""),
-                Line::from(Span::styled(self.nav_hint(), DIM)),
-            ],
+            _ => vec![Line::raw(""), self.nav_line()],
         };
         f.render_widget(Paragraph::new(footer_text), footer);
     }
@@ -418,7 +423,10 @@ pub(super) fn outcome(i: &Item) -> (&'static str, Style, String) {
     }
 }
 
-fn row(i: &Item, tab: Tab) -> ListItem<'_> {
+/// Columns a history row spends on everything but the title: gutter, id, agent, outcome, age.
+const HISTORY_FIXED: usize = 2 + 7 + 21 + 17 + 5;
+
+fn row(i: &Item, tab: Tab, width: u16) -> ListItem<'_> {
     let open = i.status == "open";
     let title = if i.checks.is_empty() {
         i.title.clone()
@@ -427,15 +435,21 @@ fn row(i: &Item, tab: Tab) -> ListItem<'_> {
     };
     // In their own tab closed items are the subject, not intruders in the queue, so they are not
     // dimmed — and their gutter carries the outcome, priority being moot once an item is closed.
+    // The title is cut to fit because the outcome is the column you came here to read: letting a
+    // long title push it off the edge would hide the answer.
     if tab == Tab::History {
         let (glyph, style, label) = outcome(i);
+        let title_w = (width as usize).saturating_sub(HISTORY_FIXED).max(10);
         return ListItem::new(Line::from(vec![
             Span::styled("▍ ", style),
             Span::styled(format!("{:<6} ", i.id), META),
             Span::styled(format!("{:<20} ", source(i)), LINK),
-            Span::styled(title, Style::default()),
-            Span::styled(format!("   {glyph} {label}"), style),
-            Span::styled(format!("   {}", age(&i.created_at)), DIM),
+            Span::styled(
+                format!("{:<title_w$}", ellipsis(&title, title_w.saturating_sub(1))),
+                Style::default(),
+            ),
+            Span::styled(format!("{glyph} {:<14} ", ellipsis(&label, 14)), style),
+            Span::styled(format!("{:>4}", age(&i.created_at)), DIM),
         ]));
     }
     let gutter = match (open, i.priority.as_str()) {
