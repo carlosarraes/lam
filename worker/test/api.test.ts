@@ -115,6 +115,61 @@ describe("read", () => {
   });
 });
 
+describe("paging", () => {
+  const list = async (query = "") => (await SELF.fetch(`http://lam/items${query}`, { headers: AUTH })).json<any[]>();
+
+  it("limit caps the page, newest first", async () => {
+    const a = await push({ title: "p-a" });
+    const b = await push({ title: "p-b" });
+    expect((await list("?limit=2")).map((i) => i.id)).toEqual([b.id, a.id]);
+  });
+
+  it("before pages backwards without overlap", async () => {
+    const a = await push({ title: "q-a" });
+    const b = await push({ title: "q-b" });
+    const first = await list("?limit=1");
+    expect(first.map((i) => i.id)).toEqual([b.id]);
+    const second = await list(`?limit=1&before=${encodeURIComponent(first.at(-1)!.created_at)}`);
+    expect(second.map((i) => i.id)).toEqual([a.id]);
+    expect(second[0].created_at < first[0].created_at).toBe(true);
+  });
+
+  it("an exhausted cursor returns an empty page", async () => {
+    expect(await list("?limit=5&before=1970-01-01T00:00:00.000Z")).toEqual([]);
+  });
+
+  // Guard for the five machines running older binaries: they send no params and must still get
+  // the whole table. Do not "tidy" this into a limited call.
+  it("no params returns everything, as an older binary expects", async () => {
+    const a = await push({ title: "r-a" });
+    const all = await list();
+    expect(all.find((i) => i.id === a.id)).toBeDefined();
+    expect(all.length).toBeGreaterThan(1);
+  });
+
+  it("rejects a bad limit", async () => {
+    for (const bad of ["0", "abc", "501", "-1"]) {
+      expect((await SELF.fetch(`http://lam/items?limit=${bad}`, { headers: AUTH })).status).toBe(400);
+    }
+  });
+
+  it("status filters within the page, it is not a search", async () => {
+    await push({ title: "s-a" });
+    const page = await list("?status=open&limit=1");
+    expect(page.length).toBeLessThanOrEqual(1);
+    expect(page.every((i) => i.status === "open")).toBe(true);
+  });
+
+  // Regression guard: whoever moves the status filter into SQL will break this, because `expired`
+  // is derived on read and never stored.
+  it("a paged expired item still reports its derived status", async () => {
+    const item = await push({ title: "t-a", ttl: 1 });
+    await new Promise((r) => setTimeout(r, 1100));
+    const page = await list("?limit=20");
+    expect(page.find((i) => i.id === item.id).status).toBe("expired");
+  });
+});
+
 describe("resolution", () => {
   it("phone button resolves with choice and publishes closed message", async () => {
     const item = await push({ title: "q", choices: ["yes", "no"] });

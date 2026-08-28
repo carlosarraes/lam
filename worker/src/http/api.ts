@@ -15,6 +15,12 @@ const CommaNumbers = Schema.transform(Schema.String, Schema.Array(Schema.Number)
   encode: (a) => a.join(","),
 });
 const WaitMany = Schema.Struct({ ids: Schema.NonEmptyString, since: Schema.optional(CommaNumbers) });
+/** Every field optional, and absent means today's behaviour — binaries in the field send none of them. */
+const ListParams = Schema.Struct({
+  status: Schema.optional(Status),
+  limit: Schema.optional(Schema.NumberFromString.pipe(Schema.int(), Schema.between(1, 500))),
+  before: Schema.optional(Schema.String),
+});
 
 /** A waiter returns when the item closed, or (with `since`) when any mutation bumped the version past it. */
 const changed = (item: Item, since: number) => item.status !== "open" || item.version > since;
@@ -60,8 +66,8 @@ export const api = HttpRouter.empty.pipe(
   HttpRouter.get(
     "/items",
     Effect.gen(function* () {
-      const { status } = yield* HttpServerRequest.schemaSearchParams(Schema.Struct({ status: Schema.optional(Status) }));
-      return yield* HttpServerResponse.json(yield* (yield* Items).list(status));
+      const query = yield* HttpServerRequest.schemaSearchParams(ListParams);
+      return yield* HttpServerResponse.json(yield* (yield* Items).list(query));
     }),
   ),
   HttpRouter.get(
@@ -73,7 +79,7 @@ export const api = HttpRouter.empty.pipe(
       const items = yield* Items;
       const deadline = Date.now() + WAIT_MS;
       while (true) {
-        const hit = (yield* items.list(undefined, wanted)).find((i) => changed(i, versions.get(i.id)!));
+        const hit = (yield* items.list({ ids: wanted })).find((i) => changed(i, versions.get(i.id)!));
         if (hit) return yield* HttpServerResponse.json(hit);
         if (Date.now() + POLL_MS > deadline) return HttpServerResponse.empty({ status: 204 });
         yield* Effect.sleep(POLL_MS);

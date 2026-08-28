@@ -14,6 +14,15 @@ const decodeRow = (row: unknown) =>
     Effect.orDie,
   );
 
+export interface ListQuery {
+  status?: Status;
+  ids?: readonly string[];
+  /** Page size. Absent means every row. */
+  limit?: number;
+  /** Exclusive `created_at` cursor: the page holds rows strictly older than this. */
+  before?: string;
+}
+
 interface ChecksUpdate {
   checks: Item["checks"];
   resolve: boolean;
@@ -97,14 +106,37 @@ export class Items extends Effect.Service<Items>()("lam/Items", {
         Effect.flatMap((row) => (row ? decodeRow(row) : Effect.fail(new NotFound({ id })))),
       ),
 
-    /** `status` filters on the derived status, so `open` excludes expired items. */
-    list: (status?: Status, ids?: readonly string[]) =>
-      db((d) =>
-        (ids
-          ? d.prepare(`SELECT * FROM items WHERE id IN (${ids.map(() => "?").join(",")}) ORDER BY created_at DESC`).bind(...ids)
-          : d.prepare("SELECT * FROM items ORDER BY created_at DESC")
-        ).all(),
-      ).pipe(
+    /**
+     * `status` filters on the *derived* status, so `open` excludes expired items — which is why it
+     * has to happen in JS, after `decodeRow` applies `Item.withExpiry`. Do not move it into SQL:
+     * `expired` is never stored, so `WHERE status = 'open'` would hand back expired rows.
+     *
+     * `limit`/`before` bound the rows *read* and are safe in SQL because `created_at` is stored.
+     * They compose with `status` as "filter this page", not as a search: `?status=open&limit=10`
+     * means "the ten newest rows, of which the open ones". The CLI never combines them.
+     *
+     * Absent `limit` means unlimited, which is what every binary already in the field expects.
+     */
+    list: ({ status, ids, limit, before }: ListQuery = {}) =>
+      db((d) => {
+        const where: string[] = [];
+        const binds: unknown[] = [];
+        if (ids) {
+          where.push(`id IN (${ids.map(() => "?").join(",")})`);
+          binds.push(...ids);
+        }
+        // Exclusive: `created_at` is millisecond-resolution with no monotonic tiebreak, so `<=`
+        // could hand back the cursor row forever.
+        if (before !== undefined) {
+          where.push("created_at < ?");
+          binds.push(before);
+        }
+        if (limit !== undefined) binds.push(limit);
+        const stmt = d.prepare(
+          `SELECT * FROM items${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY created_at DESC${limit === undefined ? "" : " LIMIT ?"}`,
+        );
+        return (binds.length ? stmt.bind(...binds) : stmt).all();
+      }).pipe(
         Effect.flatMap(({ results }) => Effect.forEach(results, decodeRow)),
         Effect.map((items) => (status ? items.filter((i) => i.status === status) : items)),
       ),
