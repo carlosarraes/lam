@@ -182,7 +182,7 @@ impl App {
 
         let rows: Vec<ListItem> = visible
             .iter()
-            .map(|i| row(i, self.tab, list.width))
+            .map(|i| ListItem::new(row(i, self.tab, list.width)))
             .collect();
         let mut state = ListState::default().with_selected(Some(self.pane().selected));
         f.render_stateful_widget(
@@ -423,10 +423,13 @@ pub(super) fn outcome(i: &Item) -> (&'static str, Style, String) {
     }
 }
 
-/// Columns a history row spends on everything but the title: gutter, id, agent, outcome, age.
+/// Columns a row spends on everything but the title: gutter, id, agent, then the outcome (history
+/// only) and the age. The title takes what is left, so the right-hand columns always survive.
 const HISTORY_FIXED: usize = 2 + 7 + 21 + 17 + 5;
+const REQUESTS_FIXED: usize = 2 + 7 + 21 + 5;
 
-fn row(i: &Item, tab: Tab, width: u16) -> ListItem<'_> {
+/// Returns the `Line` rather than a `ListItem` so tests can read back what was rendered.
+fn row(i: &Item, tab: Tab, width: u16) -> Line<'_> {
     let open = i.status == "open";
     let title = if i.checks.is_empty() {
         i.title.clone()
@@ -440,7 +443,7 @@ fn row(i: &Item, tab: Tab, width: u16) -> ListItem<'_> {
     if tab == Tab::History {
         let (glyph, style, label) = outcome(i);
         let title_w = (width as usize).saturating_sub(HISTORY_FIXED).max(10);
-        return ListItem::new(Line::from(vec![
+        return Line::from(vec![
             Span::styled("▍ ", style),
             Span::styled(format!("{:<6} ", i.id), META),
             Span::styled(format!("{:<20} ", source(i)), LINK),
@@ -450,7 +453,7 @@ fn row(i: &Item, tab: Tab, width: u16) -> ListItem<'_> {
             ),
             Span::styled(format!("{glyph} {:<14} ", ellipsis(&label, 14)), style),
             Span::styled(format!("{:>4}", age(&i.created_at)), DIM),
-        ]));
+        ]);
     }
     let gutter = match (open, i.priority.as_str()) {
         (true, "critical") => Style::default().fg(Color::Red),
@@ -459,13 +462,17 @@ fn row(i: &Item, tab: Tab, width: u16) -> ListItem<'_> {
         (false, _) => RULE,
     };
     let text = if open { Style::default() } else { DIM };
-    ListItem::new(Line::from(vec![
+    let title_w = (width as usize).saturating_sub(REQUESTS_FIXED).max(10);
+    Line::from(vec![
         Span::styled("▍ ", gutter),
         Span::styled(format!("{:<6} ", i.id), if open { META } else { DIM }),
         Span::styled(format!("{:<20} ", source(i)), if open { LINK } else { DIM }),
-        Span::styled(title, text),
-        Span::styled(format!("   {}", age(&i.created_at)), DIM),
-    ]))
+        Span::styled(
+            format!("{:<title_w$}", ellipsis(&title, title_w.saturating_sub(1))),
+            text,
+        ),
+        Span::styled(format!("{:>5}", age(&i.created_at)), DIM),
+    ])
 }
 
 #[cfg(test)]
@@ -592,6 +599,39 @@ mod tests {
         let (g, st, label) = outcome(&closed("g", "expired", None, None));
         assert_eq!((g, label.as_str()), ("⋯", "expired"));
         assert_eq!(st, DIM);
+    }
+
+    /// The flat text of a rendered row, which is what actually has to fit the terminal.
+    fn row_text(i: &Item, tab: Tab, width: u16) -> String {
+        row(i, tab, width)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn a_long_title_never_pushes_the_right_hand_columns_off_screen() {
+        let mut i = item("aaa", "resolved", &[], "");
+        i.title = "Approve MON-3120: parallelize the hottest E2E group and drop serial mode".into();
+        i.response_choice = Some("approve".into());
+        i.created_at = (chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+
+        let h = row_text(&i, Tab::History, 100);
+        assert!(h.chars().count() <= 100, "history row overflows: {h:?}");
+        assert!(h.contains("✓ approve"), "the outcome survives: {h:?}");
+        assert!(h.trim_end().ends_with("3h"), "and so does the age: {h:?}");
+        assert!(h.contains('…'), "the title is what gives way: {h:?}");
+
+        i.status = "open".into();
+        let r = row_text(&i, Tab::Requests, 100);
+        assert!(r.chars().count() <= 100, "requests row overflows: {r:?}");
+        assert!(r.trim_end().ends_with("3h"), "the age survives too: {r:?}");
+        assert!(r.contains('…'));
+
+        // a title that already fits is left alone
+        i.title = "short".into();
+        assert!(!row_text(&i, Tab::Requests, 100).contains('…'));
     }
 
     #[test]
