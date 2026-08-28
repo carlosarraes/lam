@@ -1,5 +1,9 @@
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
+use crossterm::execute;
 use std::cell::Cell;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -11,12 +15,18 @@ use crate::watch;
 mod draw;
 
 const REFRESH: Duration = Duration::from_secs(30);
+const HISTORY_PAGE: usize = 50;
 
 /// What the UI asks the outside world to do; keeps `App` free of I/O so it is unit-testable.
 #[derive(Debug, PartialEq)]
 pub enum Action {
     Quit,
     Refresh,
+    /// The history tab wants the page older than `before` (None asks for the newest page). The
+    /// cursor rides along rather than being read back off `App`, so the loop stays dumb.
+    LoadHistory {
+        before: Option<String>,
+    },
     Resolve {
         id: String,
         choice: Option<String>,
@@ -46,16 +56,39 @@ enum Mode {
     Filter,
 }
 
-pub struct App {
+/// The queue you answer, and the record of what you already answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Requests,
+    History,
+}
+
+/// One tab's list and its cursor. The tabs are independent views, so each keeps your place.
+#[derive(Default)]
+struct Pane {
     items: Vec<Item>,
-    filter: String,
     selected: usize,
+}
+
+pub struct App {
+    tab: Tab,
+    requests: Pane,
+    history: Pane,
+    /// `created_at` of the last row the server returned, however few of them we kept. Paging from
+    /// the last *displayed* item would stall whenever a page ended on an open row.
+    history_cursor: Option<String>,
+    /// The server has nothing older.
+    history_end: bool,
+    /// A page is in flight. The network thread is serial, so there is at most one.
+    history_loading: bool,
+    /// The terminal granted the kitty flags, so Ctrl+1/Ctrl+2 actually arrive.
+    kitty: bool,
+    filter: String,
     /// Cursor within the selected item's checks.
     check_sel: usize,
     focus: Focus,
     /// A request is in flight on the network thread.
     busy: bool,
-    show_all: bool,
     /// Side-by-side markdown reader for long bodies (`m`).
     reader: bool,
     scroll: u16,
@@ -69,13 +102,17 @@ pub struct App {
 impl App {
     pub fn new(host: String) -> Self {
         Self {
-            items: vec![],
+            tab: Tab::Requests,
+            requests: Pane::default(),
+            history: Pane::default(),
+            history_cursor: None,
+            history_end: false,
+            history_loading: false,
+            kitty: false,
             filter: String::new(),
-            selected: 0,
             check_sel: 0,
             focus: Focus::List,
             busy: false,
-            show_all: false,
             reader: false,
             scroll: 0,
             doc_lines: Cell::new(0),
@@ -85,31 +122,108 @@ impl App {
         }
     }
 
+    pub fn set_kitty(&mut self, kitty: bool) {
+        self.kitty = kitty;
+    }
+
+    fn pane(&self) -> &Pane {
+        match self.tab {
+            Tab::Requests => &self.requests,
+            Tab::History => &self.history,
+        }
+    }
+
+    fn pane_mut(&mut self) -> &mut Pane {
+        match self.tab {
+            Tab::Requests => &mut self.requests,
+            Tab::History => &mut self.history,
+        }
+    }
+
     /// Refreshes never move you: the same item stays selected, keeping its scroll position and
-    /// check cursor. Only when it is gone (resolved, filtered away) does the cursor reset.
+    /// check cursor. Only when it is gone (resolved, filtered away) does the cursor reset. This
+    /// feeds the requests tab only — a refresh landing while you read history must not move it.
     pub fn set_items(&mut self, items: Vec<Item>) {
-        let previous = self.current().map(|i| i.id.clone());
-        self.items = items;
-        let same = previous.and_then(|id| self.visible().iter().position(|i| i.id == id));
+        let previous = self
+            .visible_of(Tab::Requests)
+            .get(self.requests.selected)
+            .map(|i| i.id.clone());
+        self.requests.items = items;
+        let same = previous.and_then(|id| {
+            self.visible_of(Tab::Requests)
+                .iter()
+                .position(|i| i.id == id)
+        });
         match same {
             Some(pos) => {
-                self.selected = pos;
-                let checks = self.current().map_or(0, |i| i.checks.len());
-                self.check_sel = self.check_sel.min(checks.saturating_sub(1));
+                self.requests.selected = pos;
+                if self.tab == Tab::Requests {
+                    let checks = self.current().map_or(0, |i| i.checks.len());
+                    self.check_sel = self.check_sel.min(checks.saturating_sub(1));
+                }
             }
-            None => self.clamp(),
+            None => self.clamp_of(Tab::Requests),
         }
+    }
+
+    /// Appends a page of closed items. Open rows are dropped — history is the closed side — and so
+    /// are ids already held, because a worker that predates paging ignores the cursor and replays
+    /// the whole table; a page that adds nothing is then how we learn there is nothing older.
+    /// The server returns newest-first, so the last row of the page is the oldest.
+    pub fn add_history(&mut self, page: Vec<Item>, end: bool) {
+        self.history_loading = false;
+        if let Some(last) = page.last() {
+            self.history_cursor = Some(last.created_at.clone());
+        }
+        let before = self.history.items.len();
+        for i in page {
+            if i.status == "open" || self.history.items.iter().any(|h| h.id == i.id) {
+                continue;
+            }
+            self.history.items.push(i);
+        }
+        self.history_end = end || self.history.items.len() == before;
+        self.clamp_of(Tab::History);
+    }
+
+    /// Throws away the history pane so the next load starts from the newest page again.
+    fn reset_history(&mut self) {
+        self.history = Pane::default();
+        self.history_cursor = None;
+        self.history_end = false;
+        self.history_loading = false;
     }
 
     pub fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
     }
 
+    /// Clears the in-flight page without recording one, so a failed load can be retried.
+    /// Deliberately not folded into `set_busy`: jobs queue, so an unrelated refresh can land
+    /// while a page is still queued, and clearing the flag there would let a second request go
+    /// out with the same cursor — whose duplicate rows would then look like the end of history.
+    pub fn history_failed(&mut self) {
+        self.history_loading = false;
+    }
+
+    /// Keeps a pane's cursor in range. The reader and check cursor follow the selected item, so
+    /// they only reset when the pane being clamped is the one on screen.
+    fn clamp_of(&mut self, tab: Tab) {
+        let n = self.visible_of(tab).len();
+        let pane = match tab {
+            Tab::Requests => &mut self.requests,
+            Tab::History => &mut self.history,
+        };
+        pane.selected = pane.selected.min(n.saturating_sub(1));
+        if self.tab == tab {
+            self.check_sel = 0;
+            self.scroll = 0;
+            self.focus = Focus::List;
+        }
+    }
+
     fn clamp(&mut self) {
-        self.selected = self.selected.min(self.visible().len().saturating_sub(1));
-        self.check_sel = 0;
-        self.scroll = 0;
-        self.focus = Focus::List;
+        self.clamp_of(self.tab);
     }
 
     /// The next unticked check after `from`, wrapping — so repeated Space walks the whole list.
@@ -136,10 +250,10 @@ impl App {
     }
 
     fn nav_hint(&self) -> &'static str {
-        if self.reader {
-            "j/k move · J/K scroll · g/G top/end · m close · / filter · q quit"
-        } else {
-            "j/k move · m read · / filter · a all · R refresh · q quit"
+        match (self.reader, self.kitty) {
+            (true, _) => "j/k move · J/K scroll · g/G top/end · m close · / filter · q quit",
+            (false, true) => "h/l · ^1/^2 tabs · j/k move · m read · / filter · R refresh · q quit",
+            (false, false) => "h/l tabs · j/k move · m read · / filter · R refresh · q quit",
         }
     }
 
@@ -148,28 +262,62 @@ impl App {
         self.scroll = (self.scroll as i32 + delta).clamp(0, max.max(0)) as u16;
     }
 
-    /// Items matching the current filter, which matches on agent name or title.
-    fn visible(&self) -> Vec<&Item> {
+    /// One tab's items matching the current filter, which matches on agent name or title. The
+    /// filter is shared: it applies to whichever tab you are looking at.
+    fn visible_of(&self, tab: Tab) -> Vec<&Item> {
+        let items = match tab {
+            Tab::Requests => &self.requests.items,
+            Tab::History => &self.history.items,
+        };
         if self.filter.is_empty() {
-            return self.items.iter().collect();
+            return items.iter().collect();
         }
         let f = self.filter.to_lowercase();
-        self.items
+        items
             .iter()
             .filter(|i| i.name.to_lowercase().contains(&f) || i.title.to_lowercase().contains(&f))
             .collect()
+    }
+
+    fn visible(&self) -> Vec<&Item> {
+        self.visible_of(self.tab)
     }
 
     pub fn set_status(&mut self, s: impl Into<String>) {
         self.status = s.into();
     }
 
-    pub fn show_all(&self) -> bool {
-        self.show_all
+    fn current(&self) -> Option<&Item> {
+        self.visible().get(self.pane().selected).copied()
     }
 
-    fn current(&self) -> Option<&Item> {
-        self.visible().get(self.selected).copied()
+    /// Switching keeps each tab's cursor. The reader, check cursor and focus follow the newly
+    /// selected item, so they reset exactly as a cursor move does.
+    fn set_tab(&mut self, tab: Tab) -> Option<Action> {
+        if self.tab == tab {
+            return None;
+        }
+        self.tab = tab;
+        self.check_sel = 0;
+        self.scroll = 0;
+        self.focus = Focus::List;
+        self.load_more()
+    }
+
+    /// Asks for the next history page when the tab is empty or the cursor nears the bottom.
+    /// Prefetching three rows early means the list never visibly dead-ends.
+    fn load_more(&mut self) -> Option<Action> {
+        if self.tab != Tab::History || self.history_loading || self.history_end {
+            return None;
+        }
+        let n = self.visible().len();
+        if n != 0 && self.pane().selected + 3 < n {
+            return None;
+        }
+        self.history_loading = true;
+        Some(Action::LoadHistory {
+            before: self.history_cursor.clone(),
+        })
     }
 
     /// Translates a key press into an Action. Returns None when only internal state changed.
@@ -221,6 +369,14 @@ impl App {
                 None
             }
             KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
+            // Above the choice arm below, or Ctrl+1 answers an item instead of switching tabs.
+            // Only terminals speaking the kitty protocol report these at all; h/l is the fallback.
+            KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.set_tab(Tab::Requests)
+            }
+            KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.set_tab(Tab::History)
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(Action::Quit)
             }
@@ -233,15 +389,16 @@ impl App {
                 None
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                if self.selected + 1 < self.visible().len() {
-                    self.selected += 1;
+                if self.pane().selected + 1 < self.visible().len() {
+                    self.pane_mut().selected += 1;
                     self.check_sel = 0;
                     self.scroll = 0;
                 }
-                None
+                self.load_more()
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.selected = self.selected.saturating_sub(1);
+                let up = self.pane().selected.saturating_sub(1);
+                self.pane_mut().selected = up;
                 self.check_sel = 0;
                 self.scroll = 0;
                 None
@@ -273,10 +430,8 @@ impl App {
                 }
                 Some(action)
             }
-            KeyCode::Char('a') => {
-                self.show_all = !self.show_all;
-                Some(Action::Refresh)
-            }
+            KeyCode::Char('h') => self.set_tab(Tab::Requests),
+            KeyCode::Char('l') => self.set_tab(Tab::History),
             KeyCode::Char('m') => {
                 self.reader = !self.reader;
                 self.scroll = 0;
@@ -301,6 +456,11 @@ impl App {
             KeyCode::Char('/') => {
                 self.mode = Mode::Filter;
                 None
+            }
+            // On history this rewinds to the newest page, so items you just closed appear.
+            KeyCode::Char('R') if self.tab == Tab::History => {
+                self.reset_history();
+                self.load_more()
             }
             KeyCode::Char('R') => Some(Action::Refresh),
             KeyCode::Char('d') => self.open_current().map(|i| Action::Dismiss(i.id.clone())),
@@ -344,8 +504,9 @@ impl App {
 /// or hung request cannot freeze the screen — and `q`/Ctrl-C keep working, which in raw mode they
 /// only do if the loop is still reading keys.
 enum Job {
-    Refresh {
-        all: bool,
+    Refresh,
+    History {
+        before: Option<String>,
     },
     Resolve {
         id: String,
@@ -362,6 +523,11 @@ enum Job {
 
 enum Msg {
     Items(Vec<Item>),
+    /// A page of items newest-first; `end` when the server returned fewer rows than we asked for.
+    History {
+        items: Vec<Item>,
+        end: bool,
+    },
     Failed(String),
     /// A push arrived; `fresh` is true for new items (not closed/updated notices).
     Push {
@@ -383,29 +549,36 @@ pub fn run(silent: bool) -> Result<i32> {
 
     let net_tx = tx.clone();
     std::thread::spawn(move || {
-        let mut show_all = false;
         while let Ok(job) = work.recv() {
+            // History short-circuits: every other job ends by re-reading the open queue, and a
+            // page of closed items has no reason to pay for that.
+            if let Job::History { before } = job {
+                let _ = net_tx.send(match client.page(HISTORY_PAGE, before.as_deref()) {
+                    Ok(items) => Msg::History {
+                        end: items.len() < HISTORY_PAGE,
+                        items,
+                    },
+                    Err(e) => Msg::Failed(format!("history failed: {e}")),
+                });
+                continue;
+            }
             let outcome = match job {
-                Job::Refresh { all } => {
-                    show_all = all;
-                    Ok(())
-                }
+                Job::Refresh => Ok(()),
                 Job::Resolve { id, choice, text } => client
                     .resolve(&id, &Resolution { choice, text })
                     .map(|_| ()),
                 Job::Dismiss(id) => client.dismiss(&id).map(|_| ()),
                 Job::SetCheck { id, index, done } => client.set_check(&id, index, done).map(|_| ()),
+                Job::History { .. } => unreachable!("handled above"),
             };
             if let Err(e) = outcome {
                 let _ = net_tx.send(Msg::Failed(format!("{e}")));
             }
             // Every job ends by re-reading the queue, so the screen always catches up.
-            let _ = net_tx.send(
-                match client.list(if show_all { None } else { Some("open") }) {
-                    Ok(items) => Msg::Items(items),
-                    Err(e) => Msg::Failed(format!("refresh failed: {e}")),
-                },
-            );
+            let _ = net_tx.send(match client.list(Some("open")) {
+                Ok(items) => Msg::Items(items),
+                Err(e) => Msg::Failed(format!("refresh failed: {e}")),
+            });
         }
     });
 
@@ -429,7 +602,27 @@ pub fn run(silent: bool) -> Result<i32> {
     });
 
     let mut terminal = ratatui::init();
+    // Ctrl+1/Ctrl+2 have no legacy encoding — only the kitty protocol reports them at all. Ask
+    // after init() so the query runs with raw mode already on; h/l works either way, so this is
+    // pure upside. ratatui's panic hook restores the screen but knows nothing about the flags,
+    // so wrap it to pop first or a panic strands the terminal in kitty mode.
+    let kitty = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if kitty {
+        let _ = execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+            hook(info);
+        }));
+    }
+    app.set_kitty(kitty);
     let result = event_loop(&mut terminal, &mut app, &jobs, &rx, silent);
+    if kitty {
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
     ratatui::restore();
     result.map(|_| 0)
 }
@@ -441,12 +634,10 @@ fn event_loop(
     rx: &mpsc::Receiver<Msg>,
     silent: bool,
 ) -> Result<()> {
-    let refresh = |app: &App| {
-        let _ = jobs.send(Job::Refresh {
-            all: app.show_all(),
-        });
+    let refresh = || {
+        let _ = jobs.send(Job::Refresh);
     };
-    refresh(app);
+    refresh();
     let mut last_refresh = Instant::now();
     loop {
         terminal.draw(|f| app.draw(f))?;
@@ -458,8 +649,13 @@ fn event_loop(
                     app.set_busy(false);
                     app.set_status("live");
                 }
+                Msg::History { items, end } => {
+                    app.add_history(items, end);
+                    app.set_busy(false);
+                }
                 Msg::Failed(e) => {
                     app.set_busy(false);
+                    app.history_failed();
                     app.set_status(e);
                 }
                 Msg::Push {
@@ -476,13 +672,13 @@ fn event_loop(
                             let _ = crate::notify::desktop(&title, &body, critical);
                         }
                     }
-                    refresh(app);
+                    refresh();
                 }
                 Msg::Status(s) => app.set_status(s),
             }
         }
         if last_refresh.elapsed() > REFRESH {
-            refresh(app);
+            refresh();
             last_refresh = Instant::now();
         }
 
@@ -500,9 +696,8 @@ fn event_loop(
         };
         let job = match action {
             Action::Quit => return Ok(()),
-            Action::Refresh => Job::Refresh {
-                all: app.show_all(),
-            },
+            Action::Refresh => Job::Refresh,
+            Action::LoadHistory { before } => Job::History { before },
             Action::Resolve { id, choice, text } => Job::Resolve { id, choice, text },
             Action::Dismiss(id) => Job::Dismiss(id),
             Action::SetCheck { id, index, done } => Job::SetCheck { id, index, done },
@@ -567,7 +762,7 @@ mod tests {
         }
     }
 
-    fn key(c: char) -> KeyEvent {
+    pub(in crate::tui) fn key(c: char) -> KeyEvent {
         KeyEvent::from(KeyCode::Char(c))
     }
 
@@ -643,10 +838,13 @@ mod tests {
         for _ in 0..5 {
             a.handle(key('j'));
         }
-        assert_eq!(a.selected, 2);
+        assert_eq!(a.requests.selected, 2);
         assert_eq!(a.handle(key('o')), None);
-        assert_eq!(a.handle(key('a')), Some(Action::Refresh));
-        assert!(a.show_all());
+        assert_eq!(
+            a.handle(key('a')),
+            None,
+            "the history tab replaced show-all"
+        );
         assert_eq!(a.handle(key('q')), Some(Action::Quit));
     }
 
@@ -747,7 +945,7 @@ mod tests {
         assert_eq!(a.focus, Focus::List, "nothing to focus without checks");
         a.handle(key('j'));
         a.handle(key('j'));
-        assert_eq!(a.selected, 2, "j/k still move items");
+        assert_eq!(a.requests.selected, 2, "j/k still move items");
         assert_eq!(
             a.handle(KeyEvent::from(KeyCode::Enter)),
             Some(Action::Resolve {
@@ -761,7 +959,10 @@ mod tests {
     #[test]
     fn a_refresh_does_not_move_the_cursor_or_lose_your_place() {
         let mut a = checklist([false, false, false]);
-        a.set_items(vec![item("other", "open", &[], ""), a.items[0].clone()]);
+        a.set_items(vec![
+            item("other", "open", &[], ""),
+            a.requests.items[0].clone(),
+        ]);
         a.handle(key('j'));
         let selected = a.current().unwrap().id.clone();
         a.handle(KeyEvent::from(KeyCode::Tab));
@@ -772,7 +973,7 @@ mod tests {
         let (check_sel, scroll) = (a.check_sel, a.scroll);
 
         // the same items arrive again in a different order, as a refresh may deliver them
-        let mut items = a.items.clone();
+        let mut items = a.requests.items.clone();
         items.reverse();
         a.set_items(items);
 
@@ -855,8 +1056,211 @@ mod tests {
         a.handle(key('j'));
         a.handle(key('j'));
         a.set_items(vec![item("aaa", "open", &[], "")]);
-        assert_eq!(a.selected, 0);
+        assert_eq!(a.requests.selected, 0);
         a.set_items(vec![]);
         assert_eq!(a.handle(key('1')), None);
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// A closed item `n` minutes back, titled after its id so a filter can tell it from the queue.
+    fn closed(id: &str, status: &str, minutes: i64) -> Item {
+        let mut i = item(id, status, &[], "");
+        i.title = id.into();
+        i.created_at = (chrono::Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339();
+        i
+    }
+
+    #[test]
+    fn tabs_switch_with_h_l_and_ctrl_digits() {
+        let mut a = app();
+        assert_eq!(
+            a.handle(key('l')),
+            Some(Action::LoadHistory { before: None }),
+            "the first visit loads the newest page"
+        );
+        assert_eq!(a.tab, Tab::History);
+        assert_eq!(a.handle(key('l')), None, "already there");
+        assert_eq!(a.handle(key('h')), None);
+        assert_eq!(a.tab, Tab::Requests);
+
+        assert!(a.handle(ctrl('2')).is_none(), "the page is already loading");
+        assert_eq!(a.tab, Tab::History);
+        a.handle(ctrl('1'));
+        assert_eq!(a.tab, Tab::Requests);
+    }
+
+    #[test]
+    fn ctrl_digits_do_not_pick_choices() {
+        let mut a = app();
+        assert_eq!(
+            a.handle(ctrl('1')),
+            None,
+            "Ctrl+1 switches tabs; it must not answer the item"
+        );
+        assert_eq!(
+            a.tab,
+            Tab::Requests,
+            "already on requests, so nothing moved"
+        );
+        // and the bare digit still answers
+        assert_eq!(
+            a.handle(key('1')),
+            Some(Action::Resolve {
+                id: "aaa".into(),
+                choice: Some("yes".into()),
+                text: None
+            })
+        );
+    }
+
+    #[test]
+    fn history_holds_only_closed_items() {
+        let mut a = app();
+        a.add_history(
+            vec![
+                closed("op1", "open", 1),
+                closed("res", "resolved", 2),
+                closed("dis", "dismissed", 3),
+                closed("ret", "retracted", 4),
+                closed("exp", "expired", 5),
+            ],
+            true,
+        );
+        let ids: Vec<&str> = a.history.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["res", "dis", "ret", "exp"], "the open row is dropped");
+    }
+
+    #[test]
+    fn history_pages_from_the_oldest_row_returned() {
+        let mut a = app();
+        // The page ends on an open row, which history drops. The cursor must still advance past
+        // it, or the next request asks for the same page forever.
+        let tail = closed("op1", "open", 9);
+        a.add_history(vec![closed("res", "resolved", 2), tail.clone()], false);
+        assert_eq!(a.history.items.len(), 1, "the open tail is not kept");
+        assert_eq!(
+            a.history_cursor.as_deref(),
+            Some(tail.created_at.as_str()),
+            "the cursor is the last raw row, not the last kept one"
+        );
+    }
+
+    #[test]
+    fn a_refresh_landing_mid_page_does_not_release_the_paging_guard() {
+        let mut a = app();
+        assert!(a.handle(key('l')).is_some());
+        // an unrelated refresh completes while the history page is still queued
+        a.set_items(vec![item("new", "open", &[], "")]);
+        a.set_busy(false);
+        assert!(a.history_loading, "the page is still in flight");
+        assert_eq!(
+            a.handle(key('j')),
+            None,
+            "a second request with the same cursor would look like the end of history"
+        );
+    }
+
+    #[test]
+    fn history_stops_when_a_page_adds_nothing() {
+        let mut a = app();
+        a.handle(key('l'));
+        let page = vec![closed("res", "resolved", 2)];
+        a.add_history(page.clone(), false);
+        assert!(!a.history_end);
+        // a worker that predates paging ignores the cursor and replays the same rows
+        a.add_history(page, false);
+        assert!(
+            a.history_end,
+            "a page that adds nothing means nothing older"
+        );
+        assert_eq!(a.handle(key('j')), None, "and paging stops asking");
+    }
+
+    #[test]
+    fn history_pages_when_the_cursor_nears_the_bottom() {
+        let mut a = app();
+        a.handle(key('l'));
+        let page: Vec<Item> = (0..HISTORY_PAGE)
+            .map(|n| closed(&format!("i{n:03}"), "resolved", n as i64 + 1))
+            .collect();
+        a.add_history(page, false);
+        for _ in 0..46 {
+            assert_eq!(a.handle(key('j')), None, "still far from the bottom");
+        }
+        assert_eq!(a.pane().selected, 46);
+        assert!(
+            matches!(a.handle(key('j')), Some(Action::LoadHistory { .. })),
+            "three rows from the end it fetches the next page"
+        );
+        assert_eq!(a.handle(key('j')), None, "and does not ask twice at once");
+    }
+
+    #[test]
+    fn history_items_are_inert() {
+        let mut a = app();
+        a.handle(key('l'));
+        a.add_history(vec![closed("res", "resolved", 2)], true);
+        for k in ['1', 'd', 'r', ' '] {
+            assert_eq!(
+                a.handle(key(k)),
+                None,
+                "{k} must do nothing to a closed item"
+            );
+        }
+        assert_eq!(a.handle(KeyEvent::from(KeyCode::Enter)), None);
+    }
+
+    #[test]
+    fn each_tab_keeps_its_own_cursor() {
+        let mut a = app();
+        a.handle(key('j'));
+        assert_eq!(a.requests.selected, 1);
+        a.handle(key('l'));
+        a.add_history(
+            vec![closed("r1", "resolved", 2), closed("r2", "dismissed", 3)],
+            true,
+        );
+        a.handle(key('j'));
+        assert_eq!(a.history.selected, 1);
+        a.handle(key('h'));
+        assert_eq!(a.requests.selected, 1, "requests kept its place");
+        a.handle(key('l'));
+        assert_eq!(a.history.selected, 1, "and so did history");
+    }
+
+    #[test]
+    fn a_refresh_does_not_move_the_history_cursor() {
+        let mut a = app();
+        a.handle(key('l'));
+        a.add_history(
+            vec![closed("r1", "resolved", 2), closed("r2", "dismissed", 3)],
+            true,
+        );
+        a.handle(key('j'));
+        a.set_items(vec![item("new", "open", &[], "")]);
+        assert_eq!(a.history.selected, 1, "history stays where you left it");
+        assert_eq!(a.tab, Tab::History);
+    }
+
+    #[test]
+    fn the_filter_applies_to_the_active_tab_only() {
+        let mut a = app();
+        a.add_history(vec![closed("r1", "resolved", 2)], true);
+        a.handle(key('/'));
+        a.handle(key('t'));
+        assert_eq!(
+            a.visible_of(Tab::Requests).len(),
+            3,
+            "every queued item is titled t"
+        );
+        a.handle(key('l'));
+        assert_eq!(
+            a.visible().len(),
+            0,
+            "the history row is titled r1, so it hides"
+        );
     }
 }

@@ -4,8 +4,14 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::{App, Focus, Mode};
+use super::{App, Focus, Mode, Tab};
 use crate::client::Item;
+
+/// Rough width the side blocks need (`lam  12 open` and `hostname  ● live`); below the tab bar
+/// plus this, the bar steps down rather than colliding with them.
+const HEADER_SIDES: u16 = 38;
+/// Rows the detail pane keeps on the history tab; the list takes everything else.
+const HISTORY_DETAIL: u16 = 8;
 
 // Palette: one accent (amber) for "pressable" and attention; priority in red/blue so amber stays unique.
 const ACCENT: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
@@ -46,17 +52,59 @@ impl App {
         doc
     }
 
+    /// `requests  [history]` — the active tab bracketed. Both states are the same width, so the
+    /// centred bar never shifts as you switch. Degrades to the active label alone, then to
+    /// nothing, so a narrow terminal loses the bar rather than colliding with the side blocks.
+    fn tab_spans(&self, width: u16) -> Vec<Span<'static>> {
+        // The brackets move with the active label, so both states are exactly 19 columns.
+        let (left, right, a, b) = match self.tab {
+            Tab::Requests => ("[requests]", "  history", ACCENT, DIM),
+            Tab::History => ("requests  ", "[history]", DIM, ACCENT),
+        };
+        let full = (left.len() + right.len()) as u16;
+        if width >= full + HEADER_SIDES {
+            return vec![
+                Span::styled(left.to_string(), a),
+                Span::styled(right.to_string(), b),
+            ];
+        }
+        let active = match self.tab {
+            Tab::Requests => left,
+            Tab::History => right,
+        };
+        if width >= active.len() as u16 + HEADER_SIDES {
+            return vec![Span::styled(active.to_string(), ACCENT)];
+        }
+        vec![]
+    }
+
+    /// The trailing list row that says where the history ends, or that more is on the way.
+    fn history_note(&self) -> Option<&'static str> {
+        if self.tab != Tab::History {
+            return None;
+        }
+        match (self.history_loading, self.history_end) {
+            (true, _) => Some("  ⋯ loading older"),
+            (_, true) => Some("  · nothing older"),
+            _ => None,
+        }
+    }
+
     pub(super) fn draw(&self, f: &mut Frame) {
         let visible = self.visible();
-        // The list asks for exactly its rows (plus its rule) and never more than a third of the
-        // screen, so the body — which is where the agent's message lives — keeps the rest.
-        let list_h = (visible.len() as u16 + 1).clamp(3, (f.area().height / 3).max(3));
         let [header, body, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Length(2),
         ])
         .areas(f.area());
+        // On requests the list asks for exactly its rows (plus its rule) and never more than a
+        // third of the screen, so the body — where the agent's message lives — keeps the rest.
+        // History is a browsing view, so there the list takes the screen and the detail is fixed.
+        let list_h = match self.tab {
+            Tab::Requests => (visible.len() as u16 + 1).clamp(3, (f.area().height / 3).max(3)),
+            Tab::History => body.height.saturating_sub(HISTORY_DETAIL).max(3),
+        };
         let (list, detail) = if self.reader {
             let [l, r] =
                 Layout::horizontal([Constraint::Length(34), Constraint::Min(20)]).areas(body);
@@ -66,15 +114,22 @@ impl App {
                 Layout::vertical([Constraint::Length(list_h), Constraint::Min(3)]).areas(body);
             (l, d)
         };
-        let open = visible.iter().filter(|i| i.status == "open").count();
+        // Counts the queue, not what is on screen: `0 open` while browsing history would lie.
+        let open = self.visible_of(Tab::Requests).len();
         let live = self.status == "live";
-        let [head_l, head_r] =
-            Layout::horizontal([Constraint::Fill(1), Constraint::Length(40)]).areas(header);
+        let tabs = self.tab_spans(header.width);
+        let tabs_w: u16 = tabs.iter().map(|s| s.width() as u16).sum();
+        // Equal fills are what actually centres the bar; a fixed-width right block would not.
+        let [head_l, head_c, head_r] = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(tabs_w),
+            Constraint::Fill(1),
+        ])
+        .areas(header);
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("lam", BOLD),
                 Span::styled(format!("  {open} open"), META),
-                Span::styled(if self.show_all { "  · all" } else { "" }, DIM),
                 Span::styled(if self.busy { "  working…" } else { "" }, ACCENT),
                 Span::styled(
                     if self.filter.is_empty() {
@@ -95,6 +150,7 @@ impl App {
             ])),
             head_l,
         );
+        f.render_widget(Paragraph::new(Line::from(tabs)), head_c);
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(format!("{}  ", self.host), META),
@@ -112,8 +168,12 @@ impl App {
             head_r,
         );
 
-        let rows: Vec<ListItem> = visible.iter().map(|i| row(i)).collect();
-        let mut state = ListState::default().with_selected(Some(self.selected));
+        let mut rows: Vec<ListItem> = visible.iter().map(|i| row(i, self.tab)).collect();
+        // Appended after the mapping, so the selected index still lines up with `visible`.
+        if let Some(note) = self.history_note() {
+            rows.push(ListItem::new(Line::from(Span::styled(note, DIM))));
+        }
+        let mut state = ListState::default().with_selected(Some(self.pane().selected));
         f.render_stateful_widget(
             List::new(rows)
                 .block(Block::default().borders(Borders::TOP).border_style(RULE))
@@ -124,13 +184,14 @@ impl App {
 
         let text = match self.current() {
             Some(i) => {
+                // Once an item is closed, when it closed is the fact you want, not when it was
+                // raised — "created 90d ago" says nothing in a history view.
+                let (when, stamp) = match i.resolved_at.as_deref() {
+                    Some(at) if i.status != "open" => ("closed", age(at)),
+                    _ => ("raised", age(&i.created_at)),
+                };
                 let mut lines = vec![Line::from(Span::styled(
-                    format!(
-                        "{} · {} · {} ago",
-                        source(i),
-                        i.priority,
-                        age(&i.created_at)
-                    ),
+                    format!("{} · {} · {when} {stamp} ago", source(i), i.priority),
                     META,
                 ))];
                 lines.extend(i.body.lines().map(|l| Line::raw(l.to_string())));
@@ -162,13 +223,16 @@ impl App {
                             i.status,
                             i.response_by.as_deref().unwrap_or("?")
                         ),
-                        META,
+                        outcome(i).1,
                     )));
                 }
                 lines
             }
             None => vec![Line::from(Span::styled(
-                "nothing here — all caught up",
+                match self.tab {
+                    Tab::Requests => "nothing here — all caught up",
+                    Tab::History => "nothing closed yet",
+                },
                 META,
             ))],
         };
@@ -320,18 +384,65 @@ pub fn age(created_at: &str) -> String {
     }
 }
 
-fn row(i: &Item) -> ListItem<'_> {
+/// Truncate to `max` *characters* — a reply is free text, so slicing bytes would panic on UTF-8.
+fn ellipsis(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
+}
+
+/// What became of it: the answer given, otherwise the outcome itself.
+pub(super) fn outcome(i: &Item) -> (&'static str, Style, String) {
+    let answer = i
+        .response_choice
+        .as_deref()
+        .or(i.response_text.as_deref())
+        .map(|s| ellipsis(s.lines().next().unwrap_or("").trim(), 24))
+        .filter(|s| !s.is_empty());
+    match i.status.as_str() {
+        // A checklist resolves itself with no answer attached, hence the fallback.
+        "resolved" => (
+            "✓",
+            Style::new().fg(Color::Green),
+            answer.unwrap_or_else(|| "done".into()),
+        ),
+        "dismissed" => (
+            "✗",
+            Style::new().fg(Color::Red),
+            answer.unwrap_or_else(|| "dismissed".into()),
+        ),
+        "retracted" => ("⤺", META, "retracted".into()),
+        "expired" => ("⋯", DIM, "expired".into()),
+        other => ("·", DIM, other.to_string()),
+    }
+}
+
+fn row(i: &Item, tab: Tab) -> ListItem<'_> {
     let open = i.status == "open";
+    let title = if i.checks.is_empty() {
+        i.title.clone()
+    } else {
+        format!("{}  {}/{}", i.title, i.checks_done(), i.checks.len())
+    };
+    // In their own tab closed items are the subject, not intruders in the queue, so they are not
+    // dimmed — and their gutter carries the outcome, priority being moot once an item is closed.
+    if tab == Tab::History {
+        let (glyph, style, label) = outcome(i);
+        return ListItem::new(Line::from(vec![
+            Span::styled("▍ ", style),
+            Span::styled(format!("{:<6} ", i.id), META),
+            Span::styled(format!("{:<20} ", source(i)), LINK),
+            Span::styled(title, Style::default()),
+            Span::styled(format!("   {glyph} {label}"), style),
+            Span::styled(format!("   {}", age(&i.created_at)), DIM),
+        ]));
+    }
     let gutter = match (open, i.priority.as_str()) {
         (true, "critical") => Style::default().fg(Color::Red),
         (true, "low") => DIM,
         (true, _) => Style::default().fg(Color::Blue),
         (false, _) => RULE,
-    };
-    let title = if i.checks.is_empty() {
-        i.title.clone()
-    } else {
-        format!("{}  {}/{}", i.title, i.checks_done(), i.checks.len())
     };
     let text = if open { Style::default() } else { DIM };
     ListItem::new(Line::from(vec![
@@ -431,5 +542,80 @@ mod tests {
         let t = (chrono::Utc::now() - chrono::Duration::hours(26)).to_rfc3339();
         assert_eq!(age(&t), "1d");
         assert_eq!(age("garbage"), "");
+    }
+
+    fn closed(id: &str, status: &str, choice: Option<&str>, text: Option<&str>) -> Item {
+        let mut i = item(id, status, &[], "");
+        i.response_choice = choice.map(Into::into);
+        i.response_text = text.map(Into::into);
+        i
+    }
+
+    #[test]
+    fn outcome_shows_the_answer_then_the_status() {
+        let (g, st, label) = outcome(&closed("a", "resolved", Some("yes"), None));
+        assert_eq!((g, label.as_str()), ("✓", "yes"));
+        assert_eq!(st.fg, Some(Color::Green));
+
+        // a reply is free text: first line only, truncated, and never sliced mid-character
+        let long = "ship it — but rebase onto main first, then squash é😀 the fixups";
+        let (_, _, label) = outcome(&closed("b", "resolved", None, Some(long)));
+        assert_eq!(label.chars().count(), 24);
+        assert!(label.ends_with('…'));
+        let (_, _, label) = outcome(&closed("c", "resolved", None, Some("line one\nline two")));
+        assert_eq!(label, "line one");
+
+        // a checklist resolves itself with nothing attached
+        assert_eq!(outcome(&closed("d", "resolved", None, None)).2, "done");
+        assert_eq!(
+            outcome(&closed("e", "dismissed", None, None)).2,
+            "dismissed"
+        );
+        assert_eq!(
+            outcome(&closed("f", "retracted", None, None)).2,
+            "retracted"
+        );
+        let (g, st, label) = outcome(&closed("g", "expired", None, None));
+        assert_eq!((g, label.as_str()), ("⋯", "expired"));
+        assert_eq!(st, DIM);
+    }
+
+    #[test]
+    fn the_tab_bar_is_one_width_and_degrades_narrow() {
+        let mut a = App::new("host".into());
+        let width = |a: &App, w| -> usize {
+            a.tab_spans(w)
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum()
+        };
+        assert_eq!(width(&a, 80), 19);
+        a.handle(super::super::tests::key('l'));
+        assert_eq!(
+            width(&a, 80),
+            19,
+            "both states are the same width, so it never jitters"
+        );
+
+        assert_eq!(width(&a, 50), 9, "squeezed down to the active label");
+        assert_eq!(width(&a, 40), 0, "and out entirely rather than colliding");
+    }
+
+    #[test]
+    fn the_header_centres_the_tab_bar() {
+        let mut a = App::new("archlinux".into());
+        a.set_items(vec![item("aaa", "open", &[], "")]);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(71, 12)).unwrap();
+        term.draw(|f| a.draw(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let head: String = (0..71).map(|x| buf[(x, 0)].symbol()).collect();
+
+        assert!(head.starts_with("lam  1 open"), "{head:?}");
+        assert!(
+            head.trim_end().ends_with("archlinux  ● connecting"),
+            "{head:?}"
+        );
+        // 71 columns less the 19-column bar leaves 26 on each side
+        assert_eq!(&head[26..45], "[requests]  history", "{head:?}");
     }
 }

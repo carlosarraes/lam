@@ -124,6 +124,18 @@ impl Client {
         Ok(Self::ok(req.send()?)?.json()?)
     }
 
+    /// A page of the queue, newest first. `before` is an exclusive `created_at` cursor: pass the
+    /// `created_at` of the last row of the previous page, not of the last row you kept. A worker
+    /// that predates paging ignores both params and returns everything, which the caller sees as a
+    /// page that adds nothing new.
+    pub fn page(&self, limit: usize, before: Option<&str>) -> Result<Vec<Item>> {
+        let mut req = self.get("/items").query(&[("limit", limit.to_string())]);
+        if let Some(b) = before {
+            req = req.query(&[("before", b)]);
+        }
+        Ok(Self::ok(req.send()?)?.json()?)
+    }
+
     pub fn show(&self, id: &str) -> Result<Item> {
         Ok(Self::ok(self.get(&format!("/items/{id}")).send()?)?.json()?)
     }
