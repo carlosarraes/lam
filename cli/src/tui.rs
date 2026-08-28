@@ -34,6 +34,13 @@ pub enum Action {
     },
 }
 
+/// Which pane the arrow/vim keys drive.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Focus {
+    List,
+    Checks,
+}
+
 #[derive(Debug, PartialEq)]
 enum Mode {
     Normal,
@@ -48,6 +55,9 @@ pub struct App {
     selected: usize,
     /// Cursor within the selected item's checks.
     check_sel: usize,
+    focus: Focus,
+    /// A request is in flight on the network thread.
+    busy: bool,
     show_all: bool,
     /// Side-by-side markdown reader for long bodies (`m`).
     reader: bool,
@@ -66,6 +76,8 @@ impl App {
             filter: String::new(),
             selected: 0,
             check_sel: 0,
+            focus: Focus::List,
+            busy: false,
             show_all: false,
             reader: false,
             scroll: 0,
@@ -76,15 +88,54 @@ impl App {
         }
     }
 
+    /// Refreshes never move you: the same item stays selected, keeping its scroll position and
+    /// check cursor. Only when it is gone (resolved, filtered away) does the cursor reset.
     pub fn set_items(&mut self, items: Vec<Item>) {
+        let previous = self.current().map(|i| i.id.clone());
         self.items = items;
-        self.clamp();
+        let same = previous.and_then(|id| self.visible().iter().position(|i| i.id == id));
+        match same {
+            Some(pos) => {
+                self.selected = pos;
+                let checks = self.current().map_or(0, |i| i.checks.len());
+                self.check_sel = self.check_sel.min(checks.saturating_sub(1));
+            }
+            None => self.clamp(),
+        }
+    }
+
+    pub fn set_busy(&mut self, busy: bool) {
+        self.busy = busy;
     }
 
     fn clamp(&mut self) {
         self.selected = self.selected.min(self.visible().len().saturating_sub(1));
         self.check_sel = 0;
         self.scroll = 0;
+        self.focus = Focus::List;
+    }
+
+    /// The next unticked check after `from`, wrapping — so repeated Space walks the whole list.
+    fn next_unchecked(&self, from: usize) -> Option<usize> {
+        let item = self.current()?;
+        let n = item.checks.len();
+        if n == 0 {
+            return None;
+        }
+        (1..=n)
+            .map(|step| (from + step) % n)
+            .find(|&i| !item.checks[i].done)
+    }
+
+    fn move_check(&mut self, delta: isize) {
+        let n = self.current().map_or(0, |i| i.checks.len());
+        if n > 0 {
+            self.check_sel = (self.check_sel as isize + delta).rem_euclid(n as isize) as usize;
+        }
+    }
+
+    fn has_checks(&self) -> bool {
+        self.open_current().is_some_and(|i| !i.checks.is_empty())
     }
 
     fn nav_hint(&self) -> &'static str {
@@ -197,9 +248,21 @@ impl App {
             return None;
         }
         match key.code {
+            KeyCode::Esc if self.focus == Focus::Checks => {
+                self.focus = Focus::List;
+                None
+            }
             KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(Action::Quit)
+            }
+            KeyCode::Char('j') | KeyCode::Down if self.focus == Focus::Checks => {
+                self.move_check(1);
+                None
+            }
+            KeyCode::Char('k') | KeyCode::Up if self.focus == Focus::Checks => {
+                self.move_check(-1);
+                None
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.selected + 1 < self.visible().len() {
@@ -216,21 +279,31 @@ impl App {
                 None
             }
             KeyCode::Tab => {
-                if let Some(i) = self.open_current() {
-                    if !i.checks.is_empty() {
-                        self.check_sel = (self.check_sel + 1) % i.checks.len();
-                    }
+                if self.has_checks() {
+                    self.focus = match self.focus {
+                        Focus::List => Focus::Checks,
+                        Focus::Checks => Focus::List,
+                    };
                 }
                 None
             }
-            KeyCode::Char(' ') => {
+            KeyCode::Char(' ') | KeyCode::Enter if self.has_checks() => {
                 let item = self.open_current()?;
                 let check = item.checks.get(self.check_sel)?;
-                Some(Action::SetCheck {
+                let index = self.check_sel;
+                let done = !check.done;
+                let action = Action::SetCheck {
                     id: item.id.clone(),
-                    index: self.check_sel,
-                    done: !check.done,
-                })
+                    index,
+                    done,
+                };
+                // Ticking moves on to the next thing you still have to do; unticking stays put.
+                if done {
+                    if let Some(next) = self.next_unchecked(index) {
+                        self.check_sel = next;
+                    }
+                }
+                Some(action)
             }
             KeyCode::Char('a') => {
                 self.show_all = !self.show_all;
@@ -327,6 +400,7 @@ impl App {
                 Span::styled("lam", BOLD),
                 Span::styled(format!("  {open} open"), META),
                 Span::styled(if self.show_all { "  · all" } else { "" }, DIM),
+                Span::styled(if self.busy { "  working…" } else { "" }, ACCENT),
                 Span::styled(
                     if self.filter.is_empty() {
                         String::new()
@@ -390,11 +464,19 @@ impl App {
                 }
                 for (n, c) in i.checks.iter().enumerate() {
                     let cursor = n == self.check_sel && i.status == "open";
+                    let focused = cursor && self.focus == Focus::Checks;
+                    let label = if c.done {
+                        DIM
+                    } else if focused {
+                        Style::new().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
                     lines.push(Line::from(vec![
                         Span::styled(if cursor { "▸ " } else { "  " }, ACCENT),
                         Span::styled(
                             format!("{} {}", if c.done { "✔" } else { "○" }, c.label),
-                            if c.done { DIM } else { Style::default() },
+                            label,
                         ),
                     ]));
                 }
@@ -460,11 +542,14 @@ impl App {
                     .flat_map(|(n, c)| key(&(n + 1).to_string(), c))
                     .collect();
                 if !i.checks.is_empty() {
-                    spans.extend(key("Tab", "next check"));
                     spans.extend(key(
                         "Space",
-                        &format!("toggle {}/{}", i.checks_done(), i.checks.len()),
+                        &format!("tick ({}/{})", i.checks_done(), i.checks.len()),
                     ));
+                    spans.extend(match self.focus {
+                        Focus::List => key("Tab", "pick checks"),
+                        Focus::Checks => key("j/k", "pick · Tab back"),
+                    });
                 } else if i.choices.is_empty() {
                     spans.extend(key("Enter", "done"));
                 }
@@ -592,7 +677,29 @@ fn row(i: &Item) -> ListItem<'_> {
     ]))
 }
 
+/// Work handed to the network thread. Nothing in the UI thread ever calls the server, so a slow
+/// or hung request cannot freeze the screen — and `q`/Ctrl-C keep working, which in raw mode they
+/// only do if the loop is still reading keys.
+enum Job {
+    Refresh {
+        all: bool,
+    },
+    Resolve {
+        id: String,
+        choice: Option<String>,
+        text: Option<String>,
+    },
+    Dismiss(String),
+    SetCheck {
+        id: String,
+        index: usize,
+        done: bool,
+    },
+}
+
 enum Msg {
+    Items(Vec<Item>),
+    Failed(String),
     /// A push arrived; `fresh` is true for new items (not closed/updated notices).
     Push {
         fresh: bool,
@@ -609,6 +716,36 @@ pub fn run(silent: bool) -> Result<i32> {
     let mut app = App::new(hostname::get()?.to_string_lossy().into_owned());
 
     let (tx, rx) = mpsc::channel::<Msg>();
+    let (jobs, work) = mpsc::channel::<Job>();
+
+    let net_tx = tx.clone();
+    std::thread::spawn(move || {
+        let mut show_all = false;
+        while let Ok(job) = work.recv() {
+            let outcome = match job {
+                Job::Refresh { all } => {
+                    show_all = all;
+                    Ok(())
+                }
+                Job::Resolve { id, choice, text } => client
+                    .resolve(&id, &Resolution { choice, text })
+                    .map(|_| ()),
+                Job::Dismiss(id) => client.dismiss(&id).map(|_| ()),
+                Job::SetCheck { id, index, done } => client.set_check(&id, index, done).map(|_| ()),
+            };
+            if let Err(e) = outcome {
+                let _ = net_tx.send(Msg::Failed(format!("{e}")));
+            }
+            // Every job ends by re-reading the queue, so the screen always catches up.
+            let _ = net_tx.send(
+                match client.list(if show_all { None } else { Some("open") }) {
+                    Ok(items) => Msg::Items(items),
+                    Err(e) => Msg::Failed(format!("refresh failed: {e}")),
+                },
+            );
+        }
+    });
+
     let stream_cfg = cfg.clone();
     std::thread::spawn(move || {
         watch::subscribe(
@@ -629,32 +766,39 @@ pub fn run(silent: bool) -> Result<i32> {
     });
 
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &mut app, &client, &rx, silent);
+    let result = event_loop(&mut terminal, &mut app, &jobs, &rx, silent);
     ratatui::restore();
     result.map(|_| 0)
-}
-
-fn refresh(app: &mut App, client: &Client) {
-    match client.list(if app.show_all() { None } else { Some("open") }) {
-        Ok(items) => app.set_items(items),
-        Err(e) => app.set_status(format!("refresh failed: {e}")),
-    }
 }
 
 fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    client: &Client,
+    jobs: &mpsc::Sender<Job>,
     rx: &mpsc::Receiver<Msg>,
     silent: bool,
 ) -> Result<()> {
-    refresh(app, client);
+    let refresh = |app: &App| {
+        let _ = jobs.send(Job::Refresh {
+            all: app.show_all(),
+        });
+    };
+    refresh(app);
     let mut last_refresh = Instant::now();
     loop {
         terminal.draw(|f| app.draw(f))?;
 
         while let Ok(msg) = rx.try_recv() {
             match msg {
+                Msg::Items(items) => {
+                    app.set_items(items);
+                    app.set_busy(false);
+                    app.set_status("live");
+                }
+                Msg::Failed(e) => {
+                    app.set_busy(false);
+                    app.set_status(e);
+                }
                 Msg::Push {
                     fresh,
                     title,
@@ -669,13 +813,13 @@ fn event_loop(
                             let _ = crate::notify::desktop(&title, &body, critical);
                         }
                     }
-                    refresh(app, client);
+                    refresh(app);
                 }
                 Msg::Status(s) => app.set_status(s),
             }
         }
         if last_refresh.elapsed() > REFRESH {
-            refresh(app, client);
+            refresh(app);
             last_refresh = Instant::now();
         }
 
@@ -691,20 +835,25 @@ fn event_loop(
         let Some(action) = app.handle(key) else {
             continue;
         };
-        let outcome = match action {
+        let job = match action {
             Action::Quit => return Ok(()),
-            Action::Refresh => Ok(()),
-            Action::Resolve { id, choice, text } => client
-                .resolve(&id, &Resolution { choice, text })
-                .map(|_| ()),
-            Action::Dismiss(id) => client.dismiss(&id).map(|_| ()),
-            Action::OpenLink(url) => open_link(&url),
-            Action::SetCheck { id, index, done } => client.set_check(&id, index, done).map(|_| ()),
+            Action::Refresh => Job::Refresh {
+                all: app.show_all(),
+            },
+            Action::Resolve { id, choice, text } => Job::Resolve { id, choice, text },
+            Action::Dismiss(id) => Job::Dismiss(id),
+            Action::SetCheck { id, index, done } => Job::SetCheck { id, index, done },
+            Action::OpenLink(url) => {
+                if let Err(e) = open_link(&url) {
+                    app.set_status(format!("open failed: {e}"));
+                }
+                continue;
+            }
         };
-        if let Err(e) = outcome {
-            app.set_status(format!("error: {e}"));
+        app.set_busy(true);
+        if jobs.send(job).is_err() {
+            app.set_status("network thread stopped");
         }
-        refresh(app, client);
         last_refresh = Instant::now();
     }
 }
@@ -838,28 +987,25 @@ mod tests {
         assert_eq!(a.handle(key('q')), Some(Action::Quit));
     }
 
-    #[test]
-    fn checklist_keys_toggle_and_cycle() {
+    fn checklist(done: [bool; 3]) -> App {
         let mut a = App::new("host".into());
         let mut i = item("chk", "open", &[], "");
-        i.checks = vec![
-            crate::client::Check {
-                label: "one".into(),
-                done: false,
+        i.checks = done
+            .iter()
+            .enumerate()
+            .map(|(n, &d)| crate::client::Check {
+                label: format!("part {n}"),
+                done: d,
                 at: None,
-            },
-            crate::client::Check {
-                label: "two".into(),
-                done: true,
-                at: None,
-            },
-        ];
+            })
+            .collect();
         a.set_items(vec![i]);
-        assert_eq!(
-            a.handle(KeyEvent::from(KeyCode::Enter)),
-            None,
-            "Enter is not 'done' on a checklist"
-        );
+        a
+    }
+
+    #[test]
+    fn space_ticks_and_walks_to_the_next_thing_left_to_do() {
+        let mut a = checklist([false, false, false]);
         assert_eq!(
             a.handle(key(' ')),
             Some(Action::SetCheck {
@@ -868,19 +1014,108 @@ mod tests {
                 done: true
             })
         );
-        a.handle(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(a.check_sel, 1, "Space alone advances — no Tab dance");
         assert_eq!(
             a.handle(key(' ')),
             Some(Action::SetCheck {
                 id: "chk".into(),
                 index: 1,
-                done: false
+                done: true
             })
         );
+        assert_eq!(a.check_sel, 2);
+    }
+
+    #[test]
+    fn space_skips_checks_already_done_and_unticking_stays_put() {
+        let mut a = checklist([false, true, false]);
+        a.handle(key(' '));
+        assert_eq!(a.check_sel, 2, "index 1 is already done, so it is skipped");
+
+        let mut a = checklist([false, true, true]);
+        a.handle(key(' '));
+        assert_eq!(a.check_sel, 0, "nothing left to do: the cursor stays");
+
+        let mut a = checklist([true, false, false]);
+        assert_eq!(
+            a.handle(key(' ')),
+            Some(Action::SetCheck {
+                id: "chk".into(),
+                index: 0,
+                done: false
+            }),
+            "Space on a ticked check unticks it"
+        );
+        assert_eq!(a.check_sel, 0, "unticking does not move the cursor");
+    }
+
+    #[test]
+    fn tab_focuses_the_checklist_where_jk_picks_and_esc_returns() {
+        let mut a = checklist([false, false, false]);
+        assert_eq!(a.focus, Focus::List);
         a.handle(KeyEvent::from(KeyCode::Tab));
-        assert_eq!(a.check_sel, 0, "Tab wraps");
-        a.set_items(vec![item("plain", "open", &[], "")]);
-        assert_eq!(a.handle(key(' ')), None);
+        assert_eq!(a.focus, Focus::Checks);
+
+        a.handle(key('j'));
+        a.handle(key('j'));
+        assert_eq!(
+            a.check_sel, 2,
+            "j/k move between checks while they have focus"
+        );
+        a.handle(key('k'));
+        assert_eq!(a.check_sel, 1);
+        a.handle(key('j'));
+        a.handle(key('j'));
+        assert_eq!(a.check_sel, 0, "and they wrap");
+
+        assert_eq!(
+            a.handle(KeyEvent::from(KeyCode::Esc)),
+            None,
+            "Esc leaves the checks, it does not quit"
+        );
+        assert_eq!(a.focus, Focus::List);
+        assert_eq!(a.handle(KeyEvent::from(KeyCode::Esc)), Some(Action::Quit));
+    }
+
+    #[test]
+    fn an_item_without_checks_keeps_the_old_keys() {
+        let mut a = app();
+        a.handle(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(a.focus, Focus::List, "nothing to focus without checks");
+        a.handle(key('j'));
+        a.handle(key('j'));
+        assert_eq!(a.selected, 2, "j/k still move items");
+        assert_eq!(
+            a.handle(KeyEvent::from(KeyCode::Enter)),
+            Some(Action::Resolve {
+                id: "ccc".into(),
+                choice: None,
+                text: None
+            })
+        );
+    }
+
+    #[test]
+    fn a_refresh_does_not_move_the_cursor_or_lose_your_place() {
+        let mut a = checklist([false, false, false]);
+        a.set_items(vec![item("other", "open", &[], ""), a.items[0].clone()]);
+        a.handle(key('j'));
+        let selected = a.current().unwrap().id.clone();
+        a.handle(KeyEvent::from(KeyCode::Tab));
+        a.handle(key('j'));
+        a.doc_lines.set(50);
+        a.handle(key('m'));
+        a.handle(key('J'));
+        let (check_sel, scroll) = (a.check_sel, a.scroll);
+
+        // the same items arrive again in a different order, as a refresh may deliver them
+        let mut items = a.items.clone();
+        items.reverse();
+        a.set_items(items);
+
+        assert_eq!(a.current().unwrap().id, selected, "still on the same item");
+        assert_eq!(a.check_sel, check_sel, "check cursor survives a refresh");
+        assert_eq!(a.scroll, scroll, "reading position survives a refresh");
     }
 
     #[test]

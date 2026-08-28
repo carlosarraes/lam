@@ -39,6 +39,6 @@ Every item records **who asked**. `lam push` resolves the name in this order: `-
 | `lam check tick\|untick <id> <n>` | Carlos's side, from the terminal |
 | `lam list [--all] [--json]`, `lam show <id>` | |
 | `lam done <id> [choice] [-m text]`, `lam dismiss <id>` | Carlos's side |
-| `lam` / `lam tui` | interactive queue in the terminal: `1-3` choose, `Enter` done, `Tab`/`Space` tick checks, `r` reply text, `d` dismiss, `o` open link, `m` markdown reader, `/` filter by agent, `a` show all, live updates |
+| `lam` / `lam tui` | interactive queue in the terminal: `1-3` choose, `Enter` done, `Space` tick the next check, `Tab` + `j/k` pick a check, `r` reply text, `d` dismiss, `o` open link, `m` markdown reader, `/` filter by agent, `a` show all, live updates |
 | `lam watch` | mirror ntfy → desktop notifications |
 | `lam --llm` | print the agent guide (the `lam` skill) — for agents that don't have the skill installed |
