@@ -23,7 +23,7 @@ const lastMessage = async () => (await topicMessages()).at(-1)!;
 let seq = 0;
 
 /** Pushes an item whose title is made unique, so the duplicate guard never fires by accident. */
-async function push(body: { title?: string } & object = {}) {
+async function push(body: { title?: string } & Record<string, unknown> = {}) {
   const { title = "item", ...rest } = body;
   const res = await SELF.fetch("http://lam/items", json({ name: "0:agent", title: `${title} #${++seq}`, ...rest }));
   expect(res.status).toBe(201);
