@@ -10,6 +10,7 @@ async function itemToken(secret: string, id: string): Promise<string> {
 
 const AUTH = { Authorization: "Bearer test-token" };
 const json = (body: unknown) => ({ method: "POST", headers: { ...AUTH, "content-type": "application/json" }, body: JSON.stringify(body) });
+const publicJson = (body: unknown) => ({ method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 const settle = () => new Promise((r) => setTimeout(r, 50));
 
 async function topicMessages(since = "all"): Promise<any[]> {
@@ -155,6 +156,185 @@ describe("auth", () => {
       headers: { ...device.headers, "content-type": "application/json" },
     });
     expect(response.status).toBe(403);
+  });
+});
+
+describe("device pairing", () => {
+  const registration = (name: string) => ({
+    name,
+    fcm_token: `fake-fcm-${name}`,
+    app_version: "1.0.0-test",
+    android_version: "16-test",
+  });
+
+  async function createPairing(origin = "https://lam.example") {
+    const response = await SELF.fetch(`${origin}/pairings`, { method: "POST", headers: AUTH });
+    expect(response.status).toBe(201);
+    return response.json<any>();
+  }
+
+  async function claim(session: string, secret: string, name: string) {
+    return SELF.fetch(`https://lam.example/pairings/${session}/claim`, publicJson({ secret, ...registration(name) }));
+  }
+
+  it("creates an exact v1 QR payload backed by a five-minute hashed session secret", async () => {
+    const created = await createPairing();
+    const qr = JSON.parse(created.qr);
+
+    expect(Object.keys(qr)).toEqual(["v", "server", "session", "secret"]);
+    expect(created.qr).toBe(JSON.stringify({
+      v: 1,
+      server: "https://lam.example",
+      session: created.session,
+      secret: qr.secret,
+    }));
+    expect(qr.secret).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(Date.parse(created.expires_at) - Date.parse(created.created_at)).toBe(5 * 60 * 1_000);
+
+    const stored = await env.DB.prepare("SELECT secret_hash FROM pairing_sessions WHERE id = ?").bind(created.session).first<{
+      secret_hash: string;
+    }>();
+    expect(stored?.secret_hash).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(stored?.secret_hash).not.toBe(qr.secret);
+  });
+
+  it("rejects malformed pairing secrets before creating a device", async () => {
+    const created = await createPairing();
+    const before = await env.DB.prepare("SELECT COUNT(*) AS count FROM devices").first<{ count: number }>();
+
+    const response = await claim(created.session, "not-base64url-32-bytes", "Malformed secret phone");
+
+    expect(response.status).toBe(400);
+    const after = await env.DB.prepare("SELECT COUNT(*) AS count FROM devices").first<{ count: number }>();
+    expect(after?.count).toBe(before?.count);
+  });
+
+  it("authenticates a well-formed pairing secret without a bearer", async () => {
+    const created = await createPairing();
+    const response = await claim(created.session, "A".repeat(43), "Wrong-secret phone");
+
+    expect(response.status).toBe(401);
+    expect(await env.DB.prepare("SELECT id FROM devices WHERE name = ?").bind("Wrong-secret phone").first()).toBeNull();
+  });
+
+  it("expires after five minutes and cannot be claimed", async () => {
+    const created = await createPairing();
+    await env.DB.prepare("UPDATE pairing_sessions SET expires_at = ? WHERE id = ?")
+      .bind("2000-01-01T00:05:00.000Z", created.session)
+      .run();
+
+    const statusResponse = await SELF.fetch(`https://lam.example/pairings/${created.session}/wait`, { headers: AUTH });
+    expect(statusResponse.status).toBe(200);
+    expect(await statusResponse.json()).toEqual({ status: "expired" });
+    expect((await claim(created.session, JSON.parse(created.qr).secret, "Expired phone")).status).toBe(409);
+  });
+
+  it("consumes a session once and returns a permanent credential only to the winner", async () => {
+    const created = await createPairing();
+    const secret = JSON.parse(created.qr).secret;
+
+    const winner = await claim(created.session, secret, "One-use phone");
+    expect(winner.status).toBe(201);
+    const body = await winner.json<any>();
+    expect(body.credential).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(Object.keys(body.device).sort()).toEqual([
+      "android_version",
+      "app_version",
+      "created_at",
+      "id",
+      "last_seen_at",
+      "name",
+      "push_registered",
+    ]);
+    expect(JSON.stringify(body)).not.toContain("fake-fcm-One-use phone");
+    expect((await claim(created.session, secret, "Losing retry phone")).status).toBe(409);
+
+    const session = await env.DB.prepare("SELECT consumed_at, device_id, secret_hash FROM pairing_sessions WHERE id = ?")
+      .bind(created.session)
+      .first<{ consumed_at: string | null; device_id: string | null; secret_hash: string }>();
+    const device = await env.DB.prepare("SELECT credential_hash FROM devices WHERE id = ?")
+      .bind(session?.device_id)
+      .first<{ credential_hash: string }>();
+    expect(session?.consumed_at).not.toBeNull();
+    expect(session?.device_id).toBe(body.device.id);
+    expect(device?.credential_hash).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(device?.credential_hash).not.toBe(body.credential);
+  });
+
+  it("allows exactly one winner when two claims race", async () => {
+    const created = await createPairing();
+    const secret = JSON.parse(created.qr).secret;
+
+    const responses = await Promise.all([
+      claim(created.session, secret, "Concurrent phone A"),
+      claim(created.session, secret, "Concurrent phone B"),
+    ]);
+
+    expect(responses.map((response) => response.status).sort()).toEqual([201, 409]);
+    const linkedDevices = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM devices WHERE id = (SELECT device_id FROM pairing_sessions WHERE id = ?)",
+    ).bind(created.session).first<{ count: number }>();
+    const namedDevices = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM devices WHERE name IN (?, ?)",
+    ).bind("Concurrent phone A", "Concurrent phone B").first<{ count: number }>();
+    expect(linkedDevices?.count).toBe(1);
+    expect(namedDevices?.count).toBe(1);
+  });
+
+  it("does not create a device for an unknown session", async () => {
+    const before = await env.DB.prepare("SELECT COUNT(*) AS count FROM devices").first<{ count: number }>();
+    const secret = "A".repeat(43);
+
+    const response = await claim("missing-pairing-session", secret, "Wrong-session phone");
+
+    expect(response.status).toBe(404);
+    const after = await env.DB.prepare("SELECT COUNT(*) AS count FROM devices").first<{ count: number }>();
+    expect(after?.count).toBe(before?.count);
+  });
+
+  it("cancels a pending session and prevents a later claim", async () => {
+    const created = await createPairing();
+    const secret = JSON.parse(created.qr).secret;
+
+    const cancelled = await SELF.fetch(`https://lam.example/pairings/${created.session}`, { method: "DELETE", headers: AUTH });
+    expect(cancelled.status).toBe(200);
+    expect(await cancelled.json()).toEqual({ status: "cancelled" });
+    const waited = await SELF.fetch(`https://lam.example/pairings/${created.session}/wait`, { headers: AUTH });
+    expect(await waited.json()).toEqual({ status: "cancelled" });
+    expect((await claim(created.session, secret, "Cancelled phone")).status).toBe(409);
+  });
+
+  it("wait returns claimed device data without secrets", async () => {
+    const created = await createPairing();
+    const secret = JSON.parse(created.qr).secret;
+    const claimed = await claim(created.session, secret, "Waited-for phone");
+    expect(claimed.status).toBe(201);
+    const claimedBody = await claimed.json<any>();
+
+    const response = await SELF.fetch(`https://lam.example/pairings/${created.session}/wait`, { headers: AUTH });
+    expect(response.status).toBe(200);
+    const body = await response.json<any>();
+    expect(body).toEqual({ status: "claimed", device: claimedBody.device });
+    expect(JSON.stringify(body)).not.toContain(secret);
+    expect(JSON.stringify(body)).not.toContain(claimedBody.credential);
+  });
+
+  it("bounds a pending wait at 25 seconds and returns a typed pending status", async () => {
+    const created = await createPairing();
+    const startedAt = Date.now();
+
+    const response = await SELF.fetch(`https://lam.example/pairings/${created.session}/wait`, { headers: AUTH });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ status: "pending" });
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(25_000);
+    expect(Date.now() - startedAt).toBeLessThan(27_000);
+  }, 30_000);
+
+  it("keeps pairing lifecycle routes master-only while claim uses no bearer", async () => {
+    expect((await SELF.fetch("https://lam.example/pairings", { method: "POST" })).status).toBe(401);
+    const device = await registerFakeDevice();
+    expect((await SELF.fetch("https://lam.example/pairings", { method: "POST", headers: device.headers })).status).toBe(403);
   });
 });
 

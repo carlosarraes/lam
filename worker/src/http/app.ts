@@ -2,6 +2,7 @@ import { HttpRouter, HttpServerResponse } from "@effect/platform";
 import { Effect } from "effect";
 import { api, bearer } from "./api";
 import { ntfy } from "./ntfy";
+import { pairingAdmin, pairingClaims } from "./pairings";
 import { phone } from "./phone";
 
 const error = (status: number, message: string) => HttpServerResponse.unsafeJson({ error: message }, { status });
@@ -9,6 +10,8 @@ const error = (status: number, message: string) => HttpServerResponse.unsafeJson
 /** Maps domain/tagged errors to HTTP responses; anything else is a 500 with the cause logged. */
 export const app = HttpRouter.empty.pipe(
   HttpRouter.concat(api.pipe(HttpRouter.use(bearer))),
+  HttpRouter.concat(pairingAdmin.pipe(HttpRouter.use(bearer))),
+  HttpRouter.concat(pairingClaims),
   HttpRouter.concat(phone),
   HttpRouter.concat(ntfy),
   HttpRouter.catchTags({
