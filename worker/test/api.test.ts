@@ -79,6 +79,31 @@ describe("auth", () => {
     expect((await SELF.fetch(`http://lam/items/${item.id}`, { headers: device.headers })).status).toBe(200);
   });
 
+  it("allows a valid device bearer to wait for one closed item", async () => {
+    const item = await push({ title: "device single wait" });
+    await SELF.fetch(`http://lam/items/${item.id}/dismiss`, { method: "POST", headers: AUTH });
+    const device = await registerFakeDevice();
+    const response = await SELF.fetch(`http://lam/items/${item.id}/wait`, { headers: device.headers });
+    expect(response.status).toBe(200);
+    expect((await response.json<any>()).id).toBe(item.id);
+  });
+
+  it("allows a valid device bearer to wait for any closed item", async () => {
+    const open = await push({ title: "device wait open" });
+    const closed = await push({ title: "device wait closed" });
+    await SELF.fetch(`http://lam/items/${closed.id}/dismiss`, { method: "POST", headers: AUTH });
+    const device = await registerFakeDevice();
+    const response = await SELF.fetch(`http://lam/items/wait?ids=${open.id},${closed.id}`, { headers: device.headers });
+    expect(response.status).toBe(200);
+    expect((await response.json<any>()).id).toBe(closed.id);
+  });
+
+  it("rejects a revoked device bearer", async () => {
+    const device = await registerFakeDevice();
+    await env.DB.prepare("UPDATE devices SET revoked_at = ? WHERE id = ?").bind(new Date().toISOString(), device.id).run();
+    expect((await SELF.fetch("http://lam/items", { headers: device.headers })).status).toBe(401);
+  });
+
   it("records device resolve and dismiss responses as phone responses", async () => {
     const resolved = await push({ title: "device resolve" });
     const dismissed = await push({ title: "device dismiss" });
