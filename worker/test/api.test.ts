@@ -338,6 +338,111 @@ describe("device pairing", () => {
   });
 });
 
+describe("device administration", () => {
+  const patch = (headers: HeadersInit, body: unknown) => ({
+    method: "PATCH",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const summaryKeys = ["android_version", "app_version", "created_at", "id", "last_seen_at", "name", "push_registered", "revoked_at"];
+  const registrationKeys = ["android_version", "app_version", "created_at", "id", "last_seen_at", "name", "push_registered"];
+
+  it("lets the master list devices and rename one without exposing its FCM token", async () => {
+    const device = await registerFakeDevice();
+    await env.DB.prepare("UPDATE devices SET fcm_token = ? WHERE id = ?").bind("fake-admin-fcm-token", device.id).run();
+
+    const listed = await SELF.fetch("http://lam/devices", { headers: AUTH });
+    expect(listed.status).toBe(200);
+    const before = (await listed.json<any[]>()).find((entry) => entry.id === device.id);
+    expect(Object.keys(before).sort()).toEqual(summaryKeys);
+    expect(JSON.stringify(before)).not.toContain("fake-admin-fcm-token");
+
+    const renamed = await SELF.fetch(`http://lam/devices/${device.id}`, patch(AUTH, { name: "  Renamed master phone  " }));
+    expect(renamed.status).toBe(200);
+    const body = await renamed.json<any>();
+    expect(Object.keys(body).sort()).toEqual(summaryKeys);
+    expect(body.name).toBe("Renamed master phone");
+    expect(JSON.stringify(body)).not.toContain("fake-admin-fcm-token");
+  });
+
+  it("forbids a device from administering a different device", async () => {
+    const target = await registerFakeDevice();
+    const other = await registerFakeDevice();
+
+    expect((await SELF.fetch("http://lam/devices", { headers: other.headers })).status).toBe(403);
+    expect((await SELF.fetch(`http://lam/devices/${target.id}`, patch(other.headers, { name: "attacker rename" }))).status).toBe(403);
+    expect((await SELF.fetch(`http://lam/devices/${target.id}`, { method: "DELETE", headers: other.headers })).status).toBe(403);
+    expect((await env.DB.prepare("SELECT name FROM devices WHERE id = ?").bind(target.id).first<{ name: string }>())?.name).toBe("Test phone");
+  });
+
+  it("lets a device read and update only its own safe registration", async () => {
+    const device = await registerFakeDevice();
+    await env.DB.prepare("UPDATE devices SET fcm_token = ? WHERE id = ?").bind("fake-self-old-fcm", device.id).run();
+
+    const current = await SELF.fetch("http://lam/device", { headers: device.headers });
+    expect(current.status).toBe(200);
+    expect(Object.keys(await current.json<any>()).sort()).toEqual(registrationKeys);
+
+    const updated = await SELF.fetch("http://lam/device", patch(device.headers, {
+      name: "  Self managed phone  ",
+      fcm_token: "fake-self-new-fcm",
+      app_version: "2.0.0-test",
+      android_version: "17-test",
+    }));
+    expect(updated.status).toBe(200);
+    const body = await updated.json<any>();
+    expect(Object.keys(body).sort()).toEqual(registrationKeys);
+    expect(body).toMatchObject({
+      id: device.id,
+      name: "Self managed phone",
+      app_version: "2.0.0-test",
+      android_version: "17-test",
+      push_registered: true,
+    });
+    expect(JSON.stringify(body)).not.toContain("fake-self-old-fcm");
+    expect(JSON.stringify(body)).not.toContain("fake-self-new-fcm");
+    expect((await SELF.fetch("http://lam/device", { headers: AUTH })).status).toBe(403);
+  });
+
+  it("rejects invalid and unsupported self updates without changing registration", async () => {
+    const device = await registerFakeDevice();
+
+    expect((await SELF.fetch("http://lam/device", patch(device.headers, { name: "x".repeat(101) }))).status).toBe(400);
+    expect((await SELF.fetch("http://lam/device", patch(device.headers, { credential_hash: "not-allowed" }))).status).toBe(400);
+    const registration = await (await SELF.fetch("http://lam/device", { headers: device.headers })).json<any>();
+    expect(registration.name).toBe("Test phone");
+  });
+
+  it("revokes through either route idempotently, clears FCM, and rejects the revoked bearer", async () => {
+    const masterTarget = await registerFakeDevice();
+    await env.DB.prepare("UPDATE devices SET fcm_token = ? WHERE id = ?").bind("fake-master-revoke-fcm", masterTarget.id).run();
+
+    const first = await SELF.fetch(`http://lam/devices/${masterTarget.id}`, { method: "DELETE", headers: AUTH });
+    expect(first.status).toBe(200);
+    const firstBody = await first.json<any>();
+    expect(Object.keys(firstBody).sort()).toEqual(summaryKeys);
+    expect(firstBody).toMatchObject({ id: masterTarget.id, push_registered: false });
+    expect(firstBody.revoked_at).toEqual(expect.any(String));
+    expect(JSON.stringify(firstBody)).not.toContain("fake-master-revoke-fcm");
+    const second = await SELF.fetch(`http://lam/devices/${masterTarget.id}`, { method: "DELETE", headers: AUTH });
+    expect(second.status).toBe(200);
+    expect((await second.json<any>()).revoked_at).toBe(firstBody.revoked_at);
+    expect((await env.DB.prepare("SELECT fcm_token FROM devices WHERE id = ?").bind(masterTarget.id).first<{ fcm_token: string | null }>())?.fcm_token).toBeNull();
+    expect((await SELF.fetch("http://lam/items", { headers: masterTarget.headers })).status).toBe(401);
+
+    const selfTarget = await registerFakeDevice();
+    await env.DB.prepare("UPDATE devices SET fcm_token = ? WHERE id = ?").bind("fake-self-revoke-fcm", selfTarget.id).run();
+    const selfRevoked = await SELF.fetch("http://lam/device", { method: "DELETE", headers: selfTarget.headers });
+    expect(selfRevoked.status).toBe(200);
+    const selfBody = await selfRevoked.json<any>();
+    expect(Object.keys(selfBody).sort()).toEqual(summaryKeys);
+    expect(selfBody).toMatchObject({ id: selfTarget.id, push_registered: false });
+    expect(JSON.stringify(selfBody)).not.toContain("fake-self-revoke-fcm");
+    expect((await env.DB.prepare("SELECT fcm_token FROM devices WHERE id = ?").bind(selfTarget.id).first<{ fcm_token: string | null }>())?.fcm_token).toBeNull();
+    expect((await SELF.fetch("http://lam/items", { headers: selfTarget.headers })).status).toBe(401);
+  });
+});
+
 describe("POST /items", () => {
   it("validates title, priority, choices", async () => {
     for (const bad of [{}, { name: "n" }, { name: "n", title: "x", priority: "urgent" }, { name: "n", title: "x", choices: ["a", "b", "c", "d"] }, { name: "n", title: "x", choices: [""] }]) {
