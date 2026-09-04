@@ -14,6 +14,26 @@ const json = (body: unknown) => ({ method: "POST", headers: { ...AUTH, "content-
 const publicJson = (body: unknown) => ({ method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 const settle = () => new Promise((r) => setTimeout(r, 50));
 const migrations = (env as unknown as { TEST_MIGRATIONS: D1Migration[] }).TEST_MIGRATIONS;
+const MIGRATION_TABLES = ["pairing_sessions", "devices", "items", "d1_migrations"];
+const MIGRATION_FIXTURE_NAME = "__migration_0005_fixture__";
+
+async function dropMigrationTables(): Promise<void> {
+  for (const table of MIGRATION_TABLES) {
+    await env.DB.prepare(`DROP TABLE IF EXISTS ${table}`).run();
+  }
+}
+
+async function restoreFinalMigrationSchema(): Promise<void> {
+  try {
+    const itemColumns = await env.DB.prepare("PRAGMA table_info(items)").all<{ name: string }>();
+    if (itemColumns.results.some((column) => column.name === "name")) {
+      await env.DB.prepare("DELETE FROM items WHERE name = ?").bind(MIGRATION_FIXTURE_NAME).run();
+    }
+  } finally {
+    await dropMigrationTables();
+    await applyD1Migrations(env.DB, migrations);
+  }
+}
 
 async function topicMessages(since = "all"): Promise<any[]> {
   await settle();
@@ -609,29 +629,27 @@ describe("POST /items", () => {
 
 describe("duplicate pushes", () => {
   it("migrates a 0005 row with null recommendations and legacy deduplication", async () => {
-    for (const table of ["pairing_sessions", "devices", "items", "d1_migrations"]) {
-      await env.DB.prepare(`DROP TABLE ${table}`).run();
-    }
-    await applyD1Migrations(env.DB, migrations.slice(0, 5));
-
-    const beforeColumns = await env.DB.prepare("PRAGMA table_info(items)").all<{ name: string }>();
-    expect(beforeColumns.results.map((column) => column.name)).not.toEqual(expect.arrayContaining([
-      "recommendation",
-      "recommended_choice",
-      "dedupe_key",
-    ]));
-
-    const preMilestoneNewItem = {
-      name: "legacy:agent",
-      title: "retry after rollout",
-      body: "same payload",
-      source_host: "mac",
-      source_project: "lam",
-      priority: "normal",
-      choices: [],
-      checks: [],
-    };
     try {
+      await dropMigrationTables();
+      await applyD1Migrations(env.DB, migrations.slice(0, 5));
+
+      const beforeColumns = await env.DB.prepare("PRAGMA table_info(items)").all<{ name: string }>();
+      expect(beforeColumns.results.map((column) => column.name)).not.toEqual(expect.arrayContaining([
+        "recommendation",
+        "recommended_choice",
+        "dedupe_key",
+      ]));
+
+      const preMilestoneNewItem = {
+        name: MIGRATION_FIXTURE_NAME,
+        title: "retry after rollout",
+        body: "same payload",
+        source_host: "mac",
+        source_project: "lam",
+        priority: "normal",
+        choices: [],
+        checks: [],
+      };
       await env.DB.prepare(
         `INSERT INTO items
           (id, title, body, source_host, source_project, priority, choices, status,
@@ -666,8 +684,7 @@ describe("duplicate pushes", () => {
       expect((await duplicateResponse.json<any>()).id).toBe("legacy-0005");
       expect((await env.DB.prepare("SELECT COUNT(*) AS count FROM items").first<{ count: number }>())?.count).toBe(1);
     } finally {
-      await applyD1Migrations(env.DB, migrations.slice(5));
-      await env.DB.prepare("DELETE FROM items WHERE id = ?").bind("legacy-0005").run();
+      await restoreFinalMigrationSchema();
     }
   });
 
