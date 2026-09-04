@@ -2,7 +2,7 @@
 
 Date: 2026-09-03
 
-Status: approved design, awaiting written-spec review
+Status: approved
 
 ## Context
 
