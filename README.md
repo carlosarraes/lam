@@ -16,10 +16,20 @@ agent ──lam push──▶ lam-api (CF Worker: Effect + D1 + Topic DO) ──
 
 ## Setup
 
-1. Worker: `cd worker && npx wrangler deploy && npx wrangler d1 migrations apply lam --remote`, then `printf %s '<value>' | npx wrangler secret put <NAME>` for `LAM_TOKEN`, `LAM_HMAC_SECRET`, `NTFY_TOPIC` (an unguessable topic name — it is the only access control on the topic).
+1. Worker: `cd worker && npx wrangler d1 migrations apply lam --remote && npx wrangler deploy`, then `printf %s '<value>' | npx wrangler secret put <NAME>` for `LAM_TOKEN`, `LAM_HMAC_SECRET`, `NTFY_TOPIC` (an unguessable topic name — it is the only access control on the topic).
 2. CLI: `lam init --server https://lam-api.<acct>.workers.dev --token <LAM_TOKEN> --topic <NTFY_TOPIC>` → `~/.config/lam/config.toml` (`~/Library/Application Support/lam/` on macOS).
 3. Phone: install the ntfy app (Play/F-Droid), *Add subscription* → topic `<NTFY_TOPIC>` → *Use another server* → `https://lam-api.<acct>.workers.dev`. No account. The app keeps one streaming connection ("instant delivery").
 4. Desktop: `lam` opens the TUI to answer items; run `lam watch` (systemd user unit / launchd) for notifications.
+
+## Rollout and rollback
+
+Deploy in this order:
+
+1. Apply D1 migrations 0006 through 0008.
+2. Deploy the Worker.
+3. Deploy the CLI and agent skill.
+
+The schema must land first because the new Worker reads the recommendation columns and the device and pairing tables. For a rollback, restore the previous Worker, CLI, and skill but leave the additive D1 migrations in place. The old Worker ignores additive tables and columns; the old CLI remains accepted by the new Worker.
 
 Pushing the same name+title+body while the original is still open returns the existing item (HTTP 200, same id) instead of queueing a second one, so a retry after a lost response never double-notifies.
 

@@ -8,7 +8,19 @@ fn item(id: &str, status: &str, choice: Option<&str>) -> serde_json::Value {
     serde_json::json!({
         "id": id, "title": "t", "body": "", "source_host": "h", "source_project": "p",
         "name": "test:agent", "priority": "normal", "choices": [], "checks": [], "version": 0, "status": status,
+        "recommendation": null, "recommended_choice": null,
         "response_choice": choice, "response_text": null, "response_by": choice.map(|_| "phone"),
+        "created_at": "2026-08-25T00:00:00Z", "resolved_at": null
+    })
+}
+
+/// Exact response shape from before recommendation fields were added. Keep those fields absent so
+/// this fixture exercises the serde defaults used during a rolling deploy.
+fn pre_milestone_item(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id, "title": "t", "body": "", "source_host": "h", "source_project": "p",
+        "name": "test:agent", "priority": "normal", "choices": [], "checks": [], "version": 0, "status": "open",
+        "response_choice": null, "response_text": null, "response_by": null,
         "created_at": "2026-08-25T00:00:00Z", "resolved_at": null
     })
 }
@@ -448,6 +460,29 @@ async fn done_and_list() {
     let out = lam(&dir, &["show", "zzzzz"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("404"));
+}
+
+#[tokio::test]
+async fn show_decodes_a_pre_milestone_item_response() {
+    let (server, dir) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/items/old01"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pre_milestone_item("old01")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let out = lam(&dir, &["show", "old01"]);
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let decoded: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(decoded["id"], "old01");
+    assert_eq!(decoded["recommendation"], serde_json::Value::Null);
+    assert_eq!(decoded["recommended_choice"], serde_json::Value::Null);
 }
 
 #[tokio::test]

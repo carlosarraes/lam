@@ -1,4 +1,5 @@
-import { env, SELF } from "cloudflare:test";
+import type { D1Migration } from "@cloudflare/vitest-pool-workers";
+import { applyD1Migrations, env, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
 const enc = new TextEncoder();
@@ -12,6 +13,7 @@ const AUTH = { Authorization: "Bearer test-token" };
 const json = (body: unknown) => ({ method: "POST", headers: { ...AUTH, "content-type": "application/json" }, body: JSON.stringify(body) });
 const publicJson = (body: unknown) => ({ method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 const settle = () => new Promise((r) => setTimeout(r, 50));
+const migrations = (env as unknown as { TEST_MIGRATIONS: D1Migration[] }).TEST_MIGRATIONS;
 
 async function topicMessages(since = "all"): Promise<any[]> {
   await settle();
@@ -502,13 +504,32 @@ describe("POST /items", () => {
       expect((await SELF.fetch("http://lam/items", json(bad))).status).toBe(400);
     }
   });
+  it("accepts the pre-milestone NewItem JSON without recommendation fields", async () => {
+    const preMilestoneNewItem = {
+      name: "legacy:agent",
+      title: "legacy",
+      body: "",
+      source_host: "mac",
+      source_project: "platform",
+      priority: "normal",
+      choices: [],
+      checks: [],
+    };
+
+    const res = await SELF.fetch("http://lam/items", json(preMilestoneNewItem));
+    expect(res.status).toBe(201);
+    const item = await res.json<any>();
+    expect(item.name).toBe("legacy:agent");
+    expect(item.recommendation).toBeNull();
+    expect(item.recommended_choice).toBeNull();
+    expect((await lastMessage()).message).toBe("(legacy:agent)");
+  });
+
   it("accepts a push from an older binary that sends no name", async () => {
-    const res = await SELF.fetch("http://lam/items", json({ title: "legacy", source_host: "mac", source_project: "platform" }));
+    const res = await SELF.fetch("http://lam/items", json({ title: "legacy unnamed", source_host: "mac", source_project: "platform" }));
     expect(res.status).toBe(201);
     const item = await res.json<any>();
     expect(item.name).toBe("");
-    expect(item.recommendation).toBeNull();
-    expect(item.recommended_choice).toBeNull();
     expect((await lastMessage()).message).toBe("(mac:platform)");
   });
 
@@ -587,6 +608,69 @@ describe("POST /items", () => {
 });
 
 describe("duplicate pushes", () => {
+  it("migrates a 0005 row with null recommendations and legacy deduplication", async () => {
+    for (const table of ["pairing_sessions", "devices", "items", "d1_migrations"]) {
+      await env.DB.prepare(`DROP TABLE ${table}`).run();
+    }
+    await applyD1Migrations(env.DB, migrations.slice(0, 5));
+
+    const beforeColumns = await env.DB.prepare("PRAGMA table_info(items)").all<{ name: string }>();
+    expect(beforeColumns.results.map((column) => column.name)).not.toEqual(expect.arrayContaining([
+      "recommendation",
+      "recommended_choice",
+      "dedupe_key",
+    ]));
+
+    const preMilestoneNewItem = {
+      name: "legacy:agent",
+      title: "retry after rollout",
+      body: "same payload",
+      source_host: "mac",
+      source_project: "lam",
+      priority: "normal",
+      choices: [],
+      checks: [],
+    };
+    try {
+      await env.DB.prepare(
+        `INSERT INTO items
+          (id, title, body, source_host, source_project, priority, choices, status,
+           response_choice, response_text, response_by, created_at, resolved_at, link,
+           expires_at, checks, version, name)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'open', NULL, NULL, NULL, ?, NULL, '', NULL, ?, 0, ?)`,
+      ).bind(
+        "legacy-0005",
+        preMilestoneNewItem.title,
+        preMilestoneNewItem.body,
+        preMilestoneNewItem.source_host,
+        preMilestoneNewItem.source_project,
+        preMilestoneNewItem.priority,
+        JSON.stringify(preMilestoneNewItem.choices),
+        "2026-09-04T12:00:00.000Z",
+        JSON.stringify(preMilestoneNewItem.checks),
+        preMilestoneNewItem.name,
+      ).run();
+
+      await applyD1Migrations(env.DB, migrations.slice(5));
+
+      const migratedResponse = await SELF.fetch("http://lam/items/legacy-0005", { headers: AUTH });
+      expect(migratedResponse.status).toBe(200);
+      expect(await migratedResponse.json<any>()).toMatchObject({
+        id: "legacy-0005",
+        recommendation: null,
+        recommended_choice: null,
+      });
+
+      const duplicateResponse = await SELF.fetch("http://lam/items", json(preMilestoneNewItem));
+      expect(duplicateResponse.status).toBe(200);
+      expect((await duplicateResponse.json<any>()).id).toBe("legacy-0005");
+      expect((await env.DB.prepare("SELECT COUNT(*) AS count FROM items").first<{ count: number }>())?.count).toBe(1);
+    } finally {
+      await applyD1Migrations(env.DB, migrations.slice(5));
+      await env.DB.prepare("DELETE FROM items WHERE id = ?").bind("legacy-0005").run();
+    }
+  });
+
   it("a fully identical push while the first is open returns the same item and does not notify twice", async () => {
     const body = {
       name: "0:agent",
