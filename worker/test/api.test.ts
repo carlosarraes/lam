@@ -51,7 +51,64 @@ describe("POST /items", () => {
     expect(res.status).toBe(201);
     const item = await res.json<any>();
     expect(item.name).toBe("");
+    expect(item.recommendation).toBeNull();
+    expect(item.recommended_choice).toBeNull();
     expect((await lastMessage()).message).toBe("(mac:platform)");
+  });
+
+  it("round-trips recommendation fields", async () => {
+    const res = await SELF.fetch("http://lam/items", json({
+      title: "Release?",
+      choices: ["ship", "hold"],
+      recommendation: "Ship after the smoke test.",
+      recommended_choice: "ship",
+    }));
+    expect(res.status).toBe(201);
+    expect(await res.json<any>()).toMatchObject({
+      recommendation: "Ship after the smoke test.",
+      recommended_choice: "ship",
+    });
+  });
+
+  it("rejects a recommended choice that is not an exact choice", async () => {
+    const res = await SELF.fetch("http://lam/items", json({
+      title: "Release?",
+      choices: ["ship"],
+      recommended_choice: "Ship",
+    }));
+    expect(res.status).toBe(400);
+  });
+
+  it("enforces push content limits by code point, byte length, and item count", async () => {
+    const tooLongChoice = "x".repeat(201);
+    const tooLongCheck = "x".repeat(201);
+    const tooLongTitle = "x".repeat(201);
+    const bodyOver64KiB = "é".repeat(32_769);
+    const recommendationOver2_000CodePoints = "😀".repeat(2_001);
+    const fiftyOneChecks = Array.from({ length: 51 }, (_, i) => `check ${i}`);
+
+    for (const body of [
+      { title: "choice", choices: [tooLongChoice] },
+      { title: "choices", choices: ["a", "b", "c", "d"] },
+      { title: "check", checks: [tooLongCheck] },
+      { title: "checks", checks: fiftyOneChecks },
+      { title: tooLongTitle },
+      { title: "body", body: bodyOver64KiB },
+      { title: "recommendation", recommendation: recommendationOver2_000CodePoints },
+    ]) {
+      expect((await SELF.fetch("http://lam/items", json(body))).status).toBe(400);
+    }
+  });
+
+  it("accepts content exactly at the byte and code-point limits", async () => {
+    const res = await SELF.fetch("http://lam/items", json({
+      title: "😀".repeat(200),
+      body: "é".repeat(32_768),
+      choices: ["😀".repeat(200)],
+      recommendation: "😀".repeat(2_000),
+      recommended_choice: "😀".repeat(200),
+    }));
+    expect(res.status).toBe(201);
   });
 
   it("creates an item and publishes to the topic with action buttons", async () => {
@@ -74,8 +131,20 @@ describe("POST /items", () => {
 });
 
 describe("duplicate pushes", () => {
-  it("an identical push while the first is open returns the same item and does not notify twice", async () => {
-    const body = { name: "0:agent", title: "PR #2720 green", body: "trigger review" };
+  it("a fully identical push while the first is open returns the same item and does not notify twice", async () => {
+    const body = {
+      name: "0:agent",
+      title: "PR #2720 green",
+      body: "trigger review",
+      source_host: "mac",
+      source_project: "lam",
+      priority: "critical",
+      choices: ["ship", "wait"],
+      link: "https://example.com/pr/2720",
+      ttl: 17,
+      recommendation: "Ship it.",
+      recommended_choice: "ship",
+    };
     const first = await SELF.fetch("http://lam/items", json(body));
     expect(first.status).toBe(201);
     const a = await first.json<any>();
@@ -100,6 +169,19 @@ describe("duplicate pushes", () => {
     const afterClose = await SELF.fetch("http://lam/items", json(base));
     expect(afterClose.status).toBe(201);
     expect((await afterClose.json<any>()).id).not.toBe(a.id);
+  });
+
+  it("a different recommendation or exact TTL seconds creates a distinct item", async () => {
+    const body = { name: "0:agent", title: "same contract", body: "b", ttl: 17, recommendation: "do it" };
+    const first = await (await SELF.fetch("http://lam/items", json(body))).json<any>();
+
+    const differentRecommendation = await SELF.fetch("http://lam/items", json({ ...body, recommendation: "wait" }));
+    expect(differentRecommendation.status).toBe(201);
+    expect((await differentRecommendation.json<any>()).id).not.toBe(first.id);
+
+    const differentTtl = await SELF.fetch("http://lam/items", json({ ...body, ttl: 18 }));
+    expect(differentTtl.status).toBe(201);
+    expect((await differentTtl.json<any>()).id).not.toBe(first.id);
   });
 });
 
@@ -171,6 +253,25 @@ describe("paging", () => {
 });
 
 describe("resolution", () => {
+  it("rejects oversized replies and malformed resolution JSON while retaining an empty resolve body", async () => {
+    const cliItem = await push({ title: "cli reply" });
+    const oversizedReply = "😀".repeat(2_049);
+    expect((await SELF.fetch(`http://lam/items/${cliItem.id}/resolve`, json({ text: oversizedReply }))).status).toBe(400);
+    expect((await SELF.fetch(`http://lam/items/${cliItem.id}/resolve`, {
+      method: "POST",
+      headers: { ...AUTH, "content-type": "application/json" },
+      body: "{",
+    })).status).toBe(400);
+    expect((await SELF.fetch(`http://lam/items/${cliItem.id}/resolve`, { method: "POST", headers: AUTH })).status).toBe(200);
+
+    const phoneItem = await push({ title: "phone reply" });
+    const token = await itemToken("test-secret", phoneItem.id);
+    expect((await SELF.fetch(`http://lam/r/${phoneItem.id}?t=${token}`, {
+      method: "POST",
+      body: new URLSearchParams({ text: oversizedReply }),
+    })).status).toBe(400);
+  });
+
   it("phone button resolves with choice and publishes closed message", async () => {
     const item = await push({ title: "q", choices: ["yes", "no"] });
     const t = await itemToken("test-secret", item.id);
@@ -291,6 +392,12 @@ describe("checklists", () => {
     const other = await push({ title: "other" });
     const w = await SELF.fetch(`http://lam/items/wait?ids=${other.id},${item.id}&since=0,0`, { headers: AUTH });
     expect((await w.json<any>()).id).toBe(item.id);
+  });
+
+  it("rejects an appended check label over 200 code points", async () => {
+    const item = await push({ title: "PRs", checks: ["a"] });
+    const res = await SELF.fetch(`http://lam/items/${item.id}/checks`, json({ label: "😀".repeat(201) }));
+    expect(res.status).toBe(400);
   });
 
   it("phone page toggles checks via form and closes on last tick", async () => {

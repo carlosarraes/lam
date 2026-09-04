@@ -8,11 +8,57 @@ const newId = () => Array.from(crypto.getRandomValues(new Uint8Array(5)), (b) =>
 const db = <A>(run: (db: D1Database) => Promise<A>) =>
   Effect.flatMap(Env, ({ DB }) => Effect.tryPromise({ try: () => run(DB), catch: (cause) => new DbError({ cause }) }));
 
+const toItem = (row: typeof ItemRow.Type) =>
+  new Item({
+    id: row.id,
+    name: row.name,
+    title: row.title,
+    body: row.body,
+    source_host: row.source_host,
+    source_project: row.source_project,
+    priority: row.priority,
+    choices: row.choices,
+    checks: row.checks,
+    recommendation: row.recommendation,
+    recommended_choice: row.recommended_choice,
+    link: row.link,
+    status: row.status,
+    response_choice: row.response_choice,
+    response_text: row.response_text,
+    response_by: row.response_by,
+    created_at: row.created_at,
+    resolved_at: row.resolved_at,
+    expires_at: row.expires_at,
+    version: row.version,
+  });
+
 const decodeRow = (row: unknown) =>
   Schema.decodeUnknown(ItemRow)(row).pipe(
-    Effect.map((r) => Item.withExpiry(new Item(r), new Date())),
+    Effect.map((r) => Item.withExpiry(toItem(r), new Date())),
     Effect.orDie,
   );
+
+/** Stable request identity; optional values use exactly the defaults persisted by `NewItem`. */
+export const canonicalDedupeInput = (input: NewItem) =>
+  JSON.stringify({
+    name: input.name ?? "",
+    title: input.title,
+    body: input.body ?? "",
+    source_host: input.source_host ?? "",
+    source_project: input.source_project ?? "",
+    priority: input.priority ?? "normal",
+    choices: input.choices ?? [],
+    checks: input.checks ?? [],
+    link: input.link ?? "",
+    ttl: input.ttl ?? null,
+    recommendation: input.recommendation ?? null,
+    recommended_choice: input.recommended_choice ?? null,
+  });
+
+const dedupeKey = async (input: NewItem) => {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonicalDedupeInput(input))));
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+};
 
 export interface ListQuery {
   status?: Status;
@@ -61,29 +107,34 @@ export class Items extends Effect.Service<Items>()("lam/Items", {
   succeed: {
     create: (input: NewItem) =>
       Effect.gen(function* () {
-        const { ttl, link = "", checks, ...fields } = input;
+        const { ttl, link = "", checks, recommendation = null, recommended_choice = null, ...fields } = input;
         const now = Date.now();
+        const created_at = new Date(now).toISOString();
+        const expires_at = ttl === undefined ? null : new Date(now + ttl * 1000).toISOString();
+        const key = yield* Effect.promise(() => dedupeKey(input));
         const item = new Item({
           ...fields,
           link,
           checks: checks.map((label) => ({ label, done: false, at: null })),
+          recommendation,
+          recommended_choice,
           version: 0,
           id: newId(),
           status: "open",
           response_choice: null,
           response_text: null,
           response_by: null,
-          created_at: new Date(now).toISOString(),
+          created_at,
           resolved_at: null,
-          expires_at: ttl === undefined ? null : new Date(now + ttl * 1000).toISOString(),
+          expires_at,
         });
         yield* db((d) =>
           d
             .prepare(
-              `INSERT INTO items (id, name, title, body, source_host, source_project, priority, choices, checks, link, status, created_at, expires_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`,
+              `INSERT INTO items (id, name, title, body, source_host, source_project, priority, choices, checks, recommendation, recommended_choice, link, status, created_at, expires_at, dedupe_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)`,
             )
-            .bind(item.id, item.name, item.title, item.body, item.source_host, item.source_project, item.priority, JSON.stringify(item.choices), JSON.stringify(item.checks), item.link, item.created_at, item.expires_at)
+            .bind(item.id, item.name, item.title, item.body, item.source_host, item.source_project, item.priority, JSON.stringify(item.choices), JSON.stringify(item.checks), item.recommendation, item.recommended_choice, item.link, item.created_at, item.expires_at, key)
             .run(),
         );
         return item;
@@ -91,15 +142,31 @@ export class Items extends Effect.Service<Items>()("lam/Items", {
 
     /** An open, unexpired item with identical content — a retry of a push whose response was lost. */
     findDuplicate: (input: NewItem) =>
-      db((d) =>
-        d
-          .prepare(
-            `SELECT * FROM items WHERE status = 'open' AND name = ? AND title = ? AND body = ?
-             AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC LIMIT 1`,
-          )
-          .bind(input.name, input.title, input.body, new Date().toISOString())
-          .first(),
-      ).pipe(Effect.flatMap((row) => (row ? Effect.map(decodeRow(row), Option.some) : Effect.succeed(Option.none<Item>())))),
+      Effect.gen(function* () {
+        const now = new Date().toISOString();
+        const key = yield* Effect.promise(() => dedupeKey(input));
+        const keyed = yield* db((d) =>
+          d
+            .prepare(
+              `SELECT * FROM items WHERE status = 'open' AND dedupe_key = ?
+               AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC LIMIT 1`,
+            )
+            .bind(key, now)
+            .first(),
+        );
+        if (keyed) return Option.some(yield* decodeRow(keyed));
+
+        const legacy = yield* db((d) =>
+          d
+            .prepare(
+              `SELECT * FROM items WHERE status = 'open' AND dedupe_key IS NULL AND name = ? AND title = ? AND body = ?
+               AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC LIMIT 1`,
+            )
+            .bind(input.name, input.title, input.body, now)
+            .first(),
+        );
+        return legacy ? Option.some(yield* decodeRow(legacy)) : Option.none<Item>();
+      }),
 
     get: (id: string) =>
       db((d) => d.prepare("SELECT * FROM items WHERE id = ?").bind(id).first()).pipe(

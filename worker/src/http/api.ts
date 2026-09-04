@@ -1,7 +1,7 @@
 import { HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import { Effect, Fiber, Option, Schema } from "effect";
 import { Exec } from "../Env";
-import { Item, NewItem, Resolution, Status } from "../domain/Item";
+import { CheckLabel, Item, NewItem, Resolution, Status } from "../domain/Item";
 import { Items } from "../services/Items";
 import { Auth } from "../services/Auth";
 import { Notify } from "../services/Notify";
@@ -112,7 +112,9 @@ export const api = HttpRouter.empty.pipe(
     "/items/:id/resolve",
     Effect.gen(function* () {
       const { id } = yield* HttpRouter.schemaPathParams(IdParam);
-      const res = yield* HttpServerRequest.schemaBodyJson(Resolution).pipe(Effect.orElseSucceed(() => ({} as Resolution)));
+      const req = yield* HttpServerRequest.HttpServerRequest;
+      // Older callers send an empty POST to mark an item done. A present body must still decode.
+      const res = req.source instanceof Request && req.source.body === null ? ({} as Resolution) : yield* HttpServerRequest.schemaBodyJson(Resolution);
       const item = yield* (yield* Items).close(id, { status: "resolved", choice: res.choice, text: res.text, by: "cli" });
       yield* background((yield* Notify).itemClosed(item));
       return yield* HttpServerResponse.json(item);
@@ -122,7 +124,7 @@ export const api = HttpRouter.empty.pipe(
     "/items/:id/checks",
     Effect.gen(function* () {
       const { id } = yield* HttpRouter.schemaPathParams(IdParam);
-      const { label } = yield* HttpServerRequest.schemaBodyJson(Schema.Struct({ label: Schema.NonEmptyTrimmedString }));
+      const { label } = yield* HttpServerRequest.schemaBodyJson(Schema.Struct({ label: CheckLabel }));
       const item = yield* (yield* Items).addCheck(id, label);
       const baseUrl = yield* origin;
       yield* background((yield* Notify).checkAdded(item, label, baseUrl));

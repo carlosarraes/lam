@@ -1,6 +1,6 @@
 import { Headers, HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import { Effect, Schema } from "effect";
-import type { Item } from "../domain/Item";
+import { ReplyText, type Item } from "../domain/Item";
 import { Items } from "../services/Items";
 import { Auth } from "../services/Auth";
 import { Notify } from "../services/Notify";
@@ -82,7 +82,7 @@ export const phone = HttpRouter.empty.pipe(
     "/r/:id",
     Effect.gen(function* () {
       const { id } = yield* HttpRouter.schemaPathParams(IdParam);
-      const { text } = yield* HttpServerRequest.schemaBodyUrlParams(Schema.Struct({ text: Schema.NonEmptyTrimmedString }));
+      const { text } = yield* HttpServerRequest.schemaBodyUrlParams(Schema.Struct({ text: ReplyText }));
       const item = yield* (yield* Items).close(id, { status: "resolved", text: text.trim(), by: "phone" });
       yield* background((yield* Notify).itemClosed(item));
       return HttpServerResponse.text(`sent: ${text}`);
