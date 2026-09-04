@@ -7,8 +7,11 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import androidx.core.content.edit
+import dev.carraes.lam.items.LamApi
+import dev.carraes.lam.items.OkHttpLamApi
 import java.nio.charset.StandardCharsets
 import java.security.KeyStore
+import java.util.concurrent.atomic.AtomicReference
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -26,13 +29,14 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
 
-internal data class PersistedCredential(
+private data class PersistedCredential(
     val server: PairedServer,
     val credential: String,
 )
 
-internal interface CredentialPersistence {
+private interface CredentialPersistence {
     fun restore(): PersistedCredential?
 
     fun save(server: PairedServer, credential: String)
@@ -42,7 +46,7 @@ internal interface CredentialPersistence {
     fun recoverFromUnreadableRecord()
 }
 
-internal class CredentialStoreRuntime(
+private class CredentialStoreRuntime(
     private val persistence: CredentialPersistence,
     private val ioDispatcher: CoroutineDispatcher,
     scope: CoroutineScope,
@@ -98,19 +102,49 @@ internal class CredentialStoreRuntime(
     }
 }
 
-internal fun createKeystoreCredentialStore(
+internal interface CredentialComposition {
+    val credentialStore: CredentialStore
+
+    fun apiFor(server: PairedServer): LamApi
+}
+
+internal fun createCredentialComposition(
     context: Context,
     aadApplicationId: String = context.packageName,
     ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     scope: CoroutineScope = CoroutineScope(SupervisorJob() + ioDispatcher),
-    onCredentialChanged: (String?) -> Unit,
-): CredentialStore = KeystoreCredentialStore(
-    context = context,
-    aadApplicationId = aadApplicationId,
-    ioDispatcher = ioDispatcher,
-    scope = scope,
-    onCredentialChanged = onCredentialChanged,
+    baseClient: OkHttpClient = OkHttpClient(),
+): CredentialComposition = DefaultCredentialComposition(
+    context,
+    aadApplicationId,
+    ioDispatcher,
+    scope,
+    baseClient,
 )
+
+private class DefaultCredentialComposition(
+    context: Context,
+    aadApplicationId: String,
+    ioDispatcher: CoroutineDispatcher,
+    scope: CoroutineScope,
+    private val baseClient: OkHttpClient,
+) : CredentialComposition {
+    private val credential = AtomicReference<String?>(null)
+
+    override val credentialStore: CredentialStore = KeystoreCredentialStore(
+        context = context,
+        aadApplicationId = aadApplicationId,
+        ioDispatcher = ioDispatcher,
+        scope = scope,
+        onCredentialChanged = credential::set,
+    )
+
+    override fun apiFor(server: PairedServer): LamApi = OkHttpLamApi(
+        baseUrl = server.serverUrl.toHttpUrl(),
+        credentialProvider = credential::get,
+        baseClient = baseClient,
+    )
+}
 
 private class KeystoreCredentialStore(
     context: Context,

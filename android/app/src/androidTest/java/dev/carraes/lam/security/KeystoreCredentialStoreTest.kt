@@ -14,9 +14,12 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -26,6 +29,8 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
 
 class KeystoreCredentialStoreTest {
     private lateinit var context: Context
@@ -44,22 +49,17 @@ class KeystoreCredentialStoreTest {
     @Test
     fun saveObserveClearAndProcessRecreation() = runBlocking {
         val expected = pairedServer()
-        var capturedCredential: String? = null
-        val store = newStore { capturedCredential = it }
+        val store = newStore()
 
         store.save(expected, CREDENTIAL)
 
         assertEquals(expected, store.observe().first())
-        assertEquals(CREDENTIAL, capturedCredential)
 
-        var restoredCredential: String? = null
-        val recreated = newStore { restoredCredential = it }
+        val recreated = newStore()
         assertEquals(expected, recreated.observe().first())
-        assertEquals(CREDENTIAL, restoredCredential)
 
         recreated.clear()
         assertNull(recreated.observe().first())
-        assertNull(restoredCredential)
         assertTrue(credentialsPreferences().all.isEmpty())
         assertFalse(androidKeyStore().containsAlias(defaultAlias()))
     }
@@ -115,11 +115,9 @@ class KeystoreCredentialStoreTest {
             newStore().save(pairedServer(), CREDENTIAL)
             credentialsPreferences().edit().putString(corruptedKey, "not-base64!").commit()
 
-            var capturedCredential: String? = "not-cleared"
-            val recreated = newStore { capturedCredential = it }
+            val recreated = newStore()
 
             assertNull(recreated.observe().first())
-            assertNull(capturedCredential)
             assertTrue(credentialsPreferences().all.isEmpty())
             assertFalse(androidKeyStore().containsAlias(defaultAlias()))
         }
@@ -127,11 +125,9 @@ class KeystoreCredentialStoreTest {
         newStore().save(pairedServer(), CREDENTIAL)
         androidKeyStore().deleteEntry(defaultAlias())
 
-        var restoredAfterKeyLoss: String? = "not-cleared"
-        val recreatedAfterKeyLoss = newStore { restoredAfterKeyLoss = it }
+        val recreatedAfterKeyLoss = newStore()
 
         assertNull(recreatedAfterKeyLoss.observe().first())
-        assertNull(restoredAfterKeyLoss)
         assertTrue(credentialsPreferences().all.isEmpty())
         assertFalse(androidKeyStore().containsAlias(defaultAlias()))
     }
@@ -143,11 +139,9 @@ class KeystoreCredentialStoreTest {
             .putString(KEY_SERVER_URL, "https://other.example/")
             .commit()
 
-        var copiedCredential: String? = "not-cleared"
-        val copiedToAnotherServer = newStore { copiedCredential = it }
+        val copiedToAnotherServer = newStore()
 
         assertNull(copiedToAnotherServer.observe().first())
-        assertNull(copiedCredential)
         assertTrue(credentialsPreferences().all.isEmpty())
         assertFalse(androidKeyStore().containsAlias(defaultAlias()))
     }
@@ -157,11 +151,9 @@ class KeystoreCredentialStoreTest {
         assertEquals("dev.carraes.lam.debug", context.packageName)
         newStore().save(pairedServer(), CREDENTIAL)
 
-        var simulatedReleaseCredential: String? = "not-cleared"
-        val simulatedRelease = newStore("dev.carraes.lam") { simulatedReleaseCredential = it }
+        val simulatedRelease = newStore("dev.carraes.lam")
 
         assertNull(simulatedRelease.observe().first())
-        assertNull(simulatedReleaseCredential)
         assertTrue(credentialsPreferences().all.isEmpty())
         assertFalse(androidKeyStore().containsAlias(defaultAlias()))
     }
@@ -181,6 +173,28 @@ class KeystoreCredentialStoreTest {
     }
 
     @Test
+    fun safeCompositionAuthenticatesWithoutExposingTheCredential() = runBlocking {
+        MockWebServer().use { server ->
+            server.enqueue(MockResponse().setHeader("Content-Type", "application/json").setBody("[]"))
+            val composition = createCredentialComposition(context)
+            val paired = pairedServer().copy(serverUrl = server.url("/").toString())
+
+            composition.credentialStore.save(paired, CREDENTIAL)
+            composition.apiFor(paired).listOpenItems()
+
+            assertEquals("Bearer $CREDENTIAL", server.takeRequest().getHeader("Authorization"))
+            assertFalse(
+                composition.javaClass.declaredMethods.any { method ->
+                    method.parameterCount == 0 &&
+                        (method.returnType == String::class.java ||
+                            method.returnType.name.startsWith("kotlin.jvm.functions.Function"))
+                },
+            )
+            assertFalse(composition.credentialStore.observe().first().toString().contains(CREDENTIAL))
+        }
+    }
+
+    @Test
     fun keystoreOperationsLeaveTheCallingMainThread() = runBlocking {
         val executor = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "credential-device-io")
@@ -188,27 +202,41 @@ class KeystoreCredentialStoreTest {
         val dispatcher = executor.asCoroutineDispatcher()
         val scope = CoroutineScope(SupervisorJob() + dispatcher)
         try {
-            var credentialCallbackThread: Thread? = null
-            val store = createKeystoreCredentialStore(
+            val recordingDispatcher = RecordingDispatcher(dispatcher)
+            val store = createCredentialComposition(
                 context = context,
-                ioDispatcher = dispatcher,
+                ioDispatcher = recordingDispatcher,
                 scope = scope,
-                onCredentialChanged = { credential ->
-                    if (credential != null) credentialCallbackThread = Thread.currentThread()
-                },
-            )
+            ).credentialStore
 
             withContext(Dispatchers.Main) {
                 store.save(pairedServer(), CREDENTIAL)
             }
 
-            assertEquals("credential-device-io", credentialCallbackThread?.name)
-            assertNotEquals(android.os.Looper.getMainLooper().thread, credentialCallbackThread)
+            assertTrue(recordingDispatcher.threads.isNotEmpty())
+            assertTrue(recordingDispatcher.threads.all { it.name == "credential-device-io" })
+            assertFalse(recordingDispatcher.threads.contains(android.os.Looper.getMainLooper().thread))
         } finally {
             scope.cancel()
             dispatcher.close()
             executor.shutdownNow()
         }
+    }
+
+    @Test
+    fun observeWaitsForDeterministicRestoreBeforeEmittingUnpaired() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val store = createCredentialComposition(
+            context = context,
+            ioDispatcher = dispatcher,
+            scope = this,
+        ).credentialStore
+        val first = async { store.observe().first() }
+
+        assertFalse(first.isCompleted)
+        testScheduler.runCurrent()
+
+        assertNull(first.await())
     }
 
     private suspend fun eraseTestState() {
@@ -219,12 +247,10 @@ class KeystoreCredentialStoreTest {
 
     private fun newStore(
         aadApplicationId: String = context.packageName,
-        onCredentialChanged: (String?) -> Unit = {},
-    ): CredentialStore = createKeystoreCredentialStore(
+    ): CredentialStore = createCredentialComposition(
         context = context,
         aadApplicationId = aadApplicationId,
-        onCredentialChanged = onCredentialChanged,
-    )
+    ).credentialStore
 
     private fun pairedServer() = PairedServer(
         serverUrl = "https://lam.example/",
@@ -249,5 +275,18 @@ class KeystoreCredentialStoreTest {
         const val KEY_IV = "credential_iv"
         const val KEY_CIPHERTEXT = "credential_ciphertext"
         const val CREDENTIAL = "test-device-credential-never-store-plaintext"
+    }
+}
+
+private class RecordingDispatcher(
+    private val delegate: kotlinx.coroutines.CoroutineDispatcher,
+) : kotlinx.coroutines.CoroutineDispatcher() {
+    val threads = java.util.concurrent.CopyOnWriteArrayList<Thread>()
+
+    override fun dispatch(context: kotlin.coroutines.CoroutineContext, block: Runnable) {
+        delegate.dispatch(context) {
+            threads += Thread.currentThread()
+            block.run()
+        }
     }
 }

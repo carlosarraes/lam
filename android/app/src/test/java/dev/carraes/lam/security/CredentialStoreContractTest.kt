@@ -2,34 +2,27 @@ package dev.carraes.lam.security
 
 import dev.carraes.lam.AppContainer
 import java.lang.reflect.Modifier
-import java.util.concurrent.Executors
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
-import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CredentialStoreContractTest {
     @Test
-    fun `public app surfaces expose no credential reader or provider`() {
-        val forbiddenOutput = { method: java.lang.reflect.Method ->
+    fun `production module surfaces expose no credential reader provider or callback`() {
+        val returnsCredential = { method: java.lang.reflect.Method ->
             method.parameterCount == 0 &&
                 (method.returnType == String::class.java ||
                     method.returnType.name.startsWith("kotlin.jvm.functions.Function"))
         }
-        assertFalse(CredentialStore::class.java.methods.any(forbiddenOutput))
-        assertFalse(AppContainer::class.java.declaredMethods.any(forbiddenOutput))
+        assertFalse(CredentialStore::class.java.declaredMethods.any(returnsCredential))
+        assertFalse(AppContainer::class.java.declaredMethods.any(returnsCredential))
         assertFalse(
-            AppContainer::class.java.methods.any {
+            AppContainer::class.java.declaredMethods.any {
                 it.name.contains("credentialProvider", ignoreCase = true) ||
                     it.name.contains("credentialReader", ignoreCase = true)
             },
@@ -41,110 +34,60 @@ class CredentialStoreContractTest {
                     it.name.contains("secret", ignoreCase = true)
             },
         )
-        val implementation = Class.forName("dev.carraes.lam.security.KeystoreCredentialStore")
-        assertFalse(Modifier.isPublic(implementation.modifiers))
-    }
 
-    @Test
-    fun `observe emits nothing until restore completes on the injected dispatcher`() = runTest {
-        val dispatcher = StandardTestDispatcher(testScheduler)
-        val expected = PairedServer("https://lam.example/", "device-1", "S24 Ultra")
-        val persistence = FakeCredentialPersistence(PersistedCredential(expected, "device-credential"))
-        var capturedCredential: String? = null
-        val runtime = CredentialStoreRuntime(
-            persistence = persistence,
-            ioDispatcher = dispatcher,
-            scope = this,
-            onCredentialChanged = { capturedCredential = it },
+        val fileFacade = Class.forName("dev.carraes.lam.security.KeystoreCredentialStoreKt")
+        assertFalse(
+            fileFacade.declaredMethods.any { method ->
+                !Modifier.isPrivate(method.modifiers) &&
+                    method.parameterTypes.any {
+                        it.name.startsWith("kotlin.jvm.functions.Function")
+                    }
+            },
         )
-        val firstValue = async { runtime.observe().first() }
-
-        assertFalse(firstValue.isCompleted)
-        testScheduler.runCurrent()
-
-        assertEquals(expected, firstValue.await())
-        assertEquals("device-credential", capturedCredential)
-    }
-
-    @Test
-    fun `save and clear run on the injected IO dispatcher and serialize state`() {
-        val executor = Executors.newSingleThreadExecutor { runnable ->
-            Thread(runnable, "credential-store-io")
-        }
-        val dispatcher = executor.asCoroutineDispatcher()
-        val scope = CoroutineScope(SupervisorJob() + dispatcher)
-        try {
-            val persistence = FakeCredentialPersistence()
-            val captured = mutableListOf<String?>()
-            val runtime = CredentialStoreRuntime(persistence, dispatcher, scope, captured::add)
-            val server = PairedServer("https://lam.example/", "device-1", "S24 Ultra")
-
-            runBlocking {
-                runtime.save(server, "device-credential")
-                assertEquals(server, runtime.observe().first())
-                runtime.clear()
-                assertNull(runtime.observe().first())
-            }
-
-            assertTrue(persistence.operationThreads.isNotEmpty())
-            assertTrue(persistence.operationThreads.all { it.startsWith("credential-store-io") })
-            assertEquals(listOf(null, "device-credential", null), captured)
-        } finally {
-            scope.cancel()
-            dispatcher.close()
-            executor.shutdownNow()
+        listOf(
+            "dev.carraes.lam.security.KeystoreCredentialStore",
+            "dev.carraes.lam.security.CredentialStoreRuntime",
+            "dev.carraes.lam.security.PersistedCredential",
+        ).forEach { className ->
+            assertFalse(Modifier.isPublic(Class.forName(className).modifiers))
         }
     }
 
     @Test
-    fun `explicit clear fails closed with a sanitized error when deletion fails`() = runTest {
-        val dispatcher = StandardTestDispatcher(testScheduler)
-        val persistence = FakeCredentialPersistence().apply { clearFailure = true }
-        val captured = mutableListOf<String?>()
-        val runtime = CredentialStoreRuntime(persistence, dispatcher, this, captured::add)
-        testScheduler.runCurrent()
+    fun `save publishes metadata without exposing the credential`() = runTest {
+        val store = InMemoryCredentialStore()
+        val server = PairedServer("https://lam.example/", "device-1", "S24 Ultra")
 
-        val result = async { runCatching { runtime.clear() } }
-        testScheduler.runCurrent()
-        val error = result.await().exceptionOrNull()
+        store.save(server, "device-credential")
 
-        assertTrue(error is CredentialStoreException)
-        assertEquals("could not clear device credential", error?.message)
-        val thrown = requireNotNull(error)
-        val failureMessages = generateSequence<Throwable>(thrown) { current ->
-            current.cause?.takeUnless { it === current }
-        }.map { it.message }.toList()
-        assertTrue(failureMessages.isNotEmpty())
-        assertTrue(failureMessages.all { it == "could not clear device credential" })
-        assertNull(runtime.observe().first())
-        assertEquals(null, captured.last())
+        assertEquals(server, store.observe().first())
+        assertFalse(store.observe().first().toString().contains("device-credential"))
+    }
+
+    @Test
+    fun `clear publishes unpaired`() = runTest {
+        val store = InMemoryCredentialStore()
+        store.save(
+            PairedServer("https://lam.example/", "device-1", "S24 Ultra"),
+            "device-credential",
+        )
+
+        store.clear()
+
+        assertNull(store.observe().first())
     }
 }
 
-private class FakeCredentialPersistence(
-    var restored: PersistedCredential? = null,
-) : CredentialPersistence {
-    val operationThreads = mutableListOf<String>()
-    var clearFailure = false
+private class InMemoryCredentialStore : CredentialStore {
+    private val state = MutableStateFlow<PairedServer?>(null)
 
-    override fun restore(): PersistedCredential? {
-        operationThreads += Thread.currentThread().name
-        return restored
+    override fun observe(): Flow<PairedServer?> = state
+
+    override suspend fun save(server: PairedServer, credential: String) {
+        state.value = server
     }
 
-    override fun save(server: PairedServer, credential: String) {
-        operationThreads += Thread.currentThread().name
-        restored = PersistedCredential(server, credential)
-    }
-
-    override fun clear() {
-        operationThreads += Thread.currentThread().name
-        if (clearFailure) error("backend detail must not escape")
-        restored = null
-    }
-
-    override fun recoverFromUnreadableRecord() {
-        operationThreads += Thread.currentThread().name
-        restored = null
+    override suspend fun clear() {
+        state.value = null
     }
 }
