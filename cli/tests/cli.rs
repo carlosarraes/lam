@@ -1,6 +1,7 @@
 use std::process::{Command, Stdio};
 
 use qrcode::{render::unicode, QrCode};
+use serde::Deserialize;
 use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -23,6 +24,41 @@ fn pre_milestone_item(id: &str) -> serde_json::Value {
         "response_choice": null, "response_text": null, "response_by": null,
         "created_at": "2026-08-25T00:00:00Z", "resolved_at": null
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct PreMilestoneCheck {
+    label: String,
+    done: bool,
+    at: Option<String>,
+}
+
+/// The exact Rust item shape compiled before the Android foundation milestone.
+#[derive(Debug, Deserialize)]
+struct PreMilestoneItem {
+    id: String,
+    #[serde(default)]
+    name: String,
+    title: String,
+    body: String,
+    source_host: String,
+    source_project: String,
+    priority: String,
+    choices: Vec<String>,
+    #[serde(default)]
+    checks: Vec<PreMilestoneCheck>,
+    #[serde(default)]
+    link: String,
+    status: String,
+    response_choice: Option<String>,
+    response_text: Option<String>,
+    response_by: Option<String>,
+    created_at: String,
+    resolved_at: Option<String>,
+    #[serde(default)]
+    expires_at: Option<String>,
+    #[serde(default)]
+    version: u64,
 }
 
 async fn setup() -> (MockServer, tempfile::TempDir) {
@@ -80,6 +116,36 @@ fn device(id: &str, name: &str, revoked_at: Option<&str>) -> serde_json::Value {
         "push_registered": true,
         "revoked_at": revoked_at,
     })
+}
+
+fn pairing_device(id: &str, name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "name": name,
+        "app_version": "1.2.3",
+        "android_version": "16",
+        "created_at": "2026-09-04T10:00:00.000Z",
+        "last_seen_at": null,
+        "push_registered": true,
+    })
+}
+
+#[cfg(unix)]
+fn interrupt_pairing(dir: &tempfile::TempDir) -> (std::process::Output, std::time::Duration) {
+    let child = Command::new(env!("CARGO_BIN_EXE_lam"))
+        .env("LAM_CONFIG", dir.path().join("config.toml"))
+        .args(["pair"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let interrupted_at = std::time::Instant::now();
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+    let out = child.wait_with_output().unwrap();
+    (out, interrupted_at.elapsed())
 }
 
 #[tokio::test]
@@ -150,6 +216,19 @@ async fn push_rejects_four_choices() {
 async fn push_requires_a_recommendation_before_loading_config() {
     let dir = tempfile::tempdir().unwrap();
     let out = lam(&dir, &["push", "approve the release"]);
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("--recommendation is required for every non-checklist request"));
+}
+
+#[tokio::test]
+async fn push_rejects_a_whitespace_only_recommendation_before_loading_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = lam(
+        &dir,
+        &["push", "approve the release", "--recommendation", " \t\n "],
+    );
 
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr)
@@ -463,6 +542,38 @@ async fn done_and_list() {
 }
 
 #[tokio::test]
+async fn done_rejects_an_oversized_reply_before_loading_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let oversized = "😀".repeat(2_049);
+
+    let out = lam(&dir, &["done", "abc12", "-m", &oversized]);
+
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--message must be at most 8192 UTF-8 bytes"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("cannot read"), "{stderr}");
+}
+
+#[tokio::test]
+async fn check_add_rejects_an_oversized_label_before_loading_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let oversized = "😀".repeat(201);
+
+    let out = lam(&dir, &["check", "add", "abc12", &oversized]);
+
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("label must be at most 200 characters"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("cannot read"), "{stderr}");
+}
+
+#[tokio::test]
 async fn show_decodes_a_pre_milestone_item_response() {
     let (server, dir) = setup().await;
     Mock::given(method("GET"))
@@ -483,6 +594,59 @@ async fn show_decodes_a_pre_milestone_item_response() {
     assert_eq!(decoded["id"], "old01");
     assert_eq!(decoded["recommendation"], serde_json::Value::Null);
     assert_eq!(decoded["recommended_choice"], serde_json::Value::Null);
+}
+
+#[test]
+fn a_pre_milestone_rust_item_decodes_a_new_worker_response() {
+    let response = serde_json::json!({
+        "id": "new01",
+        "name": "compat:agent",
+        "title": "new Worker response",
+        "body": "body",
+        "source_host": "host",
+        "source_project": "project",
+        "priority": "critical",
+        "choices": [],
+        "checks": [{ "label": "verify", "done": false, "at": null }],
+        "recommendation": null,
+        "recommended_choice": null,
+        "link": "https://example.com/item",
+        "status": "open",
+        "response_choice": null,
+        "response_text": null,
+        "response_by": null,
+        "created_at": "2026-09-04T12:00:00.000Z",
+        "resolved_at": null,
+        "expires_at": "2026-09-04T12:05:00.000Z",
+        "version": 7,
+    });
+
+    let decoded: PreMilestoneItem = serde_json::from_value(response).unwrap();
+
+    assert_eq!(decoded.id, "new01");
+    assert_eq!(decoded.name, "compat:agent");
+    assert_eq!(decoded.title, "new Worker response");
+    assert_eq!(decoded.body, "body");
+    assert_eq!(decoded.source_host, "host");
+    assert_eq!(decoded.source_project, "project");
+    assert_eq!(decoded.priority, "critical");
+    assert!(decoded.choices.is_empty());
+    assert_eq!(decoded.checks.len(), 1);
+    assert_eq!(decoded.checks[0].label, "verify");
+    assert!(!decoded.checks[0].done);
+    assert_eq!(decoded.checks[0].at, None);
+    assert_eq!(decoded.link, "https://example.com/item");
+    assert_eq!(decoded.status, "open");
+    assert_eq!(decoded.response_choice, None);
+    assert_eq!(decoded.response_text, None);
+    assert_eq!(decoded.response_by, None);
+    assert_eq!(decoded.created_at, "2026-09-04T12:00:00.000Z");
+    assert_eq!(decoded.resolved_at, None);
+    assert_eq!(
+        decoded.expires_at.as_deref(),
+        Some("2026-09-04T12:05:00.000Z")
+    );
+    assert_eq!(decoded.version, 7);
 }
 
 #[tokio::test]
@@ -644,7 +808,7 @@ async fn pair_renders_the_exact_payload_as_unicode_without_printing_the_secret()
         .and(header("authorization", "Bearer tok"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "status": "claimed",
-            "device": device("phone-1", "Carlos's phone", None)
+            "device": pairing_device("phone-1", "Carlos's phone")
         })))
         .expect(1)
         .mount(&server)
@@ -730,7 +894,66 @@ async fn pair_repolls_pending_and_reports_expired_or_cancelled() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn pair_ctrl_c_cancels_the_session_best_effort() {
+async fn pair_ctrl_c_reports_confirmed_terminal_outcomes() {
+    for (session, response, expected) in [
+        (
+            "pair-cancel-confirmed",
+            serde_json::json!({ "status": "cancelled" }),
+            "Pairing cancelled.",
+        ),
+        (
+            "pair-expired-during-cancel",
+            serde_json::json!({ "status": "expired" }),
+            "Pairing expired.",
+        ),
+        (
+            "pair-claimed-during-cancel",
+            serde_json::json!({
+                "status": "claimed",
+                "device": pairing_device("phone-race", "Race winner phone"),
+            }),
+            "Paired Race winner phone (phone-race)",
+        ),
+    ] {
+        let (server, dir) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/pairings"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(pairing_created(&server, session)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/pairings/{session}/wait")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(2))
+                    .set_body_json(serde_json::json!({ "status": "pending" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/pairings/{session}")))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (out, elapsed) = interrupt_pairing(&dir);
+
+        assert_eq!(out.status.code(), Some(130));
+        assert!(elapsed < std::time::Duration::from_secs(1));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains(expected), "{stdout}");
+        assert!(!stdout.contains("unconfirmed"), "{stdout}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pair_ctrl_c_reports_an_unconfirmed_cancellation_when_delete_times_out() {
     let (server, dir) = setup().await;
     Mock::given(method("POST"))
         .and(path("/pairings"))
@@ -761,26 +984,59 @@ async fn pair_ctrl_c_cancels_the_session_best_effort() {
         .mount(&server)
         .await;
 
-    let child = Command::new(env!("CARGO_BIN_EXE_lam"))
-        .env("LAM_CONFIG", dir.path().join("config.toml"))
-        .args(["pair"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(250));
-    let interrupted_at = std::time::Instant::now();
-    unsafe {
-        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
-    }
-    let out = child.wait_with_output().unwrap();
+    let (out, elapsed) = interrupt_pairing(&dir);
 
     assert_eq!(out.status.code(), Some(130));
+    assert!(elapsed < std::time::Duration::from_secs(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        interrupted_at.elapsed() < std::time::Duration::from_secs(1),
-        "Ctrl-C waited for the active long poll"
+        stdout.contains("Pairing wait stopped. Cancellation is unconfirmed."),
+        "{stdout}"
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("Pairing cancelled."));
+    assert!(stdout.contains("lam devices"), "{stdout}");
+    assert!(!stdout.contains("Pairing cancelled."), "{stdout}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pair_ctrl_c_reports_an_unconfirmed_cancellation_when_delete_fails() {
+    let (server, dir) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/pairings"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(pairing_created(&server, "pair-failed-delete")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/pairings/pair-failed-delete/wait"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(2))
+                .set_body_json(serde_json::json!({ "status": "pending" })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/pairings/pair-failed-delete"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (out, elapsed) = interrupt_pairing(&dir);
+
+    assert_eq!(out.status.code(), Some(130));
+    assert!(elapsed < std::time::Duration::from_secs(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Pairing wait stopped. Cancellation is unconfirmed."),
+        "{stdout}"
+    );
+    assert!(stdout.contains("lam devices"), "{stdout}");
+    assert!(!stdout.contains("unavailable"), "{stdout}");
 }
 
 #[tokio::test]

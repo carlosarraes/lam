@@ -130,16 +130,19 @@ describe("Devices", () => {
     expect(Option.isNone(await run(service.authenticate(seeded.credentialHash)))).toBe(true);
   });
 
-  it("revokeSelf retains the row, clears its FCM token, and returns a safe summary", async () => {
+  it("revokeSelf is directly idempotent, retains the row, and clears its FCM token", async () => {
     const seeded = await seedDevice();
     const service = await run(Devices);
-    const revoked = await run(service.revokeSelf(seeded.id));
+    const first = await run(service.revokeSelf(seeded.id));
+    const second = await run(service.revokeSelf(seeded.id));
 
-    expect(Object.keys(revoked).sort()).toEqual(summaryKeys);
+    expect(Object.keys(first).sort()).toEqual(summaryKeys);
+    expect(Object.keys(second).sort()).toEqual(summaryKeys);
+    expect(second.revoked_at).toBe(first.revoked_at);
     const stored = await env.DB.prepare("SELECT fcm_token, revoked_at FROM devices WHERE id = ?").bind(seeded.id).first<{
       fcm_token: string | null;
       revoked_at: string | null;
     }>();
-    expect(stored).toEqual({ fcm_token: null, revoked_at: revoked.revoked_at });
+    expect(stored).toEqual({ fcm_token: null, revoked_at: first.revoked_at });
   });
 });

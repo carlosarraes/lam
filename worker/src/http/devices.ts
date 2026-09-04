@@ -1,16 +1,9 @@
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import { Effect, Schema } from "effect";
+import { DeviceName } from "../domain/Device";
 import { Auth, RequestAuthority } from "../services/Auth";
 import { Devices } from "../services/Devices";
 
-const MAX_DEVICE_NAME_CHARACTERS = 100;
-
-const maxCodePoints = <S extends Schema.Schema<string>>(schema: S) =>
-  schema.pipe(Schema.filter((value) => Array.from(value).length <= MAX_DEVICE_NAME_CHARACTERS || `must be at most ${MAX_DEVICE_NAME_CHARACTERS} characters`));
-
-const DeviceName = maxCodePoints(Schema.Trim).pipe(
-  Schema.filter((value) => value.length > 0 || "must not be empty"),
-);
 const IdParam = Schema.Struct({ id: Schema.String });
 const Rename = Schema.Struct({ name: DeviceName });
 const SelfUpdate = Schema.Struct({

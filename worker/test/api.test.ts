@@ -116,6 +116,11 @@ async function insertHistoryFixture({
   ).run();
 }
 
+function historyCursorFixture(closed_at: string, id: string): string {
+  const bytes = new TextEncoder().encode(JSON.stringify({ closed_at, id }));
+  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
 describe("auth", () => {
   it("rejects missing bearer", async () => {
     expect((await SELF.fetch("http://lam/items")).status).toBe(401);
@@ -273,13 +278,25 @@ describe("device pairing", () => {
     expect(stored?.secret_hash).not.toBe(qr.secret);
   });
 
-  it("rejects malformed pairing secrets before creating a device", async () => {
+  it("maps invalid claim bodies to a stable error without echoing submitted secrets or tokens", async () => {
     const created = await createPairing();
     const before = await env.DB.prepare("SELECT COUNT(*) AS count FROM devices").first<{ count: number }>();
+    const secretSentinel = "PAIRING_SECRET_SENTINEL";
+    const tokenSentinel = "FCM_TOKEN_SENTINEL";
+    const validSecret = JSON.parse(created.qr).secret;
 
-    const response = await claim(created.session, "not-base64url-32-bytes", "Malformed secret phone");
-
-    expect(response.status).toBe(400);
+    for (const body of [
+      { secret: secretSentinel, ...registration("Malformed secret phone") },
+      { secret: validSecret, ...registration("Malformed token phone"), fcm_token: { value: tokenSentinel } },
+    ]) {
+      const response = await SELF.fetch(`https://lam.example/pairings/${created.session}/claim`, publicJson(body));
+      expect(response.status).toBe(400);
+      const responseText = await response.text();
+      expect(JSON.parse(responseText)).toEqual({ error: "invalid pairing claim" });
+      expect(responseText).not.toContain(secretSentinel);
+      expect(responseText).not.toContain(tokenSentinel);
+      expect(responseText).not.toContain(validSecret);
+    }
     const after = await env.DB.prepare("SELECT COUNT(*) AS count FROM devices").first<{ count: number }>();
     expect(after?.count).toBe(before?.count);
   });
@@ -301,7 +318,9 @@ describe("device pairing", () => {
     const statusResponse = await SELF.fetch(`https://lam.example/pairings/${created.session}/wait`, { headers: AUTH });
     expect(statusResponse.status).toBe(200);
     expect(await statusResponse.json()).toEqual({ status: "expired" });
-    expect((await claim(created.session, JSON.parse(created.qr).secret, "Expired phone")).status).toBe(409);
+    const rejected = await claim(created.session, JSON.parse(created.qr).secret, "Expired phone");
+    expect(rejected.status).toBe(409);
+    expect(await rejected.json()).toEqual({ error: "expired" });
   });
 
   it("consumes a session once and returns a permanent credential only to the winner", async () => {
@@ -322,7 +341,9 @@ describe("device pairing", () => {
       "push_registered",
     ]);
     expect(JSON.stringify(body)).not.toContain("fake-fcm-One-use phone");
-    expect((await claim(created.session, secret, "Losing retry phone")).status).toBe(409);
+    const retry = await claim(created.session, secret, "Losing retry phone");
+    expect(retry.status).toBe(409);
+    expect(await retry.json()).toEqual({ error: "consumed" });
 
     const session = await env.DB.prepare("SELECT consumed_at, device_id, secret_hash FROM pairing_sessions WHERE id = ?")
       .bind(created.session)
@@ -346,6 +367,8 @@ describe("device pairing", () => {
     ]);
 
     expect(responses.map((response) => response.status).sort()).toEqual([201, 409]);
+    const loser = responses.find((response) => response.status === 409)!;
+    expect(await loser.json()).toEqual({ error: "consumed" });
     const linkedDevices = await env.DB.prepare(
       "SELECT COUNT(*) AS count FROM devices WHERE id = (SELECT device_id FROM pairing_sessions WHERE id = ?)",
     ).bind(created.session).first<{ count: number }>();
@@ -376,7 +399,62 @@ describe("device pairing", () => {
     expect(await cancelled.json()).toEqual({ status: "cancelled" });
     const waited = await SELF.fetch(`https://lam.example/pairings/${created.session}/wait`, { headers: AUTH });
     expect(await waited.json()).toEqual({ status: "cancelled" });
-    expect((await claim(created.session, secret, "Cancelled phone")).status).toBe(409);
+    const rejected = await claim(created.session, secret, "Cancelled phone");
+    expect(rejected.status).toBe(409);
+    expect(await rejected.json()).toEqual({ error: "cancelled" });
+  });
+
+  it("applies the shared trimmed 100-code-point device-name limit to claims", async () => {
+    const blank = await createPairing();
+    const blankResponse = await claim(blank.session, JSON.parse(blank.qr).secret, " \t\n ");
+    expect(blankResponse.status).toBe(400);
+
+    const exact = await createPairing();
+    const exactName = "😀".repeat(100);
+    const exactResponse = await claim(exact.session, JSON.parse(exact.qr).secret, exactName);
+    expect(exactResponse.status).toBe(201);
+    expect((await exactResponse.json<any>()).device.name).toBe(exactName);
+
+    const oversized = await createPairing();
+    const oversizedResponse = await claim(oversized.session, JSON.parse(oversized.qr).secret, "😀".repeat(101));
+    expect(oversizedResponse.status).toBe(400);
+  });
+
+  it("removes only terminal or expired pairing sessions older than the 24-hour grace period on creation", async () => {
+    const isoHoursAgo = (hours: number) => new Date(Date.now() - hours * 60 * 60 * 1_000).toISOString();
+    const isoHoursFromNow = (hours: number) => new Date(Date.now() + hours * 60 * 60 * 1_000).toISOString();
+    const fixtures = [
+      { id: "cleanup-old-expired", expires_at: isoHoursAgo(25), consumed_at: null },
+      { id: "cleanup-recent-expired", expires_at: isoHoursAgo(23), consumed_at: null },
+      { id: "cleanup-old-cancelled", expires_at: isoHoursFromNow(1), consumed_at: isoHoursAgo(25) },
+      { id: "cleanup-recent-cancelled", expires_at: isoHoursFromNow(1), consumed_at: isoHoursAgo(23) },
+      { id: "cleanup-pending", expires_at: isoHoursFromNow(1), consumed_at: null },
+    ];
+    for (const fixture of fixtures) {
+      await env.DB.prepare(
+        `INSERT INTO pairing_sessions (id, secret_hash, created_at, expires_at, consumed_at, device_id)
+         VALUES (?, ?, ?, ?, ?, NULL)`,
+      ).bind(
+        fixture.id,
+        `hash-${fixture.id}`,
+        isoHoursAgo(26),
+        fixture.expires_at,
+        fixture.consumed_at,
+      ).run();
+    }
+
+    await createPairing();
+
+    const remaining = await env.DB.prepare(
+      "SELECT id FROM pairing_sessions WHERE id LIKE 'cleanup-%' ORDER BY id",
+    ).all<{ id: string }>();
+    expect(remaining.results.map(({ id }) => id)).toEqual([
+      "cleanup-pending",
+      "cleanup-recent-cancelled",
+      "cleanup-recent-expired",
+    ]);
+    expect(await (await SELF.fetch("https://lam.example/pairings/cleanup-recent-expired/wait", { headers: AUTH })).json()).toEqual({ status: "expired" });
+    expect(await (await SELF.fetch("https://lam.example/pairings/cleanup-recent-cancelled/wait", { headers: AUTH })).json()).toEqual({ status: "cancelled" });
   });
 
   it("wait returns claimed device data without secrets", async () => {
@@ -406,10 +484,20 @@ describe("device pairing", () => {
     expect(Date.now() - startedAt).toBeLessThan(27_000);
   }, 30_000);
 
-  it("keeps pairing lifecycle routes master-only while claim uses no bearer", async () => {
+  it("keeps every pairing lifecycle route master-only while claim uses no bearer", async () => {
     expect((await SELF.fetch("https://lam.example/pairings", { method: "POST" })).status).toBe(401);
+    const created = await createPairing();
     const device = await registerFakeDevice();
     expect((await SELF.fetch("https://lam.example/pairings", { method: "POST", headers: device.headers })).status).toBe(403);
+    for (const options of [
+      {} as RequestInit,
+      { headers: device.headers },
+    ]) {
+      const expected = options.headers === undefined ? 401 : 403;
+      expect((await SELF.fetch(`https://lam.example/pairings/${created.session}/wait`, options)).status).toBe(expected);
+      expect((await SELF.fetch(`https://lam.example/pairings/${created.session}`, { ...options, method: "DELETE" })).status).toBe(expected);
+    }
+    expect((await SELF.fetch(`https://lam.example/pairings/${created.session}`, { method: "DELETE", headers: AUTH })).status).toBe(200);
   });
 });
 
@@ -482,10 +570,15 @@ describe("device administration", () => {
   it("rejects invalid and unsupported self updates without changing registration", async () => {
     const device = await registerFakeDevice();
 
-    expect((await SELF.fetch("http://lam/device", patch(device.headers, { name: "x".repeat(101) }))).status).toBe(400);
+    expect((await SELF.fetch("http://lam/device", patch(device.headers, { name: " \t\n " }))).status).toBe(400);
+    const exactName = "😀".repeat(100);
+    const exact = await SELF.fetch("http://lam/device", patch(device.headers, { name: exactName }));
+    expect(exact.status).toBe(200);
+    expect((await exact.json<any>()).name).toBe(exactName);
+    expect((await SELF.fetch("http://lam/device", patch(device.headers, { name: "😀".repeat(101) }))).status).toBe(400);
     expect((await SELF.fetch("http://lam/device", patch(device.headers, { credential_hash: "not-allowed" }))).status).toBe(400);
     const registration = await (await SELF.fetch("http://lam/device", { headers: device.headers })).json<any>();
-    expect(registration.name).toBe("Test phone");
+    expect(registration.name).toBe(exactName);
   });
 
   it("revokes through either route idempotently, clears FCM, and rejects the revoked bearer", async () => {
@@ -594,6 +687,19 @@ describe("POST /items", () => {
       { title: "recommendation", recommendation: recommendationOver2_000CodePoints },
     ]) {
       expect((await SELF.fetch("http://lam/items", json(body))).status).toBe(400);
+    }
+  });
+
+  it("rejects a present whitespace-only recommendation while accepting an omitted one", async () => {
+    const omitted = await SELF.fetch("http://lam/items", json({ title: `legacy recommendation #${++seq}` }));
+    expect(omitted.status).toBe(201);
+
+    for (const recommendation of ["", " \t\n "]) {
+      const response = await SELF.fetch("http://lam/items", json({
+        title: `blank recommendation #${++seq}`,
+        recommendation,
+      }));
+      expect(response.status).toBe(400);
     }
   });
 
@@ -713,6 +819,73 @@ describe("duplicate pushes", () => {
     expect((await second.json<any>()).id).toBe(a.id);
     await settle();
     expect((await topicMessages()).length).toBe(before);
+  });
+
+  it("ignores source metadata when identifying a retry", async () => {
+    const body = {
+      name: "dedupe-source-agent",
+      title: "source metadata does not identify the request",
+      body: "same meaningful content",
+      source_host: "first-host",
+      source_project: "first-project",
+      recommendation: "Keep the existing request.",
+    };
+    const first = await SELF.fetch("http://lam/items", json(body));
+    expect(first.status).toBe(201);
+    const firstItem = await first.json<any>();
+
+    const retry = await SELF.fetch("http://lam/items", json({
+      ...body,
+      source_host: "second-host",
+      source_project: "second-project",
+    }));
+
+    expect(retry.status).toBe(200);
+    expect((await retry.json<any>()).id).toBe(firstItem.id);
+  });
+
+  it("uses every specified request field in canonical identity", async () => {
+    const base = {
+      name: "dedupe-field-agent",
+      title: "canonical identity",
+      body: "identity body",
+      priority: "normal",
+      choices: ["ship", "hold"],
+      checks: [],
+      link: "https://example.com/identity",
+      ttl: 61,
+      recommendation: "Ship after verification.",
+      recommended_choice: "ship",
+    };
+    const variants: Array<[string, Record<string, unknown>]> = [
+      ["agent name", { name: "other-agent" }],
+      ["title", { title: "other title" }],
+      ["body", { body: "other body" }],
+      ["priority", { priority: "critical" }],
+      ["choices", { choices: ["ship", "later"] }],
+      ["link", { link: "https://example.com/other" }],
+      ["exact TTL seconds", { ttl: 62 }],
+      ["recommendation", { recommendation: "Hold after verification." }],
+      ["recommended choice", { recommended_choice: "hold" }],
+    ];
+
+    const first = await SELF.fetch("http://lam/items", json(base));
+    expect(first.status).toBe(201);
+    const firstId = (await first.json<any>()).id;
+
+    for (const [field, change] of variants) {
+      const response = await SELF.fetch("http://lam/items", json({ ...base, ...change }));
+      expect(response.status, field).toBe(201);
+      expect((await response.json<any>()).id, field).not.toBe(firstId);
+    }
+
+    const checklist = { ...base, title: "canonical checklist identity", choices: [], checks: ["verify"], recommended_choice: null };
+    const firstChecklist = await SELF.fetch("http://lam/items", json(checklist));
+    expect(firstChecklist.status).toBe(201);
+    const firstChecklistId = (await firstChecklist.json<any>()).id;
+    const changedChecks = await SELF.fetch("http://lam/items", json({ ...checklist, checks: ["verify again"] }));
+    expect(changedChecks.status, "checks").toBe(201);
+    expect((await changedChecks.json<any>()).id, "checks").not.toBe(firstChecklistId);
   });
 
   it("a different body, a different agent, or a closed original all push a new item", async () => {
@@ -901,8 +1074,27 @@ describe("history", () => {
     ]);
   });
 
-  it("rejects malformed cursors", async () => {
-    expect((await SELF.fetch("http://lam/history?cursor=not-base64url", { headers: AUTH })).status).toBe(400);
+  it("rejects malformed, noncanonical, and structurally invalid cursors", async () => {
+    const canonical = historyCursorFixture("2024-01-01T00:00:00.000Z", "history-cursor");
+    const standardAlphabet = "eyJjbG9zZWRfYXQiOiIyMDI0LTAxLTAxVDAwOjAwOjAwLjAwMFoiLCJpZCI6IsK+In0";
+    const malformed = [
+      "not-base64url",
+      `${canonical}=`,
+      standardAlphabet,
+      historyCursorFixture("not-an-iso-timestamp", "history-cursor"),
+      historyCursorFixture("2024-02-30T00:00:00.000Z", "history-cursor"),
+      historyCursorFixture("2024-01-01T00:00:00.000Z", ""),
+    ];
+
+    for (const value of malformed) {
+      expect((await SELF.fetch(`http://lam/history?cursor=${encodeURIComponent(value)}`, { headers: AUTH })).status, value).toBe(400);
+    }
+  });
+
+  it("accepts a valid ISO cursor timestamp without fractional seconds", async () => {
+    const value = historyCursorFixture("2024-01-01T00:00:00Z", "history-cursor");
+    const response = await SELF.fetch(`http://lam/history?cursor=${encodeURIComponent(value)}`, { headers: AUTH });
+    expect(response.status).toBe(200);
   });
 
   it("searches title, name, body, and legacy source while treating LIKE characters literally", async () => {
@@ -1110,6 +1302,39 @@ describe("checklists", () => {
     const item = await push({ title: "PRs", checks: ["a"] });
     const res = await SELF.fetch(`http://lam/items/${item.id}/checks`, json({ label: "😀".repeat(201) }));
     expect(res.status).toBe(400);
+  });
+
+  it("allows the 50th check and rejects the 51st", async () => {
+    const item = await push({
+      title: "aggregate check cap",
+      checks: Array.from({ length: 49 }, (_, index) => `check ${index + 1}`),
+    });
+
+    const fiftieth = await SELF.fetch(`http://lam/items/${item.id}/checks`, json({ label: "check 50" }));
+    expect(fiftieth.status).toBe(200);
+    expect((await fiftieth.json<any>()).checks).toHaveLength(50);
+
+    const fiftyFirst = await SELF.fetch(`http://lam/items/${item.id}/checks`, json({ label: "check 51" }));
+    expect(fiftyFirst.status).toBe(400);
+    const stored = await (await SELF.fetch(`http://lam/items/${item.id}`, { headers: AUTH })).json<any>();
+    expect(stored.checks).toHaveLength(50);
+  });
+
+  it("allows only one concurrent append when a checklist has 49 checks", async () => {
+    const item = await push({
+      title: "concurrent aggregate check cap",
+      checks: Array.from({ length: 49 }, (_, index) => `existing ${index + 1}`),
+    });
+
+    const responses = await Promise.all([
+      SELF.fetch(`http://lam/items/${item.id}/checks`, json({ label: "concurrent A" })),
+      SELF.fetch(`http://lam/items/${item.id}/checks`, json({ label: "concurrent B" })),
+    ]);
+
+    expect(responses.map((response) => response.status).sort()).toEqual([200, 400]);
+    const stored = await (await SELF.fetch(`http://lam/items/${item.id}`, { headers: AUTH })).json<any>();
+    expect(stored.checks).toHaveLength(50);
+    expect(stored.checks.slice(49).map((check: any) => check.label)).toHaveLength(1);
   });
 
   it("phone page toggles checks via form and closes on last tick", async () => {

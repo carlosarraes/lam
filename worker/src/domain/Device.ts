@@ -1,5 +1,12 @@
 import { Schema } from "effect";
 
+export const MAX_DEVICE_NAME_CHARACTERS = 100;
+
+export const DeviceName = Schema.Trim.pipe(
+  Schema.filter((value) => value.length > 0 || "must not be empty"),
+  Schema.filter((value) => Array.from(value).length <= MAX_DEVICE_NAME_CHARACTERS || `must be at most ${MAX_DEVICE_NAME_CHARACTERS} characters`),
+);
+
 const PublicDeviceFields = {
   id: Schema.String,
   name: Schema.String,

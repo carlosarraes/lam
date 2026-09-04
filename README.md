@@ -31,7 +31,7 @@ Deploy in this order:
 
 The schema must land first because the new Worker reads the recommendation columns and the device and pairing tables. For a rollback, restore the previous Worker, CLI, and skill but leave the additive D1 migrations in place. The old Worker ignores additive tables and columns; the old CLI remains accepted by the new Worker.
 
-Pushing the same name+title+body while the original is still open returns the existing item (HTTP 200, same id) instead of queueing a second one, so a retry after a lost response never double-notifies.
+Pushing the same agent name, title, body, priority, ordered choices, ordered checks, link, exact TTL seconds, recommendation, and recommended choice while the original is still open returns the existing item (HTTP 200, same id) instead of queueing a second one. Source host and project are metadata, not identity, so a retry from another machine still cannot double-notify.
 
 Item bodies are markdown. In the TUI, `m` opens a side-by-side reader (list left, rendered markdown right) with `J`/`K`, `PgUp`/`PgDn` and `g`/`G` to scroll — so an agent can send a whole plan, not a teaser.
 

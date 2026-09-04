@@ -1,11 +1,11 @@
-import { Schema } from "effect";
-import { DeviceRegistration } from "./Device";
+import { Data, Schema } from "effect";
+import { DeviceName, DeviceRegistration } from "./Device";
 
 // Thirty-two bytes have 43 unpadded base64url characters; the final sextet has two zero padding bits.
 export const PairingSecret = Schema.String.pipe(Schema.pattern(/^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/));
 
 export const PairingRegistration = Schema.Struct({
-  name: Schema.NonEmptyTrimmedString,
+  name: DeviceName,
   fcm_token: Schema.optionalWith(Schema.NullOr(Schema.String), { default: () => null }),
   app_version: Schema.NonEmptyString,
   android_version: Schema.NonEmptyString,
@@ -37,6 +37,11 @@ export interface PairingClaimed {
   readonly credential: string;
   readonly device: DeviceRegistration;
 }
+
+export type PairingClaimErrorCode = "expired" | "consumed" | "cancelled";
+export class PairingClaimConflict extends Data.TaggedError("PairingClaimConflict")<{
+  readonly code: PairingClaimErrorCode;
+}> {}
 
 export const PairingStatusRow = Schema.Struct({
   expires_at: Schema.String,

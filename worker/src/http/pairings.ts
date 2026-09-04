@@ -1,5 +1,6 @@
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import { Effect, Schema } from "effect";
+import { BadRequest } from "../domain/Item";
 import { PairingClaimRequest } from "../domain/Pairing";
 import { Auth, RequestAuthority } from "../services/Auth";
 import { Pairings } from "../services/Pairings";
@@ -11,6 +12,12 @@ const requestOrigin = Effect.map(HttpServerRequest.HttpServerRequest, (request) 
 const WAIT_MS = 25_000;
 const POLL_MS = 250;
 const IdParam = Schema.Struct({ id: Schema.String });
+const claimRequest = HttpServerRequest.schemaBodyJson(PairingClaimRequest).pipe(
+  Effect.catchTags({
+    ParseError: () => Effect.fail(new BadRequest({ message: "invalid pairing claim" })),
+    RequestError: () => Effect.fail(new BadRequest({ message: "invalid pairing claim" })),
+  }),
+);
 
 export const pairingAdmin = HttpRouter.empty.pipe(
   HttpRouter.post(
@@ -55,7 +62,7 @@ export const pairingClaims = HttpRouter.empty.pipe(
     "/pairings/:id/claim",
     Effect.gen(function* () {
       const { id } = yield* HttpRouter.schemaPathParams(IdParam);
-      const { secret, ...registration } = yield* HttpServerRequest.schemaBodyJson(PairingClaimRequest);
+      const { secret, ...registration } = yield* claimRequest;
       const claimed = yield* (yield* Pairings).claim(id, secret, registration);
       return yield* HttpServerResponse.json(claimed, { status: 201 });
     }),

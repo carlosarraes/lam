@@ -3,6 +3,8 @@ import { Env } from "../Env";
 import { DeviceRegistration } from "../domain/Device";
 import {
   PairingCreated,
+  PairingClaimConflict,
+  type PairingClaimErrorCode,
   type PairingClaimed,
   type PairingRegistration,
   type PairingStatus,
@@ -13,6 +15,7 @@ import { Conflict, DbError, NotFound, Unauthorized } from "../domain/Item";
 import { constantTimeEqual, hmacDigest } from "./Auth";
 
 const PAIRING_LIFETIME_MS = 5 * 60 * 1_000;
+const PAIRING_CLEANUP_GRACE_MS = 24 * 60 * 60 * 1_000;
 
 const db = <A>(run: (db: D1Database) => Promise<A>) =>
   Effect.flatMap(Env, ({ DB }) => Effect.tryPromise({ try: () => run(DB), catch: (cause) => new DbError({ cause }) }));
@@ -23,6 +26,29 @@ const randomBase64Url32 = () => {
 };
 
 const decodeStatusRow = (row: unknown) => Schema.decodeUnknown(PairingStatusRow)(row).pipe(Effect.orDie);
+
+interface ClaimSessionRow {
+  readonly secret_hash: string;
+  readonly expires_at: string;
+  readonly consumed_at: string | null;
+  readonly device_id: string | null;
+}
+
+const getClaimSession = (id: string) =>
+  db((database) =>
+    database
+      .prepare("SELECT secret_hash, expires_at, consumed_at, device_id FROM pairing_sessions WHERE id = ?")
+      .bind(id)
+      .first<ClaimSessionRow>(),
+  );
+
+const claimErrorCode = (session: ClaimSessionRow, now: number): PairingClaimErrorCode | undefined => {
+  if (session.consumed_at !== null) {
+    return session.device_id === null ? "cancelled" : "consumed";
+  }
+  if (Date.parse(session.expires_at) <= now) return "expired";
+  return undefined;
+};
 
 const status = (id: string): Effect.Effect<PairingStatus, DbError | NotFound, Env> =>
   db((database) =>
@@ -72,8 +98,19 @@ export class Pairings extends Effect.Service<Pairings>()("lam/Pairings", {
         const expiresAt = new Date(createdAt.getTime() + PAIRING_LIFETIME_MS);
         const createdAtIso = createdAt.toISOString();
         const expiresAtIso = expiresAt.toISOString();
+        const cleanupCutoff = new Date(createdAt.getTime() - PAIRING_CLEANUP_GRACE_MS).toISOString();
         const env = yield* Env;
         const secretHash = yield* hmacDigest(env.LAM_HMAC_SECRET, secret);
+        yield* db((database) =>
+          database
+            .prepare(
+              `DELETE FROM pairing_sessions
+                WHERE (consumed_at IS NOT NULL AND consumed_at <= ?)
+                   OR (consumed_at IS NULL AND expires_at <= ?)`,
+            )
+            .bind(cleanupCutoff, cleanupCutoff)
+            .run(),
+        );
         yield* db((database) =>
           database
             .prepare(
@@ -112,14 +149,15 @@ export class Pairings extends Effect.Service<Pairings>()("lam/Pairings", {
 
     claim: (id: string, secret: string, registration: PairingRegistration) =>
       Effect.gen(function* () {
-        const stored = yield* db((database) =>
-          database.prepare("SELECT secret_hash FROM pairing_sessions WHERE id = ?").bind(id).first<{ secret_hash: string }>(),
-        );
+        const stored = yield* getClaimSession(id);
         if (stored === null) return yield* new NotFound({ id });
 
         const env = yield* Env;
         const secretHash = yield* hmacDigest(env.LAM_HMAC_SECRET, secret);
         if (!constantTimeEqual(secretHash, stored.secret_hash)) return yield* new Unauthorized();
+
+        const unavailable = claimErrorCode(stored, Date.now());
+        if (unavailable !== undefined) return yield* new PairingClaimConflict({ code: unavailable });
 
         const deviceId = crypto.randomUUID();
         const credential = randomBase64Url32();
@@ -159,7 +197,14 @@ export class Pairings extends Effect.Service<Pairings>()("lam/Pairings", {
               .bind(now, deviceId, id, secretHash, now),
           ]),
         );
-        if (inserted.meta.changes !== 1 || consumed.meta.changes !== 1) return yield* new Conflict({ id });
+        if (inserted.meta.changes !== 1 || consumed.meta.changes !== 1) {
+          const current = yield* getClaimSession(id);
+          if (current !== null) {
+            const outcome = claimErrorCode(current, Date.now());
+            if (outcome !== undefined) return yield* new PairingClaimConflict({ code: outcome });
+          }
+          return yield* new Conflict({ id });
+        }
 
         return {
           credential,

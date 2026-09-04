@@ -47,7 +47,7 @@ Every non-checklist push requires `--recommendation <action and rationale>`. Whe
 
 - `-p critical` only for actual blockers; `normal` for "look when convenient".
 - The body may be **markdown** — headings, bullets, tables, fenced code. Carlos reads it rendered in the terminal (`m` opens a reader pane), so send the whole plan or diff summary when the decision needs it rather than a one-line teaser. The phone shows the same text unrendered, so keep the first line meaningful.
-- A push with the same name, title and body as an item that is still open returns **that item's id** and does not notify again — so a retry after a failed-looking push is safe, and re-asking an open question is a no-op.
+- A push with the same agent name, title, body, priority, ordered choices, ordered checks, link, exact TTL seconds, recommendation, and recommended choice as an item that is still open returns **that item's id** and does not notify again. Source host and project do not affect identity, so retrying from another machine is safe.
 - Never invent a name that hides who you are: the inferred `session:window` is what Carlos looks for when several agents are running.
 - Title = the decision. `--recommendation` = the action you recommend and why. Body = where to act ("Reply in Claude Code: …"). Host and project are attached automatically.
 - Always pass `--link` when there is a URL to act on, and `--ttl` when the ask stops mattering after a while — stale items make the queue untrustworthy.

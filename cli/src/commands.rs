@@ -53,6 +53,7 @@ pub struct PushArgs {
 const MAX_TITLE_CHARACTERS: usize = 200;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_RECOMMENDATION_CHARACTERS: usize = 2_000;
+const MAX_REPLY_BYTES: usize = 8 * 1024;
 const MAX_CHOICE_CHARACTERS: usize = 200;
 const MAX_CHECK_CHARACTERS: usize = 200;
 const MAX_CHOICES: usize = 3;
@@ -83,7 +84,10 @@ fn validate_push(a: &PushArgs) -> Result<()> {
             bail!("--recommended-choice is not allowed with --check");
         }
     } else {
-        if a.recommendation.as_deref().is_none_or(str::is_empty) {
+        if a.recommendation
+            .as_deref()
+            .is_none_or(|recommendation| recommendation.trim().is_empty())
+        {
             bail!("--recommendation is required for every non-checklist request");
         }
         if !a.choices.is_empty() {
@@ -281,6 +285,12 @@ pub fn show(id: &str) -> Result<i32> {
 }
 
 pub fn done(id: &str, choice: Option<String>, message: Option<String>) -> Result<i32> {
+    if message
+        .as_deref()
+        .is_some_and(|text| text.len() > MAX_REPLY_BYTES)
+    {
+        bail!("--message must be at most {MAX_REPLY_BYTES} UTF-8 bytes");
+    }
     let item = client()?.resolve(
         id,
         &Resolution {
@@ -293,6 +303,7 @@ pub fn done(id: &str, choice: Option<String>, message: Option<String>) -> Result
 }
 
 pub fn check_add(id: &str, label: &str) -> Result<i32> {
+    validate_max_characters("label", label, MAX_CHECK_CHARACTERS)?;
     print_json(&client()?.add_check(id, label)?)?;
     Ok(0)
 }
@@ -332,6 +343,21 @@ fn print_device(device: &DeviceSummary) {
     println!("Revoked: {}", device.revoked_at.as_deref().unwrap_or("no"));
 }
 
+fn report_pairing_cancellation(status: Result<PairingWait>) {
+    match status {
+        Ok(PairingWait::Claimed { device }) => {
+            println!("Paired {} ({})", device.name, device.id);
+        }
+        Ok(PairingWait::Expired) => println!("Pairing expired."),
+        Ok(PairingWait::Cancelled) => println!("Pairing cancelled."),
+        Ok(PairingWait::Pending) | Err(_) => {
+            println!(
+                "Pairing wait stopped. Cancellation is unconfirmed. Run `lam devices` to check for a paired device."
+            );
+        }
+    }
+}
+
 pub fn pair() -> Result<i32> {
     let cfg = Config::load()?;
     let c = Client::new(&cfg)?;
@@ -357,8 +383,7 @@ pub fn pair() -> Result<i32> {
         });
         let status = loop {
             if interrupted.load(Ordering::SeqCst) {
-                let _ = c.cancel_pairing(&pairing.session);
-                println!("Pairing cancelled.");
+                report_pairing_cancellation(c.cancel_pairing(&pairing.session));
                 return Ok(130);
             }
             match receive.recv_timeout(Duration::from_millis(50)) {

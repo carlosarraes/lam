@@ -25,7 +25,10 @@ const maxUtf8Bytes = (max: number) =>
 
 const Title = Schema.NonEmptyTrimmedString.pipe(maxCodePoints(MAX_TITLE_CHARACTERS));
 const Body = Schema.String.pipe(maxUtf8Bytes(MAX_BODY_BYTES));
-const Recommendation = Schema.String.pipe(maxCodePoints(MAX_RECOMMENDATION_CHARACTERS));
+const Recommendation = Schema.String.pipe(
+  Schema.filter((value) => value.trim().length > 0 || "must not be blank"),
+  maxCodePoints(MAX_RECOMMENDATION_CHARACTERS),
+);
 const Choice = Schema.NonEmptyTrimmedString.pipe(maxCodePoints(MAX_CHOICE_CHARACTERS));
 export const CheckLabel = Schema.NonEmptyTrimmedString.pipe(maxCodePoints(MAX_CHECK_CHARACTERS));
 export const ReplyText = Schema.NonEmptyTrimmedString.pipe(maxUtf8Bytes(MAX_REPLY_BYTES));

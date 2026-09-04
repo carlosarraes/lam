@@ -1,6 +1,6 @@
 import { Effect, Option, Schema } from "effect";
 import { Env } from "../Env";
-import { AlreadyClosed, BadRequest, Conflict, DbError, Item, ItemRow, NotFound, type NewItem, type ResponseBy, type Status } from "../domain/Item";
+import { AlreadyClosed, BadRequest, Conflict, DbError, Item, ItemRow, MAX_CHECKS, NotFound, type NewItem, type ResponseBy, type Status } from "../domain/Item";
 
 const ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
 const newId = () => Array.from(crypto.getRandomValues(new Uint8Array(5)), (b) => ALPHABET[b % ALPHABET.length]).join("");
@@ -44,8 +44,6 @@ export const canonicalDedupeInput = (input: NewItem) =>
     name: input.name ?? "",
     title: input.title,
     body: input.body ?? "",
-    source_host: input.source_host ?? "",
-    source_project: input.source_project ?? "",
     priority: input.priority ?? "normal",
     choices: input.choices ?? [],
     checks: input.checks ?? [],
@@ -89,17 +87,37 @@ interface HistoryCursor {
   id: string;
 }
 
+const encodeBase64Url = (bytes: Uint8Array) =>
+  btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
 const encodeCursor = (cursor: HistoryCursor) => {
   const bytes = new TextEncoder().encode(JSON.stringify(cursor));
-  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return encodeBase64Url(bytes);
+};
+
+const isValidIsoTimestamp = (value: string) => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|[+-](\d{2}):(\d{2}))$/.exec(value);
+  if (match === null) return false;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, offsetHourText, offsetMinuteText] = match;
+  const [year, month, day, hour, minute, second] = [yearText, monthText, dayText, hourText, minuteText, secondText].map(Number);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth[month - 1]!) return false;
+  if (hour > 23 || minute > 59 || second > 59) return false;
+  if (offsetHourText !== undefined && (Number(offsetHourText) > 23 || Number(offsetMinuteText) > 59)) return false;
+  return !Number.isNaN(Date.parse(value));
 };
 
 const decodeCursor = (cursor: string) =>
   Effect.try({
     try: () => {
+      if (!/^[A-Za-z0-9_-]+$/.test(cursor) || cursor.length % 4 === 1) {
+        throw new Error("invalid history cursor");
+      }
       const base64 = cursor.replace(/-/g, "+").replace(/_/g, "/");
       const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
       const bytes = Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
+      if (encodeBase64Url(bytes) !== cursor) throw new Error("invalid history cursor");
       const value: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
       if (
         value === null
@@ -110,6 +128,8 @@ const decodeCursor = (cursor: string) =>
         || typeof (value as Record<string, unknown>).id !== "string"
         || (value as Record<string, string>).id.length === 0
       ) throw new Error("invalid history cursor");
+      const closedAt = (value as Record<string, string>).closed_at;
+      if (!isValidIsoTimestamp(closedAt)) throw new Error("invalid history cursor");
       return value as HistoryCursor;
     },
     catch: () => new BadRequest({ message: "invalid history cursor" }),
@@ -319,7 +339,11 @@ export class Items extends Effect.Service<Items>()("lam/Items", {
 
     /** Appends a check to an open item (agent side). */
     addCheck: (id: string, label: string) =>
-      mutateChecks(id, (item) => Effect.succeed({ checks: [...item.checks, { label, done: false, at: null }], resolve: false, by: "cli" as const })),
+      mutateChecks(id, (item) =>
+        item.checks.length >= MAX_CHECKS
+          ? Effect.fail(new BadRequest({ message: `at most ${MAX_CHECKS} checks` }))
+          : Effect.succeed({ checks: [...item.checks, { label, done: false, at: null }], resolve: false, by: "cli" as const }),
+      ),
 
     /** Transitions an open, unexpired item; NotFound if missing, AlreadyClosed otherwise. */
     close: (id: string, c: Closing) =>
