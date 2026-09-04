@@ -6,3 +6,8 @@ worker-configuration.d.ts
 TASKS.md
 CHANGELOG.md
 .worktrees/
+android/.gradle/
+android/**/build/
+android/local.properties
+android/keystore.properties
+android/keys/
