@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -40,6 +40,33 @@ fn lam(dir: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .unwrap()
+}
+
+fn pairing_created(server: &MockServer, session: &str) -> serde_json::Value {
+    serde_json::json!({
+        "session": session,
+        "created_at": "2026-09-04T12:00:00.000Z",
+        "expires_at": "2026-09-04T12:05:00.000Z",
+        "qr": format!(
+            "{{\"v\":1,\"server\":\"{}\",\"session\":\"{}\",\"secret\":\"{}\"}}",
+            server.uri(),
+            session,
+            "A".repeat(43)
+        )
+    })
+}
+
+fn device(id: &str, name: &str, revoked_at: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "name": name,
+        "app_version": "1.2.3",
+        "android_version": "16",
+        "created_at": "2026-09-04T10:00:00.000Z",
+        "last_seen_at": "2026-09-04T11:30:00.000Z",
+        "push_registered": true,
+        "revoked_at": revoked_at,
+    })
 }
 
 #[tokio::test]
@@ -556,4 +583,252 @@ async fn explicit_name_flag_wins_over_env() {
     let req = &server.received_requests().await.unwrap()[0];
     let body: serde_json::Value = req.body_json().unwrap();
     assert_eq!(body["name"], "sweep:2");
+}
+
+#[tokio::test]
+async fn pair_renders_the_exact_payload_as_unicode_without_printing_the_secret() {
+    let (server, dir) = setup().await;
+    let created = pairing_created(&server, "pair-1");
+    let qr = created["qr"].as_str().unwrap().to_string();
+    let secret = "A".repeat(43);
+    Mock::given(method("POST"))
+        .and(path("/pairings"))
+        .and(header("authorization", "Bearer tok"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(created))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/pairings/pair-1/wait"))
+        .and(header("authorization", "Bearer tok"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "claimed",
+            "device": device("phone-1", "Carlos's phone", None)
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let out = lam(&dir, &["pair"]);
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains('█') || stdout.contains('▀') || stdout.contains('▄'),
+        "{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.starts_with("    ")),
+        "quiet zone missing:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("Server: {}", server.uri())),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Expires: 2026-09-04T12:05:00.000Z (five minutes)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Paired Carlos's phone (phone-1)"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains(&secret), "secret leaked:\n{stdout}");
+    assert!(
+        !stdout.contains(&qr),
+        "serialized payload leaked:\n{stdout}"
+    );
+}
+
+#[tokio::test]
+async fn pair_repolls_pending_and_reports_expired_or_cancelled() {
+    for (session, final_status, expected) in [
+        ("pair-expired", "expired", "Pairing expired."),
+        ("pair-cancelled", "cancelled", "Pairing cancelled."),
+    ] {
+        let (server, dir) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/pairings"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(pairing_created(&server, session)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/pairings/{session}/wait")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "status": "pending" })),
+            )
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/pairings/{session}/wait")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "status": final_status })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let out = lam(&dir, &["pair"]);
+
+        assert_eq!(out.status.code(), Some(1), "{final_status}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains(expected));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pair_ctrl_c_cancels_the_session_best_effort() {
+    let (server, dir) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/pairings"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(pairing_created(&server, "pair-signal")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/pairings/pair-signal/wait"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(2))
+                .set_body_json(serde_json::json!({ "status": "pending" })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/pairings/pair-signal"))
+        .and(header("authorization", "Bearer tok"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": "cancelled" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let child = Command::new(env!("CARGO_BIN_EXE_lam"))
+        .env("LAM_CONFIG", dir.path().join("config.toml"))
+        .args(["pair"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let interrupted_at = std::time::Instant::now();
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+    let out = child.wait_with_output().unwrap();
+
+    assert_eq!(out.status.code(), Some(130));
+    assert!(
+        interrupted_at.elapsed() < std::time::Duration::from_secs(1),
+        "Ctrl-C waited for the active long poll"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Pairing cancelled."));
+}
+
+#[tokio::test]
+async fn devices_prints_every_safe_administration_field() {
+    let (server, dir) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/devices"))
+        .and(header("authorization", "Bearer tok"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vec![device(
+            "phone-1",
+            "Carlos's phone",
+            None,
+        )]))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let out = lam(&dir, &["devices"]);
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for expected in [
+        "ID: phone-1",
+        "Name: Carlos's phone",
+        "Android: 16",
+        "App: 1.2.3",
+        "Created: 2026-09-04T10:00:00.000Z",
+        "Last contact: 2026-09-04T11:30:00.000Z",
+        "Push registered: yes",
+        "Revoked: no",
+    ] {
+        assert!(stdout.contains(expected), "missing {expected:?}:\n{stdout}");
+    }
+}
+
+#[tokio::test]
+async fn device_rename_patches_the_name_and_prints_the_returned_summary() {
+    let (server, dir) = setup().await;
+    Mock::given(method("PATCH"))
+        .and(path("/devices/phone-1"))
+        .and(header("authorization", "Bearer tok"))
+        .and(body_json(serde_json::json!({ "name": "Travel phone" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(device(
+            "phone-1",
+            "Travel phone",
+            None,
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let out = lam(&dir, &["device", "rename", "phone-1", "Travel phone"]);
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("ID: phone-1"), "{stdout}");
+    assert!(stdout.contains("Name: Travel phone"), "{stdout}");
+}
+
+#[tokio::test]
+async fn device_revoke_deletes_and_confirms_the_returned_revocation() {
+    let (server, dir) = setup().await;
+    Mock::given(method("DELETE"))
+        .and(path("/devices/phone-1"))
+        .and(header("authorization", "Bearer tok"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(device(
+            "phone-1",
+            "Travel phone",
+            Some("2026-09-04T12:30:00.000Z"),
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let out = lam(&dir, &["device", "revoke", "phone-1"]);
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("ID: phone-1"), "{stdout}");
+    assert!(
+        stdout.contains("Revoked: 2026-09-04T12:30:00.000Z"),
+        "{stdout}"
+    );
 }

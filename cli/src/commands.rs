@@ -1,7 +1,12 @@
 use anyhow::{bail, Context, Result};
+use qrcode::{render::unicode, QrCode};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc,
+};
 use std::time::{Duration, Instant};
 
-use crate::client::{Client, Item, NewItem, Resolution, Wait};
+use crate::client::{Client, DeviceSummary, Item, NewItem, PairingWait, Resolution, Wait};
 use crate::config::Config;
 
 pub const EXIT_RESOLVED: i32 = 0;
@@ -307,6 +312,99 @@ pub fn retract(id: &str) -> Result<i32> {
 
 pub fn dismiss(id: &str) -> Result<i32> {
     print_json(&client()?.dismiss(id)?)?;
+    Ok(0)
+}
+
+fn print_device(device: &DeviceSummary) {
+    println!("ID: {}", device.id);
+    println!("Name: {}", device.name);
+    println!("Android: {}", device.android_version);
+    println!("App: {}", device.app_version);
+    println!("Created: {}", device.created_at);
+    println!(
+        "Last contact: {}",
+        device.last_seen_at.as_deref().unwrap_or("never")
+    );
+    println!(
+        "Push registered: {}",
+        if device.push_registered { "yes" } else { "no" }
+    );
+    println!("Revoked: {}", device.revoked_at.as_deref().unwrap_or("no"));
+}
+
+pub fn pair() -> Result<i32> {
+    let cfg = Config::load()?;
+    let c = Client::new(&cfg)?;
+    let pairing = c.create_pairing()?;
+    let qr = QrCode::new(pairing.qr.as_bytes()).context("server returned an invalid QR payload")?;
+    let rendered = qr.render::<unicode::Dense1x2>().quiet_zone(true).build();
+
+    println!("Scan this code with the LAM Android app:");
+    println!("{rendered}");
+    println!("Server: {}", cfg.server);
+    println!("Expires: {} (five minutes)", pairing.expires_at);
+
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let signal = Arc::clone(&interrupted);
+    ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))?;
+
+    loop {
+        let wait_client = c.clone();
+        let wait_session = pairing.session.clone();
+        let (send, receive) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = send.send(wait_client.wait_pairing(&wait_session));
+        });
+        let status = loop {
+            if interrupted.load(Ordering::SeqCst) {
+                let _ = c.cancel_pairing(&pairing.session);
+                println!("Pairing cancelled.");
+                return Ok(130);
+            }
+            match receive.recv_timeout(Duration::from_millis(50)) {
+                Ok(status) => break status?,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("pairing wait stopped unexpectedly")
+                }
+            }
+        };
+        match status {
+            PairingWait::Pending => {}
+            PairingWait::Claimed { device } => {
+                println!("Paired {} ({})", device.name, device.id);
+                return Ok(0);
+            }
+            PairingWait::Expired => {
+                println!("Pairing expired.");
+                return Ok(1);
+            }
+            PairingWait::Cancelled => {
+                println!("Pairing cancelled.");
+                return Ok(1);
+            }
+        }
+    }
+}
+
+pub fn devices() -> Result<i32> {
+    let devices = client()?.devices()?;
+    for (index, device) in devices.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        print_device(device);
+    }
+    Ok(0)
+}
+
+pub fn device_rename(id: &str, name: &str) -> Result<i32> {
+    print_device(&client()?.rename_device(id, name)?);
+    Ok(0)
+}
+
+pub fn device_revoke(id: &str) -> Result<i32> {
+    print_device(&client()?.revoke_device(id)?);
     Ok(0)
 }
 

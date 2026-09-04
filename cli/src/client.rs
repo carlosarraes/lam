@@ -84,6 +84,40 @@ pub enum Wait {
     Pending,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PairingCreated {
+    pub session: String,
+    pub expires_at: String,
+    pub qr: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum PairingWait {
+    Pending,
+    Claimed { device: DeviceSummary },
+    Expired,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeviceSummary {
+    pub id: String,
+    pub name: String,
+    pub app_version: String,
+    pub android_version: String,
+    pub created_at: String,
+    pub last_seen_at: Option<String>,
+    pub push_registered: bool,
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RenameDevice<'a> {
+    name: &'a str,
+}
+
+#[derive(Clone)]
 pub struct Client {
     http: Http,
     base: String,
@@ -108,6 +142,18 @@ impl Client {
     fn post(&self, path: &str) -> RequestBuilder {
         self.http
             .post(format!("{}{}", self.base, path))
+            .bearer_auth(&self.token)
+    }
+
+    fn patch(&self, path: &str) -> RequestBuilder {
+        self.http
+            .patch(format!("{}{}", self.base, path))
+            .bearer_auth(&self.token)
+    }
+
+    fn delete(&self, path: &str) -> RequestBuilder {
+        self.http
+            .delete(format!("{}{}", self.base, path))
             .bearer_auth(&self.token)
     }
 
@@ -222,5 +268,34 @@ impl Client {
                 .send()?,
         )?
         .json()?)
+    }
+
+    pub fn create_pairing(&self) -> Result<PairingCreated> {
+        Ok(Self::ok(self.post("/pairings").send()?)?.json()?)
+    }
+
+    pub fn wait_pairing(&self, id: &str) -> Result<PairingWait> {
+        Ok(Self::ok(self.get(&format!("/pairings/{id}/wait")).send()?)?.json()?)
+    }
+
+    pub fn cancel_pairing(&self, id: &str) -> Result<PairingWait> {
+        Ok(Self::ok(self.delete(&format!("/pairings/{id}")).send()?)?.json()?)
+    }
+
+    pub fn devices(&self) -> Result<Vec<DeviceSummary>> {
+        Ok(Self::ok(self.get("/devices").send()?)?.json()?)
+    }
+
+    pub fn rename_device(&self, id: &str, name: &str) -> Result<DeviceSummary> {
+        Ok(Self::ok(
+            self.patch(&format!("/devices/{id}"))
+                .json(&RenameDevice { name })
+                .send()?,
+        )?
+        .json()?)
+    }
+
+    pub fn revoke_device(&self, id: &str) -> Result<DeviceSummary> {
+        Ok(Self::ok(self.delete(&format!("/devices/{id}")).send()?)?.json()?)
     }
 }

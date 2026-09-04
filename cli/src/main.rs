@@ -118,6 +118,13 @@ enum Cmd {
     Check(CheckCmd),
     /// Subscribe to ntfy and mirror pushes as desktop notifications
     Watch,
+    /// Pair an Android device using a five-minute QR code
+    Pair,
+    /// List paired Android devices
+    Devices,
+    /// Manage a paired Android device
+    #[command(subcommand)]
+    Device(DeviceCmd),
     /// Interactive queue: answer items from the terminal (default when no command is given)
     Tui {
         /// No bell or desktop notification when new items arrive
@@ -134,6 +141,14 @@ enum CheckCmd {
     Tick { id: String, n: usize },
     /// Untick a check (1-based index)
     Untick { id: String, n: usize },
+}
+
+#[derive(Subcommand)]
+enum DeviceCmd {
+    /// Rename a paired device
+    Rename { id: String, name: String },
+    /// Revoke a paired device
+    Revoke { id: String },
 }
 
 fn main() {
@@ -203,6 +218,10 @@ fn run(cmd: Cmd) -> Result<i32> {
         Cmd::Check(CheckCmd::Tick { id, n }) => commands::check_set(&id, n, true),
         Cmd::Check(CheckCmd::Untick { id, n }) => commands::check_set(&id, n, false),
         Cmd::Watch => watch::run(),
+        Cmd::Pair => commands::pair(),
+        Cmd::Devices => commands::devices(),
+        Cmd::Device(DeviceCmd::Rename { id, name }) => commands::device_rename(&id, &name),
+        Cmd::Device(DeviceCmd::Revoke { id }) => commands::device_revoke(&id),
         Cmd::Tui { silent } => tui::run(silent),
     }
 }
