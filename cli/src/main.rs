@@ -58,6 +58,12 @@ enum Cmd {
         /// Up to 3 choices shown as buttons
         #[arg(short, long = "choice")]
         choices: Vec<String>,
+        /// Recommended action and rationale for a decision request
+        #[arg(long)]
+        recommendation: Option<String>,
+        /// The exact recommended --choice value
+        #[arg(long)]
+        recommended_choice: Option<String>,
         /// Sub-item the human ticks off; the item resolves when all are done (exclusive with --choice)
         #[arg(long = "check")]
         checks: Vec<String>,
@@ -159,6 +165,8 @@ fn run(cmd: Cmd) -> Result<i32> {
             body,
             priority,
             choices,
+            recommendation,
+            recommended_choice,
             checks,
             link,
             ttl,
@@ -169,6 +177,8 @@ fn run(cmd: Cmd) -> Result<i32> {
             body,
             priority,
             choices,
+            recommendation,
+            recommended_choice,
             checks,
             link,
             ttl,

@@ -33,7 +33,7 @@ Every item records **who asked**. `lam push` resolves the name in this order: `-
 
 | cmd | |
 |---|---|
-| `lam push <title> [-n name] [-b body] [-p low\|normal\|critical] [-c choice]… \| [--check part]… [--link URL] [--ttl 2h] [--wait]` | prints id; `--check` makes a checklist that resolves when all parts are ticked |
+| `lam push <title> [-n name] [-b body] [-p low\|normal\|critical] [--recommendation TEXT] [-c choice]… [--recommended-choice CHOICE] \| [--check part]… [--link URL] [--ttl 2h] [--wait]` | prints id; every decision requires `--recommendation` (the action and rationale); choices also require an exact `--recommended-choice`; `--check` makes a checklist that resolves when all parts are ticked and is the only exception |
 | `lam wait <id>… \| --any [--timeout 2h]` | first item to change (a check ticked) or close, as JSON; `--any` covers every open item under this agent's name; exit 0 resolved/changed / 2 dismissed / 3 timeout / 4 expired / 5 retracted |
 | `lam retract <id>`, `lam check add <id> <label>` | agent withdraws its ask / appends a check |
 | `lam check tick\|untick <id> <n>` | Carlos's side, from the terminal |

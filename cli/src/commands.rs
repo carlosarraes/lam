@@ -37,24 +37,90 @@ pub struct PushArgs {
     pub body: String,
     pub priority: String,
     pub choices: Vec<String>,
+    pub recommendation: Option<String>,
+    pub recommended_choice: Option<String>,
     pub checks: Vec<String>,
     pub link: Option<String>,
     pub ttl: Option<String>,
     pub wait: bool,
 }
 
-pub fn push(a: PushArgs) -> Result<i32> {
-    if a.choices.len() > 3 {
-        bail!("at most 3 choices");
+const MAX_TITLE_CHARACTERS: usize = 200;
+const MAX_BODY_BYTES: usize = 64 * 1024;
+const MAX_RECOMMENDATION_CHARACTERS: usize = 2_000;
+const MAX_CHOICE_CHARACTERS: usize = 200;
+const MAX_CHECK_CHARACTERS: usize = 200;
+const MAX_CHOICES: usize = 3;
+const MAX_CHECKS: usize = 50;
+
+fn validate_max_characters(flag: &str, value: &str, max: usize) -> Result<()> {
+    if value.chars().count() > max {
+        bail!("{flag} must be at most {max} characters");
+    }
+    Ok(())
+}
+
+fn validate_push(a: &PushArgs) -> Result<()> {
+    if a.choices.len() > MAX_CHOICES {
+        bail!("at most {MAX_CHOICES} choices");
+    }
+    if a.checks.len() > MAX_CHECKS {
+        bail!("at most {MAX_CHECKS} checks");
     }
     if !a.choices.is_empty() && !a.checks.is_empty() {
         bail!("--choice and --check are mutually exclusive");
+    }
+    if !a.checks.is_empty() {
+        if a.recommendation.is_some() {
+            bail!("--recommendation is not allowed with --check");
+        }
+        if a.recommended_choice.is_some() {
+            bail!("--recommended-choice is not allowed with --check");
+        }
+    } else {
+        if a.recommendation.as_deref().is_none_or(str::is_empty) {
+            bail!("--recommendation is required for every non-checklist request");
+        }
+        if !a.choices.is_empty() {
+            let recommended = a
+                .recommended_choice
+                .as_deref()
+                .context("--recommended-choice is required when --choice is used")?;
+            if !a.choices.iter().any(|choice| choice == recommended) {
+                bail!("--recommended-choice must exactly match one --choice");
+            }
+        } else if a.recommended_choice.is_some() {
+            bail!("--recommended-choice is only valid when --choice is used");
+        }
+    }
+
+    validate_max_characters("--title", &a.title, MAX_TITLE_CHARACTERS)?;
+    if a.body.len() > MAX_BODY_BYTES {
+        bail!("--body must be at most {MAX_BODY_BYTES} UTF-8 bytes");
+    }
+    if let Some(recommendation) = &a.recommendation {
+        validate_max_characters(
+            "--recommendation",
+            recommendation,
+            MAX_RECOMMENDATION_CHARACTERS,
+        )?;
+    }
+    for choice in &a.choices {
+        validate_max_characters("--choice", choice, MAX_CHOICE_CHARACTERS)?;
+    }
+    for check in &a.checks {
+        validate_max_characters("--check", check, MAX_CHECK_CHARACTERS)?;
     }
     if let Some(l) = &a.link {
         if !l.starts_with("http://") && !l.starts_with("https://") {
             bail!("--link must be an http(s) URL");
         }
     }
+    Ok(())
+}
+
+pub fn push(a: PushArgs) -> Result<i32> {
+    validate_push(&a)?;
     let name = crate::name::resolve(a.name)?;
     let ttl = a
         .ttl
@@ -71,6 +137,8 @@ pub fn push(a: PushArgs) -> Result<i32> {
         priority: a.priority,
         choices: a.choices,
         checks: a.checks,
+        recommendation: a.recommendation,
+        recommended_choice: a.recommended_choice,
         link: a.link,
         ttl,
     })?;

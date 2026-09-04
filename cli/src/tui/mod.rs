@@ -749,6 +749,8 @@ mod tests {
             source_project: "p".into(),
             priority: "normal".into(),
             choices: choices.iter().map(|s| s.to_string()).collect(),
+            recommendation: None,
+            recommended_choice: None,
             link: link.into(),
             checks: vec![],
             version: 0,

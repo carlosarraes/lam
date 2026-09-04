@@ -19,10 +19,11 @@ Every item carries a **name** so Carlos can tell concurrent agents apart. Inside
 
 ```bash
 # ask a question with buttons (max 3 choices) and block until answered
-lam push "PR #2529: waive artifact check?" -b "Reply in Claude Code session mp-2529" -p critical -c waive -c require --wait
+# Every decision says what you recommend and why; the recommended choice exactly matches a --choice.
+lam push "PR #2529: waive artifact check?" -b "Reply in Claude Code session mp-2529" -p critical -c waive -c require --recommendation "Waive it: the published artifact's checksum and smoke test are green." --recommended-choice waive --wait
 
-# two-step, with an "Open" button to the thing to look at and a deadline after which the ask expires
-ID=$(lam push "PR #2529 needs your click" --link https://github.com/org/repo/pull/2529 --ttl 2h -c done)
+# two-step decision, with an "Open" button and a deadline after which the ask expires
+ID=$(lam push "PR #2529 needs your click" --link https://github.com/org/repo/pull/2529 --ttl 2h --recommendation "Approve it: the review and CI are complete.")
 lam wait "$ID" --timeout 1h
 
 # several asks in flight: block until whichever closes first (prints that item)
@@ -40,13 +41,15 @@ lam check add "$ID" "PR #2601" # a new part became ready: append instead of push
 
 Checklist loop: `lam wait` exits 0 both on progress and on resolution — check `status`: `open` means "some check flipped, act on it and call `lam wait` again"; anything else is final. `--check` and `--choice` are exclusive.
 
+Every non-checklist push requires `--recommendation <action and rationale>`. When using `--choice`, also pass `--recommended-choice <CHOICE>` with an exact value from `--choice`. Checklists are the only exception: do not pass either recommendation flag with `--check`.
+
 `wait` prints the item as JSON. Read `response_choice` (button pressed) and `response_text` (free text). Exit codes: `0` resolved, `2` dismissed (he doesn't want to deal with it — stop and report), `3` timeout (fall back to `lam list` later; do not re-push the same question), `4` expired (TTL passed — decide whether to re-push), `5` retracted.
 
 - `-p critical` only for actual blockers; `normal` for "look when convenient".
 - The body may be **markdown** — headings, bullets, tables, fenced code. Carlos reads it rendered in the terminal (`m` opens a reader pane), so send the whole plan or diff summary when the decision needs it rather than a one-line teaser. The phone shows the same text unrendered, so keep the first line meaningful.
 - A push with the same name, title and body as an item that is still open returns **that item's id** and does not notify again — so a retry after a failed-looking push is safe, and re-asking an open question is a no-op.
 - Never invent a name that hides who you are: the inferred `session:window` is what Carlos looks for when several agents are running.
-- Title = the decision. Body = where to act ("Reply in Claude Code: …"). Host and project are attached automatically.
+- Title = the decision. `--recommendation` = the action you recommend and why. Body = where to act ("Reply in Claude Code: …"). Host and project are attached automatically.
 - Always pass `--link` when there is a URL to act on, and `--ttl` when the ask stops mattering after a while — stale items make the queue untrustworthy.
 - The phone notification shows at most 3 buttons; with 3 choices the Open/Reply buttons are still available inside the ntfy app.
 - `lam list` shows open items; `lam show <id>` shows one. Never resolve items yourself with `lam done` or tick checks with `lam check tick` — that is Carlos's side. `lam retract` and `lam check add` are the only mutations that are yours.

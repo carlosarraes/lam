@@ -43,7 +43,7 @@ fn lam(dir: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
 }
 
 #[tokio::test]
-async fn push_prints_id_and_sends_bearer() {
+async fn push_accepts_an_exact_recommended_choice_and_sends_it() {
     let (server, dir) = setup().await;
     Mock::given(method("POST"))
         .and(path("/items"))
@@ -61,6 +61,10 @@ async fn push_prints_id_and_sends_bearer() {
             "yes",
             "-c",
             "no",
+            "--recommendation",
+            "Ship it: the release checks are green.",
+            "--recommended-choice",
+            "yes",
             "-p",
             "critical",
             "--link",
@@ -80,6 +84,11 @@ async fn push_prints_id_and_sends_bearer() {
     assert_eq!(body["title"], "hello");
     assert_eq!(body["priority"], "critical");
     assert_eq!(body["choices"], serde_json::json!(["yes", "no"]));
+    assert_eq!(
+        body["recommendation"],
+        "Ship it: the release checks are green."
+    );
+    assert_eq!(body["recommended_choice"], "yes");
     assert_eq!(body["name"], "test:agent");
     assert_eq!(body["link"], "https://x/pr/1");
     assert_eq!(body["ttl"], 1800);
@@ -95,6 +104,234 @@ async fn push_rejects_four_choices() {
     );
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("at most 3"));
+}
+
+#[tokio::test]
+async fn push_requires_a_recommendation_before_loading_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = lam(&dir, &["push", "approve the release"]);
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("--recommendation is required for every non-checklist request"));
+}
+
+#[tokio::test]
+async fn push_with_choices_requires_recommendation_flags() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let without_either = lam(&dir, &["push", "approve the release", "--choice", "ship"]);
+    assert_eq!(without_either.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&without_either.stderr)
+        .contains("--recommendation is required for every non-checklist request"));
+
+    let without_choice = lam(
+        &dir,
+        &[
+            "push",
+            "approve the release",
+            "--choice",
+            "ship",
+            "--recommendation",
+            "Ship after the smoke test.",
+        ],
+    );
+    assert_eq!(without_choice.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&without_choice.stderr)
+        .contains("--recommended-choice is required when --choice is used"));
+}
+
+#[tokio::test]
+async fn push_rejects_a_recommended_choice_outside_the_choices_before_loading_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = lam(
+        &dir,
+        &[
+            "push",
+            "approve the release",
+            "--choice",
+            "ship",
+            "--recommendation",
+            "Ship after the smoke test.",
+            "--recommended-choice",
+            "hold",
+        ],
+    );
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("--recommended-choice must exactly match one --choice"));
+}
+
+#[tokio::test]
+async fn push_accepts_a_checklist_without_recommendation_fields() {
+    let (server, dir) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/items"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(item("abc12", "open", None)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let out = lam(&dir, &["push", "release checklist", "--check", "publish"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body: serde_json::Value = server.received_requests().await.unwrap()[0]
+        .body_json()
+        .unwrap();
+    assert_eq!(body["checks"], serde_json::json!(["publish"]));
+    assert!(body.get("recommendation").is_none());
+    assert!(body.get("recommended_choice").is_none());
+}
+
+#[tokio::test]
+async fn push_rejects_recommendation_flags_on_checklists_and_choice_flag_without_choices() {
+    let dir = tempfile::tempdir().unwrap();
+    for (args, expected) in [
+        (
+            vec![
+                "push",
+                "checklist",
+                "--check",
+                "publish",
+                "--recommendation",
+                "Do it.",
+            ],
+            "--recommendation is not allowed with --check",
+        ),
+        (
+            vec![
+                "push",
+                "checklist",
+                "--check",
+                "publish",
+                "--recommended-choice",
+                "publish",
+            ],
+            "--recommended-choice is not allowed with --check",
+        ),
+        (
+            vec![
+                "push",
+                "decision",
+                "--recommendation",
+                "Do it.",
+                "--recommended-choice",
+                "yes",
+            ],
+            "--recommended-choice is only valid when --choice is used",
+        ),
+    ] {
+        let out = lam(&dir, &args);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(expected),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[tokio::test]
+async fn push_rejects_oversized_fields_locally_with_readable_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let cases = [
+        (
+            vec![
+                "push".to_string(),
+                "x".repeat(201),
+                "--recommendation".to_string(),
+                "because".to_string(),
+            ],
+            "--title must be at most 200 characters",
+        ),
+        (
+            vec![
+                "push".to_string(),
+                "body".to_string(),
+                "--body".to_string(),
+                "é".repeat(32_769),
+                "--recommendation".to_string(),
+                "because".to_string(),
+            ],
+            "--body must be at most 65536 UTF-8 bytes",
+        ),
+        (
+            vec![
+                "push".to_string(),
+                "recommendation".to_string(),
+                "--recommendation".to_string(),
+                "😀".repeat(2_001),
+            ],
+            "--recommendation must be at most 2000 characters",
+        ),
+        (
+            vec![
+                "push".to_string(),
+                "choice".to_string(),
+                "--choice".to_string(),
+                "x".repeat(201),
+                "--recommendation".to_string(),
+                "because".to_string(),
+                "--recommended-choice".to_string(),
+                "x".repeat(201),
+            ],
+            "--choice must be at most 200 characters",
+        ),
+        (
+            vec![
+                "push".to_string(),
+                "check".to_string(),
+                "--check".to_string(),
+                "x".repeat(201),
+            ],
+            "--check must be at most 200 characters",
+        ),
+        (
+            vec![
+                "push".to_string(),
+                "choices".to_string(),
+                "--choice".to_string(),
+                "a".to_string(),
+                "--choice".to_string(),
+                "b".to_string(),
+                "--choice".to_string(),
+                "c".to_string(),
+                "--choice".to_string(),
+                "d".to_string(),
+                "--recommendation".to_string(),
+                "because".to_string(),
+                "--recommended-choice".to_string(),
+                "a".to_string(),
+            ],
+            "at most 3 choices",
+        ),
+        (
+            std::iter::once("push".to_string())
+                .chain(std::iter::once("checks".to_string()))
+                .chain((0..51).flat_map(|n| ["--check".to_string(), format!("check {n}")]))
+                .collect(),
+            "at most 50 checks",
+        ),
+    ];
+
+    for (args, expected) in cases {
+        let out = Command::new(env!("CARGO_BIN_EXE_lam"))
+            .env("LAM_CONFIG", dir.path().join("config.toml"))
+            .env("LAM_NAME", "test:agent")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{expected}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(expected),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[tokio::test]
@@ -285,7 +522,7 @@ async fn push_without_any_name_source_fails_with_guidance() {
         .env_remove("TMUX_PANE")
         .env_remove("ZELLIJ_SESSION_NAME")
         .env_remove("STY")
-        .args(["push", "who am i"])
+        .args(["push", "who am i", "--recommendation", "Do it."])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
@@ -303,9 +540,19 @@ async fn explicit_name_flag_wins_over_env() {
         .expect(1)
         .mount(&server)
         .await;
-    assert!(lam(&dir, &["push", "x", "--name", "sweep:2"])
-        .status
-        .success());
+    assert!(lam(
+        &dir,
+        &[
+            "push",
+            "x",
+            "--name",
+            "sweep:2",
+            "--recommendation",
+            "Do it."
+        ],
+    )
+    .status
+    .success());
     let req = &server.received_requests().await.unwrap()[0];
     let body: serde_json::Value = req.body_json().unwrap();
     assert_eq!(body["name"], "sweep:2");

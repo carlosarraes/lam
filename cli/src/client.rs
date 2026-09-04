@@ -25,6 +25,10 @@ pub struct Item {
     pub priority: String,
     pub choices: Vec<String>,
     #[serde(default)]
+    pub recommendation: Option<String>,
+    #[serde(default)]
+    pub recommended_choice: Option<String>,
+    #[serde(default)]
     pub checks: Vec<Check>,
     #[serde(default)]
     pub link: String,
@@ -56,6 +60,10 @@ pub struct NewItem {
     pub priority: String,
     pub choices: Vec<String>,
     pub checks: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommendation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommended_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
