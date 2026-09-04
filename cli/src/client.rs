@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use crate::config::Config;
 
+const PAIRING_CANCEL_TIMEOUT: Duration = Duration::from_millis(500);
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Check {
     pub label: String,
@@ -279,7 +281,12 @@ impl Client {
     }
 
     pub fn cancel_pairing(&self, id: &str) -> Result<PairingWait> {
-        Ok(Self::ok(self.delete(&format!("/pairings/{id}")).send()?)?.json()?)
+        Ok(Self::ok(
+            self.delete(&format!("/pairings/{id}"))
+                .timeout(PAIRING_CANCEL_TIMEOUT)
+                .send()?,
+        )?
+        .json()?)
     }
 
     pub fn devices(&self) -> Result<Vec<DeviceSummary>> {

@@ -1,5 +1,6 @@
 use std::process::{Command, Stdio};
 
+use qrcode::{render::unicode, QrCode};
 use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -590,6 +591,11 @@ async fn pair_renders_the_exact_payload_as_unicode_without_printing_the_secret()
     let (server, dir) = setup().await;
     let created = pairing_created(&server, "pair-1");
     let qr = created["qr"].as_str().unwrap().to_string();
+    let expected_rendering = QrCode::new(qr.as_bytes())
+        .unwrap()
+        .render::<unicode::Dense1x2>()
+        .quiet_zone(true)
+        .build();
     let secret = "A".repeat(43);
     Mock::given(method("POST"))
         .and(path("/pairings"))
@@ -617,13 +623,10 @@ async fn pair_renders_the_exact_payload_as_unicode_without_printing_the_secret()
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains('█') || stdout.contains('▀') || stdout.contains('▄'),
-        "{stdout}"
-    );
-    assert!(
-        stdout.lines().any(|line| line.starts_with("    ")),
-        "quiet zone missing:\n{stdout}"
+        stdout.contains(&expected_rendering),
+        "fixture QR rendering missing:\n{stdout}"
     );
     assert!(
         stdout.contains(&format!("Server: {}", server.uri())),
@@ -637,11 +640,16 @@ async fn pair_renders_the_exact_payload_as_unicode_without_printing_the_secret()
         stdout.contains("Paired Carlos's phone (phone-1)"),
         "{stdout}"
     );
-    assert!(!stdout.contains(&secret), "secret leaked:\n{stdout}");
-    assert!(
-        !stdout.contains(&qr),
-        "serialized payload leaked:\n{stdout}"
-    );
+    for (stream_name, stream) in [("stdout", stdout.as_ref()), ("stderr", stderr.as_ref())] {
+        assert!(
+            !stream.contains(&secret),
+            "secret leaked on {stream_name}:\n{stream}"
+        );
+        assert!(
+            !stream.contains(&qr),
+            "serialized payload leaked on {stream_name}:\n{stream}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -710,7 +718,9 @@ async fn pair_ctrl_c_cancels_the_session_best_effort() {
         .and(path("/pairings/pair-signal"))
         .and(header("authorization", "Bearer tok"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": "cancelled" })),
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(2))
+                .set_body_json(serde_json::json!({ "status": "cancelled" })),
         )
         .expect(1)
         .mount(&server)
