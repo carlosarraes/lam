@@ -137,6 +137,28 @@ tasks.matching { it.name == "preReleaseBuild" }.configureEach {
     dependsOn(verifyReleaseSigning)
 }
 
+val testStrictAndroidTestGate = tasks.register<Exec>("testStrictAndroidTestGate") {
+    group = "verification"
+    description = "Proves that the direct AndroidJUnitRunner gate rejects failures and aborts."
+    commandLine("bash", rootProject.file("scripts/test-run-instrumentation-tests.sh"))
+}
+
+tasks.register<Exec>("strictDebugAndroidTest") {
+    group = "verification"
+    description = "Installs debug APKs and fails unless AndroidJUnitRunner reports a clean pass."
+    dependsOn("assembleDebug", "assembleDebugAndroidTest", testStrictAndroidTestGate)
+    val testClass = providers.gradleProperty("androidTestClass")
+        .orElse("")
+    commandLine(
+        "bash",
+        rootProject.file("scripts/run-instrumentation-tests.sh"),
+        layout.buildDirectory.file("outputs/apk/debug/app-debug.apk").get().asFile,
+        layout.buildDirectory.file("outputs/apk/androidTest/debug/app-debug-androidTest.apk").get().asFile,
+        "dev.carraes.lam.debug.test",
+        testClass.get(),
+    )
+}
+
 dependencies {
     implementation(platform(libs.compose.bom))
     androidTestImplementation(platform(libs.compose.bom))
@@ -170,6 +192,7 @@ dependencies {
     testImplementation(libs.okhttp.mockwebserver)
     testImplementation(libs.kotlinx.coroutines.test)
     androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.androidx.test.core)
     androidTestImplementation(libs.espresso.core)
     androidTestImplementation(libs.compose.ui.test.junit4)
 }

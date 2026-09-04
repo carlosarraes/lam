@@ -16,6 +16,7 @@ mlkit-barcode = "17.3.0"
 browser = "1.10.0"
 markdown = "0.41.0"
 androidx-test-ext = "1.3.0"
+androidx-test-core = "1.7.0"
 espresso = "3.7.0"
 junit = "4.13.2"
 
@@ -49,6 +50,7 @@ browser = { module = "androidx.browser:browser", version.ref = "browser" }
 markdown-core = { module = "com.mikepenz:multiplatform-markdown-renderer", version.ref = "markdown" }
 markdown-material3 = { module = "com.mikepenz:multiplatform-markdown-renderer-m3", version.ref = "markdown" }
 androidx-test-ext-junit = { module = "androidx.test.ext:junit", version.ref = "androidx-test-ext" }
+androidx-test-core = { module = "androidx.test:core", version.ref = "androidx-test-core" }
 espresso-core = { module = "androidx.test.espresso:espresso-core", version.ref = "espresso" }
 junit = { module = "junit:junit", version.ref = "junit" }
 
