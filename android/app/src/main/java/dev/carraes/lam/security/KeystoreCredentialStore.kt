@@ -1,94 +1,197 @@
 package dev.carraes.lam.security
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.SharedPreferences
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import androidx.core.content.edit
-import java.io.IOException
 import java.nio.charset.StandardCharsets
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrl
 
-class KeystoreCredentialStore internal constructor(
-    context: Context,
-    private val aadApplicationId: String = context.packageName,
-) : CredentialStore, CredentialReader {
-    private val preferences: SharedPreferences =
-        context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
-    private val keyAlias = "$KEY_ALIAS_PREFIX${context.packageName}"
-    private val state = MutableStateFlow<PairedServer?>(null)
+internal data class PersistedCredential(
+    val server: PairedServer,
+    val credential: String,
+)
+
+internal interface CredentialPersistence {
+    fun restore(): PersistedCredential?
+
+    fun save(server: PairedServer, credential: String)
+
+    fun clear()
+
+    fun recoverFromUnreadableRecord()
+}
+
+internal class CredentialStoreRuntime(
+    private val persistence: CredentialPersistence,
+    private val ioDispatcher: CoroutineDispatcher,
+    scope: CoroutineScope,
+    private val onCredentialChanged: (String?) -> Unit,
+) : CredentialStore {
+    private val state = MutableSharedFlow<PairedServer?>(replay = 1)
+    private val initialized = CompletableDeferred<Unit>()
     private val lock = Mutex()
 
-    @Volatile
-    private var currentCredential: String? = null
-
     init {
-        restore()
+        scope.launch(ioDispatcher) {
+            try {
+                lock.withLock {
+                    val restored = try {
+                        persistence.restore()
+                    } catch (_: Exception) {
+                        runCatching { persistence.recoverFromUnreadableRecord() }
+                        null
+                    }
+                    onCredentialChanged(restored?.credential)
+                    state.emit(restored?.server)
+                }
+            } finally {
+                initialized.complete(Unit)
+            }
+        }
     }
 
-    override fun observe(): Flow<PairedServer?> = state
+    override fun observe(): Flow<PairedServer?> = state.asSharedFlow()
 
     override suspend fun save(server: PairedServer, credential: String) {
         require(credential.isNotBlank()) { "credential must not be blank" }
-        lock.withLock {
-            val normalizedServer = server.copy(serverUrl = normalizeServerUrl(server.serverUrl))
-            val cipher = Cipher.getInstance(TRANSFORMATION).apply {
-                init(Cipher.ENCRYPT_MODE, getOrCreateKey())
-                updateAAD(associatedData(normalizedServer.serverUrl))
+        withContext(ioDispatcher) {
+            initialized.await()
+            lock.withLock {
+                persistence.save(server, credential)
+                onCredentialChanged(credential)
+                state.emit(server)
             }
-            val ciphertext = cipher.doFinal(credential.toByteArray(StandardCharsets.UTF_8))
-            val persisted = preferences.edit()
-                .putString(KEY_SERVER_URL, normalizedServer.serverUrl)
-                .putString(KEY_DEVICE_ID, normalizedServer.deviceId)
-                .putString(KEY_DEVICE_NAME, normalizedServer.deviceName)
-                .putString(KEY_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
-                .putString(KEY_CIPHERTEXT, Base64.encodeToString(ciphertext, Base64.NO_WRAP))
-                .commit()
-            if (!persisted) throw IOException("could not persist device credential")
-            currentCredential = credential
-            state.value = normalizedServer
         }
     }
 
     override suspend fun clear() {
-        lock.withLock {
-            eraseRecordAndKey()
+        withContext(ioDispatcher) {
+            initialized.await()
+            lock.withLock {
+                val deletionFailure = runCatching { persistence.clear() }.exceptionOrNull()
+                onCredentialChanged(null)
+                state.emit(null)
+                if (deletionFailure != null) throw CredentialStoreException()
+            }
         }
     }
+}
 
-    override fun credential(): String? = currentCredential
+internal fun createKeystoreCredentialStore(
+    context: Context,
+    aadApplicationId: String = context.packageName,
+    ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    scope: CoroutineScope = CoroutineScope(SupervisorJob() + ioDispatcher),
+    onCredentialChanged: (String?) -> Unit,
+): CredentialStore = KeystoreCredentialStore(
+    context = context,
+    aadApplicationId = aadApplicationId,
+    ioDispatcher = ioDispatcher,
+    scope = scope,
+    onCredentialChanged = onCredentialChanged,
+)
 
-    private fun restore() {
-        if (preferences.all.isEmpty()) return
-        try {
-            val serverUrl = requiredPreference(KEY_SERVER_URL)
-            val server = PairedServer(
-                serverUrl = normalizeServerUrl(serverUrl),
-                deviceId = requiredPreference(KEY_DEVICE_ID),
-                deviceName = requiredPreference(KEY_DEVICE_NAME),
-            )
-            val iv = Base64.decode(requiredPreference(KEY_IV), Base64.NO_WRAP)
-            val ciphertext = Base64.decode(requiredPreference(KEY_CIPHERTEXT), Base64.NO_WRAP)
-            val key = loadKey() ?: error("device credential key is missing")
-            val cipher = Cipher.getInstance(TRANSFORMATION).apply {
-                init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(GCM_TAG_BITS, iv))
-                updateAAD(associatedData(server.serverUrl))
-            }
-            currentCredential = String(cipher.doFinal(ciphertext), StandardCharsets.UTF_8)
-            state.value = server
-        } catch (_: Exception) {
-            eraseRecordAndKey()
+private class KeystoreCredentialStore(
+    context: Context,
+    aadApplicationId: String,
+    ioDispatcher: CoroutineDispatcher,
+    scope: CoroutineScope,
+    onCredentialChanged: (String?) -> Unit,
+) : CredentialStore {
+    private val runtime = CredentialStoreRuntime(
+        persistence = KeystoreCredentialPersistence(context, aadApplicationId),
+        ioDispatcher = ioDispatcher,
+        scope = scope,
+        onCredentialChanged = onCredentialChanged,
+    )
+
+    override fun observe(): Flow<PairedServer?> = runtime.observe()
+
+    override suspend fun save(server: PairedServer, credential: String) {
+        runtime.save(server.copy(serverUrl = normalizeServerUrl(server.serverUrl)), credential)
+    }
+
+    override suspend fun clear() = runtime.clear()
+}
+
+private class KeystoreCredentialPersistence(
+    context: Context,
+    private val aadApplicationId: String,
+) : CredentialPersistence {
+    private val preferences: SharedPreferences =
+        context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
+    private val keyAlias = "$KEY_ALIAS_PREFIX${context.packageName}"
+
+    override fun restore(): PersistedCredential? {
+        if (preferences.all.isEmpty()) return null
+        val server = PairedServer(
+            serverUrl = normalizeServerUrl(requiredPreference(KEY_SERVER_URL)),
+            deviceId = requiredPreference(KEY_DEVICE_ID),
+            deviceName = requiredPreference(KEY_DEVICE_NAME),
+        )
+        val iv = Base64.decode(requiredPreference(KEY_IV), Base64.NO_WRAP)
+        val ciphertext = Base64.decode(requiredPreference(KEY_CIPHERTEXT), Base64.NO_WRAP)
+        val key = loadKey() ?: error("device credential key is missing")
+        val cipher = Cipher.getInstance(TRANSFORMATION).apply {
+            init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(GCM_TAG_BITS, iv))
+            updateAAD(associatedData(server.serverUrl))
         }
+        val credential = String(cipher.doFinal(ciphertext), StandardCharsets.UTF_8)
+        return PersistedCredential(server, credential)
+    }
+
+    override fun save(server: PairedServer, credential: String) {
+        val cipher = Cipher.getInstance(TRANSFORMATION).apply {
+            init(Cipher.ENCRYPT_MODE, getOrCreateKey())
+            updateAAD(associatedData(server.serverUrl))
+        }
+        val ciphertext = cipher.doFinal(credential.toByteArray(StandardCharsets.UTF_8))
+        val persisted = preferences.edit()
+            .putString(KEY_SERVER_URL, server.serverUrl)
+            .putString(KEY_DEVICE_ID, server.deviceId)
+            .putString(KEY_DEVICE_NAME, server.deviceName)
+            .putString(KEY_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
+            .putString(KEY_CIPHERTEXT, Base64.encodeToString(ciphertext, Base64.NO_WRAP))
+            .commit()
+        if (!persisted) error("could not persist encrypted credential")
+    }
+
+    // The KTX edit helper returns Unit, but clear must surface a failed synchronous commit.
+    @SuppressLint("UseKtx")
+    override fun clear() {
+        var failed = !preferences.edit().clear().commit()
+        try {
+            androidKeyStore().deleteEntry(keyAlias)
+        } catch (_: Exception) {
+            failed = true
+        }
+        if (failed) error("could not delete credential material")
+    }
+
+    override fun recoverFromUnreadableRecord() {
+        runCatching { preferences.edit(commit = true) { clear() } }
+        runCatching { androidKeyStore().deleteEntry(keyAlias) }
     }
 
     private fun requiredPreference(name: String): String =
@@ -119,29 +222,7 @@ class KeystoreCredentialStore internal constructor(
 
     private fun loadKey(): SecretKey? = androidKeyStore().getKey(keyAlias, null) as? SecretKey
 
-    private fun eraseRecordAndKey() {
-        currentCredential = null
-        state.value = null
-        preferences.edit(commit = true) { clear() }
-        runCatching { androidKeyStore().deleteEntry(keyAlias) }
-    }
-
     private fun androidKeyStore(): KeyStore = KeyStore.getInstance(ANDROID_KEY_STORE).apply { load(null) }
-
-    private fun normalizeServerUrl(value: String): String {
-        val parsed = value.trim().toHttpUrl()
-        require(parsed.username.isEmpty() && parsed.password.isEmpty()) {
-            "server URL must not contain user information"
-        }
-        require(parsed.query == null && parsed.fragment == null) {
-            "server URL must not contain a query or fragment"
-        }
-        return if (parsed.encodedPath.endsWith('/')) {
-            parsed.toString()
-        } else {
-            parsed.newBuilder().addPathSegment("").build().toString()
-        }
-    }
 
     private companion object {
         const val ANDROID_KEY_STORE = "AndroidKeyStore"
@@ -155,5 +236,20 @@ class KeystoreCredentialStore internal constructor(
         const val KEY_DEVICE_NAME = "device_name"
         const val KEY_IV = "credential_iv"
         const val KEY_CIPHERTEXT = "credential_ciphertext"
+    }
+}
+
+private fun normalizeServerUrl(value: String): String {
+    val parsed = value.trim().toHttpUrl()
+    require(parsed.username.isEmpty() && parsed.password.isEmpty()) {
+        "server URL must not contain user information"
+    }
+    require(parsed.query == null && parsed.fragment == null) {
+        "server URL must not contain a query or fragment"
+    }
+    return if (parsed.encodedPath.endsWith('/')) {
+        parsed.toString()
+    } else {
+        parsed.newBuilder().addPathSegment("").build().toString()
     }
 }

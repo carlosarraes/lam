@@ -1,6 +1,7 @@
 package dev.carraes.lam.security
 
 import kotlinx.coroutines.flow.Flow
+import java.io.IOException
 
 interface CredentialStore {
     fun observe(): Flow<PairedServer?>
@@ -10,6 +11,4 @@ interface CredentialStore {
     suspend fun clear()
 }
 
-internal fun interface CredentialReader {
-    fun credential(): String?
-}
+internal class CredentialStoreException : IOException("could not clear device credential")

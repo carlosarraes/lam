@@ -36,7 +36,7 @@ if [[ "$output" == *"FAILURES!!!"* ]] ||
   exit 1
 fi
 
-if ! grep -Eq '^OK \([0-9]+ tests?\)$' <<<"$output"; then
+if ! grep -Eq '^OK \([1-9][0-9]* tests?\)$' <<<"$output"; then
   printf 'Android instrumentation did not report a passing test count\n' >&2
   exit 1
 fi

@@ -19,7 +19,7 @@ OK (2 tests)
 INSTRUMENTATION_CODE: -1
 OUT
     ;;
-  failure)
+  assertion_failure)
     if [[ "$1" == "install" ]]; then printf 'Success\n'; exit 0; fi
     cat <<'OUT'
 FAILURES!!!
@@ -33,6 +33,21 @@ OUT
 INSTRUMENTATION_ABORTED: Process crashed.
 INSTRUMENTATION_CODE: 0
 OUT
+    ;;
+  crash)
+    if [[ "$1" == "install" ]]; then printf 'Success\n'; exit 0; fi
+    printf 'Process crashed.\nINSTRUMENTATION_CODE: 0\n'
+    ;;
+  instrumentation_failed)
+    if [[ "$1" == "install" ]]; then printf 'Success\n'; exit 0; fi
+    printf 'INSTRUMENTATION_FAILED: dev.example.test\nINSTRUMENTATION_CODE: 0\n'
+    ;;
+  zero_tests)
+    if [[ "$1" == "install" ]]; then printf 'Success\n'; exit 0; fi
+    printf 'OK (0 tests)\nINSTRUMENTATION_CODE: -1\n'
+    ;;
+  nonzero_adb)
+    if [[ "$1" == "install" ]]; then printf 'install failed\n' >&2; exit 19; fi
     ;;
 esac
 EOF
@@ -58,7 +73,7 @@ if ! grep -Fq -- '-e class dev.example.ExampleTest' "$adb_log"; then
   exit 1
 fi
 
-for scenario in failure abort; do
+for scenario in assertion_failure abort crash instrumentation_failed zero_tests nonzero_adb; do
   if FAKE_ADB_SCENARIO="$scenario" FAKE_ADB_LOG="$adb_log" LAM_ADB="$fake_adb" \
     "$runner" "$test_dir/app.apk" "$test_dir/test.apk" dev.example.test dev.example.ExampleTest \
     >/dev/null 2>&1; then

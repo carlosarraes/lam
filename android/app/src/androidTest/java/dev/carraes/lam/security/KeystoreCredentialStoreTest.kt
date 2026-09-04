@@ -7,10 +7,17 @@ import android.util.Base64
 import androidx.test.core.app.ApplicationProvider
 import java.io.File
 import java.security.KeyStore
+import java.util.concurrent.Executors
 import javax.crypto.SecretKey
 import javax.crypto.SecretKeyFactory
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -37,26 +44,29 @@ class KeystoreCredentialStoreTest {
     @Test
     fun saveObserveClearAndProcessRecreation() = runBlocking {
         val expected = pairedServer()
-        val store = KeystoreCredentialStore(context)
+        var capturedCredential: String? = null
+        val store = newStore { capturedCredential = it }
 
         store.save(expected, CREDENTIAL)
 
         assertEquals(expected, store.observe().first())
-        assertEquals(CREDENTIAL, store.credential())
+        assertEquals(CREDENTIAL, capturedCredential)
 
-        val recreated = KeystoreCredentialStore(context)
+        var restoredCredential: String? = null
+        val recreated = newStore { restoredCredential = it }
         assertEquals(expected, recreated.observe().first())
-        assertEquals(CREDENTIAL, recreated.credential())
+        assertEquals(CREDENTIAL, restoredCredential)
 
         recreated.clear()
         assertNull(recreated.observe().first())
-        assertNull(recreated.credential())
+        assertNull(restoredCredential)
         assertTrue(credentialsPreferences().all.isEmpty())
+        assertFalse(androidKeyStore().containsAlias(defaultAlias()))
     }
 
     @Test
     fun normalizesAndPersistsServerAndDeviceMetadataWithoutPlaintextCredential() = runBlocking {
-        val store = KeystoreCredentialStore(context)
+        val store = newStore()
 
         store.save(
             PairedServer("HTTPS://Lam.Example:443/worker", "device-42", "Carlos's S24 Ultra"),
@@ -78,7 +88,7 @@ class KeystoreCredentialStoreTest {
 
     @Test
     fun usesRandomizedAes256GcmWithoutUserAuthentication() = runBlocking {
-        val store = KeystoreCredentialStore(context)
+        val store = newStore()
         store.save(pairedServer(), CREDENTIAL)
         val firstIv = credentialsPreferences().getString(KEY_IV, null)
         val firstCiphertext = credentialsPreferences().getString(KEY_CIPHERTEXT, null)
@@ -102,58 +112,63 @@ class KeystoreCredentialStoreTest {
     fun corruptedIvCiphertextOrMissingKeyErasesTheUnreadableRecord() = runBlocking {
         listOf(KEY_IV, KEY_CIPHERTEXT).forEach { corruptedKey ->
             eraseTestState()
-            KeystoreCredentialStore(context).save(pairedServer(), CREDENTIAL)
+            newStore().save(pairedServer(), CREDENTIAL)
             credentialsPreferences().edit().putString(corruptedKey, "not-base64!").commit()
 
-            val recreated = KeystoreCredentialStore(context)
+            var capturedCredential: String? = "not-cleared"
+            val recreated = newStore { capturedCredential = it }
 
             assertNull(recreated.observe().first())
-            assertNull(recreated.credential())
+            assertNull(capturedCredential)
             assertTrue(credentialsPreferences().all.isEmpty())
+            assertFalse(androidKeyStore().containsAlias(defaultAlias()))
         }
 
-        KeystoreCredentialStore(context).save(pairedServer(), CREDENTIAL)
+        newStore().save(pairedServer(), CREDENTIAL)
         androidKeyStore().deleteEntry(defaultAlias())
 
-        val recreatedAfterKeyLoss = KeystoreCredentialStore(context)
+        var restoredAfterKeyLoss: String? = "not-cleared"
+        val recreatedAfterKeyLoss = newStore { restoredAfterKeyLoss = it }
 
         assertNull(recreatedAfterKeyLoss.observe().first())
-        assertNull(recreatedAfterKeyLoss.credential())
+        assertNull(restoredAfterKeyLoss)
         assertTrue(credentialsPreferences().all.isEmpty())
+        assertFalse(androidKeyStore().containsAlias(defaultAlias()))
     }
 
     @Test
     fun ciphertextIsBoundToTheNormalizedServerUrl() = runBlocking {
-        KeystoreCredentialStore(context).save(pairedServer(), CREDENTIAL)
+        newStore().save(pairedServer(), CREDENTIAL)
         credentialsPreferences().edit()
             .putString(KEY_SERVER_URL, "https://other.example/")
             .commit()
 
-        val copiedToAnotherServer = KeystoreCredentialStore(context)
+        var copiedCredential: String? = "not-cleared"
+        val copiedToAnotherServer = newStore { copiedCredential = it }
 
         assertNull(copiedToAnotherServer.observe().first())
-        assertNull(copiedToAnotherServer.credential())
+        assertNull(copiedCredential)
         assertTrue(credentialsPreferences().all.isEmpty())
+        assertFalse(androidKeyStore().containsAlias(defaultAlias()))
     }
 
     @Test
     fun ciphertextCannotCrossDebugAndReleaseApplicationIds() = runBlocking {
         assertEquals("dev.carraes.lam.debug", context.packageName)
-        KeystoreCredentialStore(context).save(pairedServer(), CREDENTIAL)
+        newStore().save(pairedServer(), CREDENTIAL)
 
-        val simulatedRelease = KeystoreCredentialStore(
-            context = context,
-            aadApplicationId = "dev.carraes.lam",
-        )
+        var simulatedReleaseCredential: String? = "not-cleared"
+        val simulatedRelease = newStore("dev.carraes.lam") { simulatedReleaseCredential = it }
 
         assertNull(simulatedRelease.observe().first())
-        assertNull(simulatedRelease.credential())
+        assertNull(simulatedReleaseCredential)
         assertTrue(credentialsPreferences().all.isEmpty())
+        assertFalse(androidKeyStore().containsAlias(defaultAlias()))
     }
 
     @Test
     fun ciphertextAndIvAreTheOnlyCredentialMaterialInPreferences() = runBlocking {
-        KeystoreCredentialStore(context).save(pairedServer(), CREDENTIAL)
+        newStore().save(pairedServer(), CREDENTIAL)
         val values = credentialsPreferences().all
 
         assertEquals(
@@ -165,11 +180,51 @@ class KeystoreCredentialStoreTest {
         assertFalse(values.values.any { value -> value.toString().contains(CREDENTIAL) })
     }
 
+    @Test
+    fun keystoreOperationsLeaveTheCallingMainThread() = runBlocking {
+        val executor = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "credential-device-io")
+        }
+        val dispatcher = executor.asCoroutineDispatcher()
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
+        try {
+            var credentialCallbackThread: Thread? = null
+            val store = createKeystoreCredentialStore(
+                context = context,
+                ioDispatcher = dispatcher,
+                scope = scope,
+                onCredentialChanged = { credential ->
+                    if (credential != null) credentialCallbackThread = Thread.currentThread()
+                },
+            )
+
+            withContext(Dispatchers.Main) {
+                store.save(pairedServer(), CREDENTIAL)
+            }
+
+            assertEquals("credential-device-io", credentialCallbackThread?.name)
+            assertNotEquals(android.os.Looper.getMainLooper().thread, credentialCallbackThread)
+        } finally {
+            scope.cancel()
+            dispatcher.close()
+            executor.shutdownNow()
+        }
+    }
+
     private suspend fun eraseTestState() {
-        KeystoreCredentialStore(context).clear()
+        newStore().clear()
         credentialsPreferences().edit().clear().commit()
         androidKeyStore().deleteEntry(defaultAlias())
     }
+
+    private fun newStore(
+        aadApplicationId: String = context.packageName,
+        onCredentialChanged: (String?) -> Unit = {},
+    ): CredentialStore = createKeystoreCredentialStore(
+        context = context,
+        aadApplicationId = aadApplicationId,
+        onCredentialChanged = onCredentialChanged,
+    )
 
     private fun pairedServer() = PairedServer(
         serverUrl = "https://lam.example/",
