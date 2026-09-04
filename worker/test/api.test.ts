@@ -1,4 +1,4 @@
-import { SELF } from "cloudflare:test";
+import { env, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
 const enc = new TextEncoder();
@@ -22,6 +22,16 @@ const lastMessage = async () => (await topicMessages()).at(-1)!;
 
 let seq = 0;
 
+async function registerFakeDevice(credential = `fake-device-credential-${++seq}`) {
+  const id = `device-${seq}`;
+  const credentialHash = await itemToken("test-secret", credential);
+  await env.DB.prepare(
+    `INSERT INTO devices (id, name, credential_hash, fcm_token, app_version, android_version, created_at)
+     VALUES (?, ?, ?, NULL, ?, ?, ?)`,
+  ).bind(id, "Test phone", credentialHash, "1.0.0-test", "16-test", new Date().toISOString()).run();
+  return { id, headers: { Authorization: `Bearer ${credential}` } };
+}
+
 /** Pushes an item whose title is made unique, so the duplicate guard never fires by accident. */
 async function push(body: { title?: string } & Record<string, unknown> = {}) {
   const { title = "item", ...rest } = body;
@@ -37,6 +47,89 @@ describe("auth", () => {
   it("rejects bad item token on action", async () => {
     const item = await push();
     expect((await SELF.fetch(`http://lam/a/${item.id}/Done?t=nope`)).status).toBe(403);
+  });
+
+  it("keeps the master bearer authorized on every existing API route", async () => {
+    const resolved = await push({ title: "master resolve" });
+    expect((await SELF.fetch(`http://lam/items/${resolved.id}/resolve`, json({}))).status).toBe(200);
+    expect((await SELF.fetch(`http://lam/items/${resolved.id}/wait`, { headers: AUTH })).status).toBe(200);
+
+    const checklist = await push({ title: "master checklist", checks: ["first"] });
+    expect((await SELF.fetch(`http://lam/items/${checklist.id}/checks`, json({ label: "second" }))).status).toBe(200);
+    expect((await SELF.fetch(`http://lam/items/${checklist.id}/checks/0`, json({ done: true }))).status).toBe(200);
+
+    const retracted = await push({ title: "master retract" });
+    expect((await SELF.fetch(`http://lam/items/${retracted.id}/retract`, { method: "POST", headers: AUTH })).status).toBe(200);
+    const dismissed = await push({ title: "master dismiss" });
+    expect((await SELF.fetch(`http://lam/items/${dismissed.id}/dismiss`, { method: "POST", headers: AUTH })).status).toBe(200);
+
+    expect((await SELF.fetch("http://lam/items", { headers: AUTH })).status).toBe(200);
+    expect((await SELF.fetch(`http://lam/items/${resolved.id}`, { headers: AUTH })).status).toBe(200);
+    expect((await SELF.fetch(`http://lam/items/wait?ids=${resolved.id}`, { headers: AUTH })).status).toBe(200);
+  });
+
+  it("rejects an unknown device bearer", async () => {
+    expect((await SELF.fetch("http://lam/items", { headers: { Authorization: "Bearer fake-unknown-device-credential" } })).status).toBe(401);
+  });
+
+  it("allows a valid device bearer to list and get items", async () => {
+    const item = await push({ title: "device read" });
+    const device = await registerFakeDevice();
+    expect((await SELF.fetch("http://lam/items", { headers: device.headers })).status).toBe(200);
+    expect((await SELF.fetch(`http://lam/items/${item.id}`, { headers: device.headers })).status).toBe(200);
+  });
+
+  it("records device resolve and dismiss responses as phone responses", async () => {
+    const resolved = await push({ title: "device resolve" });
+    const dismissed = await push({ title: "device dismiss" });
+    const device = await registerFakeDevice();
+
+    const resolvedResponse = await SELF.fetch(`http://lam/items/${resolved.id}/resolve`, {
+      ...json({ text: "handled on device" }),
+      headers: { ...device.headers, "content-type": "application/json" },
+    });
+    expect(resolvedResponse.status).toBe(200);
+    expect((await resolvedResponse.json<any>()).response_by).toBe("phone");
+
+    const dismissedResponse = await SELF.fetch(`http://lam/items/${dismissed.id}/dismiss`, { method: "POST", headers: device.headers });
+    expect(dismissedResponse.status).toBe(200);
+    expect((await dismissedResponse.json<any>()).response_by).toBe("phone");
+  });
+
+  it("records a device checklist completion as a phone response", async () => {
+    const item = await push({ title: "device checklist", checks: ["first"] });
+    const device = await registerFakeDevice();
+    const response = await SELF.fetch(`http://lam/items/${item.id}/checks/0`, {
+      ...json({ done: true }),
+      headers: { ...device.headers, "content-type": "application/json" },
+    });
+    expect(response.status).toBe(200);
+    expect((await response.json<any>()).response_by).toBe("phone");
+  });
+
+  it("forbids a device bearer from pushing items", async () => {
+    const device = await registerFakeDevice();
+    const response = await SELF.fetch("http://lam/items", {
+      ...json({ title: "forbidden device push" }),
+      headers: { ...device.headers, "content-type": "application/json" },
+    });
+    expect(response.status).toBe(403);
+  });
+
+  it("forbids a device bearer from retracting items", async () => {
+    const item = await push({ title: "forbidden device retract" });
+    const device = await registerFakeDevice();
+    expect((await SELF.fetch(`http://lam/items/${item.id}/retract`, { method: "POST", headers: device.headers })).status).toBe(403);
+  });
+
+  it("forbids a device bearer from adding checks", async () => {
+    const item = await push({ title: "forbidden device check", checks: ["first"] });
+    const device = await registerFakeDevice();
+    const response = await SELF.fetch(`http://lam/items/${item.id}/checks`, {
+      ...json({ label: "second" }),
+      headers: { ...device.headers, "content-type": "application/json" },
+    });
+    expect(response.status).toBe(403);
   });
 });
 

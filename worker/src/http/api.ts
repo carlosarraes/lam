@@ -3,7 +3,7 @@ import { Effect, Fiber, Option, Schema } from "effect";
 import { Exec } from "../Env";
 import { CheckLabel, Item, NewItem, Resolution, Status } from "../domain/Item";
 import { Items } from "../services/Items";
-import { Auth } from "../services/Auth";
+import { Auth, RequestAuthority } from "../services/Auth";
 import { Notify } from "../services/Notify";
 
 const WAIT_MS = 25_000;
@@ -25,11 +25,12 @@ const ListParams = Schema.Struct({
 /** A waiter returns when the item closed, or (with `since`) when any mutation bumped the version past it. */
 const changed = (item: Item, since: number) => item.status !== "open" || item.version > since;
 
-const bearer = HttpMiddleware.make((app) =>
+/** Authenticates once, then makes the typed authority available to route handlers. */
+export const bearer = HttpMiddleware.make((app) =>
   Effect.gen(function* () {
     const req = yield* HttpServerRequest.HttpServerRequest;
-    yield* (yield* Auth).requireBearer(req.headers.authorization);
-    return yield* app;
+    const authority = yield* (yield* Auth).authenticateBearer(req.headers.authorization);
+    return yield* Effect.provideService(app, RequestAuthority, authority);
   }),
 );
 
@@ -52,6 +53,8 @@ export const api = HttpRouter.empty.pipe(
   HttpRouter.post(
     "/items",
     Effect.gen(function* () {
+      const authority = yield* RequestAuthority;
+      yield* (yield* Auth).requireMaster(authority);
       const input = yield* HttpServerRequest.schemaBodyJson(NewItem);
       const items = yield* Items;
       // A retry of a push whose response was lost must not queue (and notify) twice.
@@ -66,6 +69,7 @@ export const api = HttpRouter.empty.pipe(
   HttpRouter.get(
     "/items",
     Effect.gen(function* () {
+      yield* RequestAuthority;
       const query = yield* HttpServerRequest.schemaSearchParams(ListParams);
       return yield* HttpServerResponse.json(yield* (yield* Items).list(query));
     }),
@@ -73,6 +77,7 @@ export const api = HttpRouter.empty.pipe(
   HttpRouter.get(
     "/items/wait",
     Effect.gen(function* () {
+      yield* RequestAuthority;
       const { ids, since } = yield* HttpServerRequest.schemaSearchParams(WaitMany);
       const wanted = ids.split(",").filter(Boolean);
       const versions = new Map(wanted.map((id, i) => [id, since?.[i] ?? Number.POSITIVE_INFINITY]));
@@ -89,6 +94,7 @@ export const api = HttpRouter.empty.pipe(
   HttpRouter.get(
     "/items/:id",
     Effect.gen(function* () {
+      yield* RequestAuthority;
       const { id } = yield* HttpRouter.schemaPathParams(IdParam);
       return yield* HttpServerResponse.json(yield* (yield* Items).get(id));
     }),
@@ -96,6 +102,7 @@ export const api = HttpRouter.empty.pipe(
   HttpRouter.get(
     "/items/:id/wait",
     Effect.gen(function* () {
+      yield* RequestAuthority;
       const { id } = yield* HttpRouter.schemaPathParams(IdParam);
       const { since = Number.POSITIVE_INFINITY } = yield* HttpServerRequest.schemaSearchParams(Schema.Struct({ since: Schema.optional(Schema.NumberFromString) }));
       const items = yield* Items;
@@ -111,11 +118,12 @@ export const api = HttpRouter.empty.pipe(
   HttpRouter.post(
     "/items/:id/resolve",
     Effect.gen(function* () {
+      const authority = yield* RequestAuthority;
       const { id } = yield* HttpRouter.schemaPathParams(IdParam);
       const req = yield* HttpServerRequest.HttpServerRequest;
       // Older callers send an empty POST to mark an item done. A present body must still decode.
       const res = req.source instanceof Request && req.source.body === null ? ({} as Resolution) : yield* HttpServerRequest.schemaBodyJson(Resolution);
-      const item = yield* (yield* Items).close(id, { status: "resolved", choice: res.choice, text: res.text, by: "cli" });
+      const item = yield* (yield* Items).close(id, { status: "resolved", choice: res.choice, text: res.text, by: authority.kind === "device" ? "phone" : "cli" });
       yield* background((yield* Notify).itemClosed(item));
       return yield* HttpServerResponse.json(item);
     }),
@@ -123,6 +131,8 @@ export const api = HttpRouter.empty.pipe(
   HttpRouter.post(
     "/items/:id/checks",
     Effect.gen(function* () {
+      const authority = yield* RequestAuthority;
+      yield* (yield* Auth).requireMaster(authority);
       const { id } = yield* HttpRouter.schemaPathParams(IdParam);
       const { label } = yield* HttpServerRequest.schemaBodyJson(Schema.Struct({ label: CheckLabel }));
       const item = yield* (yield* Items).addCheck(id, label);
@@ -134,9 +144,10 @@ export const api = HttpRouter.empty.pipe(
   HttpRouter.post(
     "/items/:id/checks/:index",
     Effect.gen(function* () {
+      const authority = yield* RequestAuthority;
       const { id, index } = yield* HttpRouter.schemaPathParams(Schema.Struct({ id: Schema.String, index: Schema.NumberFromString }));
       const { done } = yield* HttpServerRequest.schemaBodyJson(Schema.Struct({ done: Schema.Boolean }));
-      const item = yield* (yield* Items).setCheck(id, index, done, "cli");
+      const item = yield* (yield* Items).setCheck(id, index, done, authority.kind === "device" ? "phone" : "cli");
       if (item.status !== "open") yield* background((yield* Notify).itemClosed(item));
       return yield* HttpServerResponse.json(item);
     }),
@@ -144,6 +155,8 @@ export const api = HttpRouter.empty.pipe(
   HttpRouter.post(
     "/items/:id/retract",
     Effect.gen(function* () {
+      const authority = yield* RequestAuthority;
+      yield* (yield* Auth).requireMaster(authority);
       const { id } = yield* HttpRouter.schemaPathParams(IdParam);
       const item = yield* (yield* Items).close(id, { status: "retracted", by: "cli" });
       yield* background((yield* Notify).itemClosed(item));
@@ -153,11 +166,11 @@ export const api = HttpRouter.empty.pipe(
   HttpRouter.post(
     "/items/:id/dismiss",
     Effect.gen(function* () {
+      const authority = yield* RequestAuthority;
       const { id } = yield* HttpRouter.schemaPathParams(IdParam);
-      const item = yield* (yield* Items).close(id, { status: "dismissed", by: "cli" });
+      const item = yield* (yield* Items).close(id, { status: "dismissed", by: authority.kind === "device" ? "phone" : "cli" });
       yield* background((yield* Notify).itemClosed(item));
       return yield* HttpServerResponse.json(item);
     }),
   ),
-  HttpRouter.use(bearer),
 );

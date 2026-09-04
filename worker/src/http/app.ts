@@ -1,6 +1,6 @@
 import { HttpRouter, HttpServerResponse } from "@effect/platform";
 import { Effect } from "effect";
-import { api } from "./api";
+import { api, bearer } from "./api";
 import { ntfy } from "./ntfy";
 import { phone } from "./phone";
 
@@ -8,7 +8,7 @@ const error = (status: number, message: string) => HttpServerResponse.unsafeJson
 
 /** Maps domain/tagged errors to HTTP responses; anything else is a 500 with the cause logged. */
 export const app = HttpRouter.empty.pipe(
-  HttpRouter.concat(api),
+  HttpRouter.concat(api.pipe(HttpRouter.use(bearer))),
   HttpRouter.concat(phone),
   HttpRouter.concat(ntfy),
   HttpRouter.catchTags({
