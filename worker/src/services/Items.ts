@@ -69,6 +69,54 @@ export interface ListQuery {
   before?: string;
 }
 
+export type HistoryType = "plain" | "choice" | "checklist";
+
+export interface HistoryQuery {
+  limit: number;
+  cursor?: string;
+  q?: string;
+  priority?: Item["priority"];
+  type?: HistoryType;
+}
+
+export interface HistoryPage {
+  items: Item[];
+  next_cursor: string | null;
+}
+
+interface HistoryCursor {
+  closed_at: string;
+  id: string;
+}
+
+const encodeCursor = (cursor: HistoryCursor) => {
+  const bytes = new TextEncoder().encode(JSON.stringify(cursor));
+  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+};
+
+const decodeCursor = (cursor: string) =>
+  Effect.try({
+    try: () => {
+      const base64 = cursor.replace(/-/g, "+").replace(/_/g, "/");
+      const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
+      const bytes = Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
+      const value: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+      if (
+        value === null
+        || typeof value !== "object"
+        || Array.isArray(value)
+        || Object.keys(value).length !== 2
+        || typeof (value as Record<string, unknown>).closed_at !== "string"
+        || typeof (value as Record<string, unknown>).id !== "string"
+        || (value as Record<string, string>).id.length === 0
+      ) throw new Error("invalid history cursor");
+      return value as HistoryCursor;
+    },
+    catch: () => new BadRequest({ message: "invalid history cursor" }),
+  });
+
+const escapeLike = (value: string) => value.replace(/[\\%_]/g, "\\$&");
+
 interface ChecksUpdate {
   checks: Item["checks"];
   resolve: boolean;
@@ -207,6 +255,59 @@ export class Items extends Effect.Service<Items>()("lam/Items", {
         Effect.flatMap(({ results }) => Effect.forEach(results, decodeRow)),
         Effect.map((items) => (status ? items.filter((i) => i.status === status) : items)),
       ),
+
+    history: ({ limit, cursor, q, priority, type }: HistoryQuery): Effect.Effect<HistoryPage, BadRequest | DbError, Env> =>
+      Effect.gen(function* () {
+        const decodedCursor = cursor === undefined ? undefined : yield* decodeCursor(cursor);
+        const now = new Date().toISOString();
+        const { results } = yield* db((d) => {
+          const where = [
+            "(status IN ('resolved', 'dismissed', 'retracted') OR (status = 'open' AND expires_at IS NOT NULL AND expires_at <= ?))",
+          ];
+          const binds: unknown[] = [now];
+          if (q !== undefined) {
+            where.push(
+              `(title LIKE ? ESCAPE '\\' COLLATE NOCASE
+                OR name LIKE ? ESCAPE '\\' COLLATE NOCASE
+                OR body LIKE ? ESCAPE '\\' COLLATE NOCASE
+                OR (source_host || ':' || source_project) LIKE ? ESCAPE '\\' COLLATE NOCASE)`,
+            );
+            const pattern = `%${escapeLike(q)}%`;
+            binds.push(pattern, pattern, pattern, pattern);
+          }
+          if (priority !== undefined) {
+            where.push("priority = ?");
+            binds.push(priority);
+          }
+          if (type === "checklist") where.push("json_array_length(checks) > 0");
+          if (type === "choice") where.push("json_array_length(checks) = 0 AND json_array_length(choices) > 0");
+          if (type === "plain") where.push("json_array_length(checks) = 0 AND json_array_length(choices) = 0");
+          if (decodedCursor !== undefined) {
+            where.push(
+              "(COALESCE(resolved_at, expires_at) < ? OR (COALESCE(resolved_at, expires_at) = ? AND id < ?))",
+            );
+            binds.push(decodedCursor.closed_at, decodedCursor.closed_at, decodedCursor.id);
+          }
+          binds.push(limit + 1);
+          return d
+            .prepare(
+              `SELECT *, COALESCE(resolved_at, expires_at) AS closed_at
+               FROM items
+               WHERE ${where.join(" AND ")}
+               ORDER BY closed_at DESC, id DESC
+               LIMIT ?`,
+            )
+            .bind(...binds)
+            .all();
+        });
+        const rows = results.slice(0, limit);
+        const items = yield* Effect.forEach(rows, decodeRow);
+        const last = rows.at(-1) as { closed_at?: unknown; id?: unknown } | undefined;
+        const next_cursor = results.length > limit && typeof last?.closed_at === "string" && typeof last.id === "string"
+          ? encodeCursor({ closed_at: last.closed_at, id: last.id })
+          : null;
+        return { items, next_cursor };
+      }),
 
     /** Flips one check; resolves the item when every check is done. */
     setCheck: (id: string, index: number, done: boolean, by: ResponseBy) =>

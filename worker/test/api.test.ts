@@ -41,6 +41,59 @@ async function push(body: { title?: string } & Record<string, unknown> = {}) {
   return res.json<any>();
 }
 
+interface HistoryFixture {
+  id: string;
+  title: string;
+  name?: string;
+  body?: string;
+  source_host?: string;
+  source_project?: string;
+  priority?: "low" | "normal" | "critical";
+  choices?: string[];
+  checks?: Array<{ label: string; done: boolean; at: string | null }>;
+  status?: "open" | "resolved" | "dismissed" | "retracted";
+  created_at?: string;
+  resolved_at?: string | null;
+  expires_at?: string | null;
+}
+
+async function insertHistoryFixture({
+  id,
+  title,
+  name = "history-fixture",
+  body = "",
+  source_host = "",
+  source_project = "",
+  priority = "normal",
+  choices = [],
+  checks = [],
+  status = "resolved",
+  created_at = "2024-01-01T00:00:00.000Z",
+  resolved_at = "2024-01-02T00:00:00.000Z",
+  expires_at = null,
+}: HistoryFixture) {
+  await env.DB.prepare(
+    `INSERT INTO items
+      (id, name, title, body, source_host, source_project, priority, choices, checks, link, status,
+       created_at, resolved_at, expires_at, recommendation, recommended_choice, version, dedupe_key)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, NULL, NULL, 0, NULL)`,
+  ).bind(
+    id,
+    name,
+    title,
+    body,
+    source_host,
+    source_project,
+    priority,
+    JSON.stringify(choices),
+    JSON.stringify(checks),
+    status,
+    created_at,
+    resolved_at,
+    expires_at,
+  ).run();
+}
+
 describe("auth", () => {
   it("rejects missing bearer", async () => {
     expect((await SELF.fetch("http://lam/items")).status).toBe(401);
@@ -652,6 +705,161 @@ describe("paging", () => {
     await new Promise((r) => setTimeout(r, 1100));
     const page = await list("?limit=20");
     expect(page.find((i) => i.id === item.id).status).toBe("expired");
+  });
+});
+
+describe("history", () => {
+  const history = async (params: Record<string, string> = {}, headers: HeadersInit = AUTH) => {
+    const query = new URLSearchParams(params);
+    const response = await SELF.fetch(`http://lam/history${query.size === 0 ? "" : `?${query}`}`, { headers });
+    expect(response.status).toBe(200);
+    return response.json<any>();
+  };
+
+  it("allows master and device authorities while rejecting an absent bearer", async () => {
+    await insertHistoryFixture({ id: "history-auth", title: "history authority" });
+    const device = await registerFakeDevice("history-authority-device-credential");
+
+    expect((await SELF.fetch("http://lam/history")).status).toBe(401);
+    expect((await history({ q: "history authority" })).items.map((item: any) => item.id)).toEqual(["history-auth"]);
+    expect((await history({ q: "history authority" }, device.headers)).items.map((item: any) => item.id)).toEqual(["history-auth"]);
+  });
+
+  it("orders closed and effectively expired rows by their effective closure time", async () => {
+    await insertHistoryFixture({
+      id: "history-order-expired",
+      title: "history-order expired",
+      status: "open",
+      resolved_at: null,
+      expires_at: "2024-05-03T00:00:00.000Z",
+    });
+    await insertHistoryFixture({
+      id: "history-order-resolved",
+      title: "history-order resolved",
+      status: "resolved",
+      resolved_at: "2024-05-02T00:00:00.000Z",
+      expires_at: "2024-01-01T00:00:00.000Z",
+    });
+    await insertHistoryFixture({
+      id: "history-order-dismissed",
+      title: "history-order dismissed",
+      status: "dismissed",
+      resolved_at: "2024-05-01T00:00:00.000Z",
+    });
+    await insertHistoryFixture({
+      id: "history-order-open-future",
+      title: "history-order open future",
+      status: "open",
+      resolved_at: null,
+      expires_at: "2999-05-04T00:00:00.000Z",
+    });
+    await insertHistoryFixture({
+      id: "history-order-open-no-ttl",
+      title: "history-order open without ttl",
+      status: "open",
+      resolved_at: null,
+      expires_at: null,
+    });
+
+    const page = await history({ q: "history-order", limit: "10" });
+
+    expect(page.items.map((item: any) => item.id)).toEqual([
+      "history-order-expired",
+      "history-order-resolved",
+      "history-order-dismissed",
+    ]);
+    expect(page.items[0]).toMatchObject({
+      id: "history-order-expired",
+      status: "expired",
+      resolved_at: null,
+      expires_at: "2024-05-03T00:00:00.000Z",
+    });
+    expect(page.next_cursor).toBeNull();
+  });
+
+  it("uses the ID as a descending tie-break and continues an opaque cursor without overlap", async () => {
+    for (const id of ["history-page-a", "history-page-b", "history-page-c"]) {
+      await insertHistoryFixture({
+        id,
+        title: "history-page equal closure",
+        resolved_at: "2024-04-01T12:00:00.000Z",
+      });
+    }
+
+    const first = await history({ q: "history-page equal closure", limit: "2" });
+    expect(first.items.map((item: any) => item.id)).toEqual(["history-page-c", "history-page-b"]);
+    expect(first.next_cursor).toBe("eyJjbG9zZWRfYXQiOiIyMDI0LTA0LTAxVDEyOjAwOjAwLjAwMFoiLCJpZCI6Imhpc3RvcnktcGFnZS1iIn0");
+
+    const second = await history({ q: "history-page equal closure", limit: "2", cursor: first.next_cursor });
+    expect(second.items.map((item: any) => item.id)).toEqual(["history-page-a"]);
+    expect(second.next_cursor).toBeNull();
+    expect([...first.items, ...second.items].map((item: any) => item.id)).toEqual([
+      "history-page-c",
+      "history-page-b",
+      "history-page-a",
+    ]);
+  });
+
+  it("rejects malformed cursors", async () => {
+    expect((await SELF.fetch("http://lam/history?cursor=not-base64url", { headers: AUTH })).status).toBe(400);
+  });
+
+  it("searches title, name, body, and legacy source while treating LIKE characters literally", async () => {
+    await insertHistoryFixture({ id: "history-search-title", title: "Literal % title" });
+    await insertHistoryFixture({ id: "history-search-name", title: "name target", name: "Literal_Name" });
+    await insertHistoryFixture({ id: "history-search-body", title: "body target", body: "Literal \\ body" });
+    await insertHistoryFixture({
+      id: "history-search-source",
+      title: "source target",
+      source_host: "legacyhost",
+      source_project: "legacyproject",
+    });
+    await insertHistoryFixture({
+      id: "history-search-decoy",
+      title: "Literal X title",
+      name: "LiteralXName",
+      body: "Literal X body",
+      source_host: "legacyhost",
+      source_project: "otherproject",
+    });
+
+    expect((await history({ q: "%" })).items.map((item: any) => item.id)).toEqual(["history-search-title"]);
+    expect((await history({ q: "_" })).items.map((item: any) => item.id)).toEqual(["history-search-name"]);
+    expect((await history({ q: "\\" })).items.map((item: any) => item.id)).toEqual(["history-search-body"]);
+    expect((await history({ q: "LEGACYHOST:LEGACYPROJECT" })).items.map((item: any) => item.id)).toEqual(["history-search-source"]);
+  });
+
+  it("filters by priority before pagination", async () => {
+    await insertHistoryFixture({ id: "history-priority-low", title: "history-priority", priority: "low" });
+    await insertHistoryFixture({ id: "history-priority-critical", title: "history-priority", priority: "critical" });
+
+    const page = await history({ q: "history-priority", priority: "critical", limit: "1" });
+
+    expect(page.items.map((item: any) => item.id)).toEqual(["history-priority-critical"]);
+    expect(page.next_cursor).toBeNull();
+  });
+
+  it("filters plain, choice, and checklist requests with checklist precedence", async () => {
+    await insertHistoryFixture({ id: "history-type-plain", title: "history-type" });
+    await insertHistoryFixture({ id: "history-type-choice", title: "history-type", choices: ["yes", "no"] });
+    await insertHistoryFixture({
+      id: "history-type-checklist",
+      title: "history-type",
+      checks: [{ label: "verify", done: true, at: "2024-01-02T00:00:00.000Z" }],
+    });
+    await insertHistoryFixture({
+      id: "history-type-both",
+      title: "history-type",
+      choices: ["yes"],
+      checks: [{ label: "legacy", done: true, at: "2024-01-02T00:00:00.000Z" }],
+    });
+
+    expect((await history({ q: "history-type", type: "plain" })).items.map((item: any) => item.id)).toEqual(["history-type-plain"]);
+    expect((await history({ q: "history-type", type: "choice" })).items.map((item: any) => item.id)).toEqual(["history-type-choice"]);
+    expect((await history({ q: "history-type", type: "checklist" })).items.map((item: any) => item.id)).toEqual([
+      "history-type-checklist",
+      "history-type-both",
+    ]);
   });
 });
 

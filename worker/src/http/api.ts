@@ -1,7 +1,7 @@
 import { HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import { Effect, Fiber, Option, Schema } from "effect";
 import { Exec } from "../Env";
-import { CheckLabel, Item, NewItem, Resolution, Status } from "../domain/Item";
+import { CheckLabel, Item, NewItem, Priority, Resolution, Status } from "../domain/Item";
 import { Items } from "../services/Items";
 import { Auth, RequestAuthority } from "../services/Auth";
 import { Notify } from "../services/Notify";
@@ -20,6 +20,13 @@ const ListParams = Schema.Struct({
   status: Schema.optional(Status),
   limit: Schema.optional(Schema.NumberFromString.pipe(Schema.int(), Schema.between(1, 500))),
   before: Schema.optional(Schema.String),
+});
+const HistoryParams = Schema.Struct({
+  limit: Schema.optionalWith(Schema.NumberFromString.pipe(Schema.int(), Schema.between(1, 500)), { default: () => 50 }),
+  cursor: Schema.optional(Schema.String),
+  q: Schema.optional(Schema.String),
+  priority: Schema.optional(Priority),
+  type: Schema.optional(Schema.Literal("plain", "choice", "checklist")),
 });
 
 /** A waiter returns when the item closed, or (with `since`) when any mutation bumped the version past it. */
@@ -72,6 +79,14 @@ export const api = HttpRouter.empty.pipe(
       yield* RequestAuthority;
       const query = yield* HttpServerRequest.schemaSearchParams(ListParams);
       return yield* HttpServerResponse.json(yield* (yield* Items).list(query));
+    }),
+  ),
+  HttpRouter.get(
+    "/history",
+    Effect.gen(function* () {
+      yield* RequestAuthority;
+      const query = yield* HttpServerRequest.schemaSearchParams(HistoryParams);
+      return yield* HttpServerResponse.json(yield* (yield* Items).history(query));
     }),
   ),
   HttpRouter.get(
