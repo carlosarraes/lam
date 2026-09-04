@@ -50,7 +50,7 @@ private class CredentialStoreRuntime(
     private val persistence: CredentialPersistence,
     private val ioDispatcher: CoroutineDispatcher,
     scope: CoroutineScope,
-    private val onCredentialChanged: (String?) -> Unit,
+    private val onCredentialChanged: (PersistedCredential?) -> Unit,
 ) : CredentialStore {
     private val state = MutableSharedFlow<PairedServer?>(replay = 1)
     private val initialized = CompletableDeferred<Unit>()
@@ -66,7 +66,7 @@ private class CredentialStoreRuntime(
                         runCatching { persistence.recoverFromUnreadableRecord() }
                         null
                     }
-                    onCredentialChanged(restored?.credential)
+                    onCredentialChanged(restored)
                     state.emit(restored?.server)
                 }
             } finally {
@@ -83,7 +83,7 @@ private class CredentialStoreRuntime(
             initialized.await()
             lock.withLock {
                 persistence.save(server, credential)
-                onCredentialChanged(credential)
+                onCredentialChanged(PersistedCredential(server, credential))
                 state.emit(server)
             }
         }
@@ -93,10 +93,13 @@ private class CredentialStoreRuntime(
         withContext(ioDispatcher) {
             initialized.await()
             lock.withLock {
-                val deletionFailure = runCatching { persistence.clear() }.exceptionOrNull()
-                onCredentialChanged(null)
-                state.emit(null)
-                if (deletionFailure != null) throw CredentialStoreException()
+                clearCredentialState(
+                    deleteCredentialMaterial = persistence::clear,
+                    publishUnpaired = {
+                        onCredentialChanged(null)
+                        state.emit(null)
+                    },
+                )
             }
         }
     }
@@ -105,7 +108,7 @@ private class CredentialStoreRuntime(
 internal interface CredentialComposition {
     val credentialStore: CredentialStore
 
-    fun apiFor(server: PairedServer): LamApi
+    fun api(): LamApi?
 }
 
 internal fun createCredentialComposition(
@@ -113,13 +116,11 @@ internal fun createCredentialComposition(
     aadApplicationId: String = context.packageName,
     ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     scope: CoroutineScope = CoroutineScope(SupervisorJob() + ioDispatcher),
-    baseClient: OkHttpClient = OkHttpClient(),
 ): CredentialComposition = DefaultCredentialComposition(
     context,
     aadApplicationId,
     ioDispatcher,
     scope,
-    baseClient,
 )
 
 private class DefaultCredentialComposition(
@@ -127,23 +128,28 @@ private class DefaultCredentialComposition(
     aadApplicationId: String,
     ioDispatcher: CoroutineDispatcher,
     scope: CoroutineScope,
-    private val baseClient: OkHttpClient,
 ) : CredentialComposition {
-    private val credential = AtomicReference<String?>(null)
+    private val pairedCredential = AtomicReference<PersistedCredential?>(null)
+    private val baseClient = OkHttpClient()
 
     override val credentialStore: CredentialStore = KeystoreCredentialStore(
         context = context,
         aadApplicationId = aadApplicationId,
         ioDispatcher = ioDispatcher,
         scope = scope,
-        onCredentialChanged = credential::set,
+        onCredentialChanged = pairedCredential::set,
     )
 
-    override fun apiFor(server: PairedServer): LamApi = OkHttpLamApi(
-        baseUrl = server.serverUrl.toHttpUrl(),
-        credentialProvider = credential::get,
-        baseClient = baseClient,
-    )
+    override fun api(): LamApi? {
+        val snapshot = pairedCredential.get() ?: return null
+        return OkHttpLamApi(
+            baseUrl = snapshot.server.serverUrl.toHttpUrl(),
+            credentialProvider = {
+                pairedCredential.get()?.takeIf { it === snapshot }?.credential
+            },
+            baseClient = baseClient,
+        )
+    }
 }
 
 private class KeystoreCredentialStore(
@@ -151,7 +157,7 @@ private class KeystoreCredentialStore(
     aadApplicationId: String,
     ioDispatcher: CoroutineDispatcher,
     scope: CoroutineScope,
-    onCredentialChanged: (String?) -> Unit,
+    onCredentialChanged: (PersistedCredential?) -> Unit,
 ) : CredentialStore {
     private val runtime = CredentialStoreRuntime(
         persistence = KeystoreCredentialPersistence(context, aadApplicationId),

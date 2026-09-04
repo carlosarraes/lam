@@ -4,7 +4,6 @@ import android.content.Context
 import dev.carraes.lam.items.LamApi
 import dev.carraes.lam.security.CredentialComposition
 import dev.carraes.lam.security.CredentialStore
-import dev.carraes.lam.security.PairedServer
 import dev.carraes.lam.security.createCredentialComposition
 
 class AppContainer(
@@ -14,5 +13,5 @@ class AppContainer(
 
     val credentialStore: CredentialStore = credentials.credentialStore
 
-    internal fun authenticatedApi(server: PairedServer): LamApi = credentials.apiFor(server)
+    internal fun authenticatedApi(): LamApi? = credentials.api()
 }

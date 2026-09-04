@@ -115,9 +115,11 @@ class KeystoreCredentialStoreTest {
             newStore().save(pairedServer(), CREDENTIAL)
             credentialsPreferences().edit().putString(corruptedKey, "not-base64!").commit()
 
-            val recreated = newStore()
+            val recoveredComposition = newComposition()
+            val recreated = recoveredComposition.credentialStore
 
             assertNull(recreated.observe().first())
+            assertNull(recoveredComposition.api())
             assertTrue(credentialsPreferences().all.isEmpty())
             assertFalse(androidKeyStore().containsAlias(defaultAlias()))
         }
@@ -125,9 +127,11 @@ class KeystoreCredentialStoreTest {
         newStore().save(pairedServer(), CREDENTIAL)
         androidKeyStore().deleteEntry(defaultAlias())
 
-        val recreatedAfterKeyLoss = newStore()
+        val recoveredAfterKeyLoss = newComposition()
+        val recreatedAfterKeyLoss = recoveredAfterKeyLoss.credentialStore
 
         assertNull(recreatedAfterKeyLoss.observe().first())
+        assertNull(recoveredAfterKeyLoss.api())
         assertTrue(credentialsPreferences().all.isEmpty())
         assertFalse(androidKeyStore().containsAlias(defaultAlias()))
     }
@@ -175,12 +179,16 @@ class KeystoreCredentialStoreTest {
     @Test
     fun safeCompositionAuthenticatesWithoutExposingTheCredential() = runBlocking {
         MockWebServer().use { server ->
-            server.enqueue(MockResponse().setHeader("Content-Type", "application/json").setBody("[]"))
+            repeat(2) {
+                server.enqueue(MockResponse().setHeader("Content-Type", "application/json").setBody("[]"))
+            }
             val composition = createCredentialComposition(context)
             val paired = pairedServer().copy(serverUrl = server.url("/").toString())
 
+            assertNull(composition.api())
             composition.credentialStore.save(paired, CREDENTIAL)
-            composition.apiFor(paired).listOpenItems()
+            val authenticatedApi = requireNotNull(composition.api())
+            authenticatedApi.listOpenItems()
 
             assertEquals("Bearer $CREDENTIAL", server.takeRequest().getHeader("Authorization"))
             assertFalse(
@@ -191,6 +199,14 @@ class KeystoreCredentialStoreTest {
                 },
             )
             assertFalse(composition.credentialStore.observe().first().toString().contains(CREDENTIAL))
+
+            val recreated = createCredentialComposition(context)
+            assertEquals(paired, recreated.credentialStore.observe().first())
+            requireNotNull(recreated.api()).listOpenItems()
+            assertEquals("Bearer $CREDENTIAL", server.takeRequest().getHeader("Authorization"))
+
+            recreated.credentialStore.clear()
+            assertNull(recreated.api())
         }
     }
 
@@ -226,17 +242,19 @@ class KeystoreCredentialStoreTest {
     @Test
     fun observeWaitsForDeterministicRestoreBeforeEmittingUnpaired() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
-        val store = createCredentialComposition(
+        val composition = createCredentialComposition(
             context = context,
             ioDispatcher = dispatcher,
             scope = this,
-        ).credentialStore
-        val first = async { store.observe().first() }
+        )
+        val first = async { composition.credentialStore.observe().first() }
 
         assertFalse(first.isCompleted)
+        assertNull(composition.api())
         testScheduler.runCurrent()
 
         assertNull(first.await())
+        assertNull(composition.api())
     }
 
     private suspend fun eraseTestState() {
@@ -247,10 +265,14 @@ class KeystoreCredentialStoreTest {
 
     private fun newStore(
         aadApplicationId: String = context.packageName,
-    ): CredentialStore = createCredentialComposition(
+    ): CredentialStore = newComposition(aadApplicationId).credentialStore
+
+    private fun newComposition(
+        aadApplicationId: String = context.packageName,
+    ): CredentialComposition = createCredentialComposition(
         context = context,
         aadApplicationId = aadApplicationId,
-    ).credentialStore
+    )
 
     private fun pairedServer() = PairedServer(
         serverUrl = "https://lam.example/",

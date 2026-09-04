@@ -19,8 +19,15 @@ class CredentialStoreContractTest {
                 (method.returnType == String::class.java ||
                     method.returnType.name.startsWith("kotlin.jvm.functions.Function"))
         }
+        val acceptsDestinationOrTransport = { method: java.lang.reflect.Method ->
+            method.parameterTypes.any {
+                it.name == PairedServer::class.java.name ||
+                    it.name.startsWith("okhttp3.")
+            }
+        }
         assertFalse(CredentialStore::class.java.declaredMethods.any(returnsCredential))
         assertFalse(AppContainer::class.java.declaredMethods.any(returnsCredential))
+        assertFalse(AppContainer::class.java.declaredMethods.any(acceptsDestinationOrTransport))
         assertFalse(
             AppContainer::class.java.declaredMethods.any {
                 it.name.contains("credentialProvider", ignoreCase = true) ||
@@ -39,11 +46,32 @@ class CredentialStoreContractTest {
         assertFalse(
             fileFacade.declaredMethods.any { method ->
                 !Modifier.isPrivate(method.modifiers) &&
-                    method.parameterTypes.any {
-                        it.name.startsWith("kotlin.jvm.functions.Function")
+                    method.parameterTypes.zip(method.genericParameterTypes).any { (raw, generic) ->
+                        raw.name.startsWith("kotlin.jvm.functions.Function") &&
+                            generic.typeName.contains("java.lang.String")
                     }
             },
         )
+        assertFalse(
+            fileFacade.declaredMethods.any { method ->
+                !Modifier.isPrivate(method.modifiers) &&
+                    acceptsDestinationOrTransport(method)
+            },
+        )
+        val factory = fileFacade.declaredMethods.single {
+            it.name == "createCredentialComposition"
+        }
+        assertEquals(
+            listOf(
+                "android.content.Context",
+                "java.lang.String",
+                "kotlinx.coroutines.CoroutineDispatcher",
+                "kotlinx.coroutines.CoroutineScope",
+            ),
+            factory.parameterTypes.map { it.name },
+        )
+        val composition = Class.forName("dev.carraes.lam.security.CredentialComposition")
+        assertFalse(composition.declaredMethods.any(acceptsDestinationOrTransport))
         listOf(
             "dev.carraes.lam.security.KeystoreCredentialStore",
             "dev.carraes.lam.security.CredentialStoreRuntime",
@@ -75,6 +103,22 @@ class CredentialStoreContractTest {
         store.clear()
 
         assertNull(store.observe().first())
+    }
+
+    @Test
+    fun `explicit deletion failure is sanitized after state becomes unpaired`() = runTest {
+        var unpaired = false
+
+        val error = runCatching {
+            clearCredentialState(
+                deleteCredentialMaterial = { error("backend detail must not escape") },
+                publishUnpaired = { unpaired = true },
+            )
+        }.exceptionOrNull()
+
+        assertEquals("could not clear device credential", error?.message)
+        assertFalse(error?.message.orEmpty().contains("backend detail"))
+        assertEquals(true, unpaired)
     }
 }
 

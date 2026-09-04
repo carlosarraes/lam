@@ -12,3 +12,12 @@ interface CredentialStore {
 }
 
 internal class CredentialStoreException : IOException("could not clear device credential")
+
+internal suspend fun clearCredentialState(
+    deleteCredentialMaterial: () -> Unit,
+    publishUnpaired: suspend () -> Unit,
+) {
+    val deletionFailure = runCatching(deleteCredentialMaterial).exceptionOrNull()
+    publishUnpaired()
+    if (deletionFailure != null) throw CredentialStoreException()
+}
