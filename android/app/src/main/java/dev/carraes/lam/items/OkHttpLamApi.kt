@@ -9,6 +9,10 @@ import kotlinx.serialization.SerializationException
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import okhttp3.Authenticator
 import okhttp3.HttpUrl
 import okhttp3.Interceptor
@@ -33,6 +37,8 @@ class OkHttpLamApi(
         .readTimeout(20, TimeUnit.SECONDS)
         .writeTimeout(20, TimeUnit.SECONDS)
         .retryOnConnectionFailure(false)
+        .followRedirects(false)
+        .followSslRedirects(false)
         .authenticator(Authenticator.NONE)
         .proxyAuthenticator(Authenticator.NONE)
         .addInterceptor(BearerInterceptor(credentialProvider))
@@ -107,11 +113,31 @@ class OkHttpLamApi(
 
     override suspend fun updateDevice(update: DeviceUpdateDto): DeviceRegistrationDto = execute(
         authenticatedRequest("device")
-            .patch(json.encodeToString(update).toRequestBody(JSON_MEDIA_TYPE))
+            .patch(encodeDeviceUpdate(update).toRequestBody(JSON_MEDIA_TYPE))
             .build(),
         ReadPolicy.NEVER_RETRY,
         DeviceRegistrationDto.serializer(),
+        sensitiveValues = when (val token = update.fcmToken) {
+            is FcmTokenUpdate.Set -> listOf(token.value)
+            FcmTokenUpdate.Clear,
+            FcmTokenUpdate.Unchanged,
+            -> emptyList()
+        },
     )
+
+    private fun encodeDeviceUpdate(update: DeviceUpdateDto): String {
+        val body = buildJsonObject {
+            update.name?.let { put("name", it) }
+            when (val fcmToken = update.fcmToken) {
+                FcmTokenUpdate.Unchanged -> Unit
+                FcmTokenUpdate.Clear -> put("fcm_token", JsonNull)
+                is FcmTokenUpdate.Set -> put("fcm_token", fcmToken.value)
+            }
+            update.appVersion?.let { put("app_version", it) }
+            update.androidVersion?.let { put("android_version", it) }
+        }
+        return json.encodeToString(JsonObject.serializer(), body)
+    }
 
     override suspend fun revokeDevice(): DeviceSummaryDto = execute(
         authenticatedRequest("device")
@@ -131,7 +157,7 @@ class OkHttpLamApi(
             .build(),
         ReadPolicy.NEVER_RETRY,
         PairingClaimResponseDto.serializer(),
-        sensitiveValues = listOf(request.secret),
+        sensitiveValues = listOfNotNull(request.secret, request.fcmToken),
     )
 
     private suspend fun <T> postJson(
@@ -167,9 +193,9 @@ class OkHttpLamApi(
                     val rawBody = response.body.string()
                     val safeBody = safeResponseBody(
                         rawBody,
-                        sensitiveValues + listOfNotNull(credentialProvider()),
+                        sensitiveValues + listOfNotNull(response.request.sentBearerCredential()),
                     )
-                    if (!response.isSuccessful) throw response.toApiError(safeBody)
+                    if (!response.isSuccessful) throw response.toApiError(rawBody, safeBody)
                     try {
                         json.decodeFromString(serializer, rawBody)
                     } catch (_: SerializationException) {
@@ -189,13 +215,28 @@ class OkHttpLamApi(
         error("unreachable")
     }
 
-    private fun okhttp3.Response.toApiError(safeBody: String?): ApiError = when (code) {
+    private fun okhttp3.Response.toApiError(rawBody: String, safeBody: String?): ApiError = when (code) {
         400 -> ApiError.Validation(safeBody)
         401 -> ApiError.Unauthorized(safeBody)
         403 -> ApiError.Forbidden(safeBody)
-        409 -> ApiError.AlreadyClosed(safeBody)
+        409 -> when (decodeWorkerError(rawBody)) {
+            "already closed" -> ApiError.AlreadyClosed(safeBody)
+            "expired" -> ApiError.Server(code, safeBody, ApiConflictCode.PAIRING_EXPIRED)
+            "consumed" -> ApiError.Server(code, safeBody, ApiConflictCode.PAIRING_CONSUMED)
+            "cancelled" -> ApiError.Server(code, safeBody, ApiConflictCode.PAIRING_CANCELLED)
+            "concurrent update, retry" -> ApiError.Server(code, safeBody, ApiConflictCode.CONCURRENT_UPDATE)
+            else -> ApiError.Server(code, safeBody)
+        }
         else -> ApiError.Server(code, safeBody)
     }
+
+    private fun decodeWorkerError(rawBody: String): String? = runCatching {
+        json.decodeFromString(WorkerErrorBody.serializer(), rawBody).error
+    }.getOrNull()
+
+    private fun Request.sentBearerCredential(): String? = header("Authorization")
+        ?.takeIf { it.startsWith(BEARER_PREFIX) }
+        ?.removePrefix(BEARER_PREFIX)
 
     private enum class ReadPolicy {
         RETRY_ONCE,
@@ -223,6 +264,7 @@ class OkHttpLamApi(
     companion object {
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private val EMPTY_BODY = ByteArray(0).toRequestBody(null)
+        private const val BEARER_PREFIX = "Bearer "
         private val SENSITIVE_JSON_VALUE = Regex(
             "(\"(?:credential|secret|fcm_token|authorization)\"\\s*:\\s*)\"(?:\\\\.|[^\"\\\\])*\"",
             RegexOption.IGNORE_CASE,
@@ -258,3 +300,6 @@ private data class TextResolution(val text: String)
 
 @kotlinx.serialization.Serializable
 private data class CheckUpdate(val done: Boolean)
+
+@kotlinx.serialization.Serializable
+private data class WorkerErrorBody(val error: String? = null)

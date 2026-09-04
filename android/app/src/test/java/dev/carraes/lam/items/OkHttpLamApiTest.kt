@@ -2,8 +2,10 @@ package dev.carraes.lam.items
 
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.test.runTest
+import mockwebserver3.Dispatcher
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
+import mockwebserver3.RecordedRequest
 import mockwebserver3.SocketEffect
 import okhttp3.HttpUrl
 import org.junit.After
@@ -168,7 +170,7 @@ class OkHttpLamApiTest {
         server.enqueue(jsonResponse(body = DEVICE_JSON))
         val update = DeviceUpdateDto(
             name = "Carlos phone",
-            fcmToken = null,
+            fcmToken = FcmTokenUpdate.Clear,
             appVersion = "0.1.0",
             androidVersion = "16",
         )
@@ -182,6 +184,42 @@ class OkHttpLamApiTest {
                 "{\"name\":\"Carlos phone\",\"fcm_token\":null,\"app_version\":\"0.1.0\",\"android_version\":\"16\"}",
             )
         }
+    }
+
+    @Test
+    fun `review fix rename-only device update omits fcm token`() = runTest {
+        server.enqueue(jsonResponse(body = DEVICE_JSON))
+
+        api.updateDevice(DeviceUpdateDto(name = "Renamed phone"))
+
+        server.takeRequest().assertJsonBody("{\"name\":\"Renamed phone\"}")
+    }
+
+    @Test
+    fun `review fix platform-only device update omits fcm token`() = runTest {
+        server.enqueue(jsonResponse(body = DEVICE_JSON))
+
+        api.updateDevice(DeviceUpdateDto(appVersion = "0.2.0", androidVersion = "17"))
+
+        server.takeRequest().assertJsonBody("{\"app_version\":\"0.2.0\",\"android_version\":\"17\"}")
+    }
+
+    @Test
+    fun `review fix token rotation sends the new fcm token`() = runTest {
+        server.enqueue(jsonResponse(body = DEVICE_JSON))
+
+        api.updateDevice(DeviceUpdateDto(fcmToken = FcmTokenUpdate.Set("rotated-fcm-token")))
+
+        server.takeRequest().assertJsonBody("{\"fcm_token\":\"rotated-fcm-token\"}")
+    }
+
+    @Test
+    fun `review fix token clearing sends an explicit null fcm token`() = runTest {
+        server.enqueue(jsonResponse(body = DEVICE_JSON))
+
+        api.updateDevice(DeviceUpdateDto(fcmToken = FcmTokenUpdate.Clear))
+
+        server.takeRequest().assertJsonBody("{\"fcm_token\":null}")
     }
 
     @Test
@@ -227,7 +265,6 @@ class OkHttpLamApiTest {
             400 to ApiError.Validation::class.java,
             401 to ApiError.Unauthorized::class.java,
             403 to ApiError.Forbidden::class.java,
-            409 to ApiError.AlreadyClosed::class.java,
             404 to ApiError.Server::class.java,
             500 to ApiError.Server::class.java,
         )
@@ -244,25 +281,59 @@ class OkHttpLamApiTest {
     }
 
     @Test
-    fun `pairing conflict preserves its safe machine code without retaining the secret`() = runTest {
-        server.enqueue(jsonResponse(409, "{\"error\":\"expired\",\"echo\":\"one-time-secret\"}"))
+    fun `review fix already-closed conflict maps only the deployed already-closed code`() = runTest {
+        server.enqueue(jsonResponse(409, "{\"error\":\"already closed\"}"))
 
-        val error = expectError<ApiError.AlreadyClosed> {
-            api.claimPairing(
-                "session",
-                PairingClaimRequestDto("one-time-secret", "Phone", null, "0.1.0", "16"),
-            )
+        val error = expectError<ApiError.AlreadyClosed> { api.dismiss("closed-item") }
+
+        assertEquals(409, error.statusCode)
+    }
+
+    @Test
+    fun `review fix pairing conflicts retain distinct lifecycle codes`() = runTest {
+        val cases = listOf(
+            "expired" to ApiConflictCode.PAIRING_EXPIRED,
+            "consumed" to ApiConflictCode.PAIRING_CONSUMED,
+            "cancelled" to ApiConflictCode.PAIRING_CANCELLED,
+        )
+
+        cases.forEach { (wireCode, expectedCode) ->
+            server.enqueue(jsonResponse(409, "{\"error\":\"$wireCode\",\"echo\":\"one-time-secret\"}"))
+
+            val error = expectError<ApiError.Server> {
+                api.claimPairing(
+                    "session",
+                    PairingClaimRequestDto("one-time-secret", "Phone", null, "0.1.0", "16"),
+                )
+            }
+
+            assertEquals(409, error.statusCode)
+            assertEquals(expectedCode, error.conflictCode)
+            assertTrue(error.responseBody.orEmpty().contains(wireCode))
+            assertFalse(error.responseBody.orEmpty().contains("one-time-secret"))
         }
+    }
 
-        assertTrue(error.responseBody.orEmpty().contains("expired"))
-        assertFalse(error.responseBody.orEmpty().contains("one-time-secret"))
+    @Test
+    fun `review fix concurrent-update conflict is not described as already closed`() = runTest {
+        server.enqueue(jsonResponse(409, "{\"error\":\"concurrent update, retry\"}"))
+
+        val error = expectError<ApiError.Server> { api.setCheck("item", 0, true) }
+
+        assertEquals(ApiConflictCode.CONCURRENT_UPDATE, error.conflictCode)
+        assertFalse(error.message.orEmpty().contains("no longer open"))
     }
 
     @Test
     fun `request and response DTO strings redact credentials secrets and push tokens`() {
         val claim = PairingClaimRequestDto("one-time-secret", "Phone", "fcm-secret", "0.1.0", "16")
         val claimed = PairingClaimResponseDto("device-credential", DEVICE)
-        val update = DeviceUpdateDto("Phone", "fcm-secret", "0.1.0", "16")
+        val update = DeviceUpdateDto(
+            name = "Phone",
+            fcmToken = FcmTokenUpdate.Set("fcm-secret"),
+            appVersion = "0.1.0",
+            androidVersion = "16",
+        )
 
         assertFalse(claim.toString().contains("one-time-secret"))
         assertFalse(claim.toString().contains("fcm-secret"))
@@ -283,6 +354,114 @@ class OkHttpLamApiTest {
 
         assertFalse(error.responseBody.orEmpty().contains("returned-private-token"))
         assertTrue(error.responseBody.orEmpty().contains("[redacted]"))
+    }
+
+    @Test
+    fun `review fix HTTP-preserving redirect cannot replay a mutation`() = runTest {
+        server.enqueue(redirectResponse(307, server.url("/redirect-target")))
+        server.enqueue(jsonResponse(body = RESOLVED_ITEM_JSON))
+
+        val error = expectError<ApiError.Server> { api.replyChoice("item", "yes") }
+
+        assertEquals(307, error.statusCode)
+        assertEquals(1, server.requestCount)
+        assertEquals("/api/items/item/resolve", server.takeRequest().target)
+        assertNull(server.takeRequest(100, TimeUnit.MILLISECONDS))
+    }
+
+    @Test
+    fun `review fix cross-scheme redirect cannot replay a mutation`() = runTest {
+        val httpsTarget = server.url("/secure-target").newBuilder().scheme("https").build()
+        server.enqueue(redirectResponse(308, httpsTarget))
+        server.enqueue(jsonResponse(body = RESOLVED_ITEM_JSON))
+
+        val error = expectError<ApiError.Server> { api.dismiss("item") }
+
+        assertEquals(308, error.statusCode)
+        assertEquals(1, server.requestCount)
+        assertEquals("/api/items/item/dismiss", server.takeRequest().target)
+        assertNull(server.takeRequest(100, TimeUnit.MILLISECONDS))
+    }
+
+    @Test
+    fun `review fix errors redact the bearer actually sent before provider rotation or clear`() = runTest {
+        listOf<String?>("rotated-credential", null).forEachIndexed { index, replacement ->
+            val isolatedServer = MockWebServer()
+            isolatedServer.start()
+            try {
+                val sentCredential = "sent-credential-$index"
+                var credential: String? = sentCredential
+                isolatedServer.dispatcher = object : Dispatcher() {
+                    override fun dispatch(request: RecordedRequest): MockResponse {
+                        credential = replacement
+                        return jsonResponse(500, "{\"arbitrary_echo\":\"$sentCredential\"}")
+                    }
+                }
+                val isolatedApi = OkHttpLamApi(isolatedServer.url("/"), credentialProvider = { credential })
+
+                val error = expectError<ApiError.Server> { isolatedApi.getItem("item") }
+
+                assertFalse(error.responseBody.orEmpty().contains(sentCredential))
+                assertTrue(error.responseBody.orEmpty().contains("[redacted]"))
+            } finally {
+                isolatedServer.close()
+            }
+        }
+    }
+
+    @Test
+    fun `review fix non-success claim redacts arbitrary secret and token echoes`() = runTest {
+        server.enqueue(jsonResponse(400, "{\"echo_a\":\"claim-secret\",\"echo_b\":\"claim-fcm\"}"))
+
+        val error = expectError<ApiError.Validation> {
+            api.claimPairing(
+                "session",
+                PairingClaimRequestDto("claim-secret", "Phone", "claim-fcm", "0.1.0", "16"),
+            )
+        }
+
+        assertNoSensitiveValues(error, "claim-secret", "claim-fcm")
+    }
+
+    @Test
+    fun `review fix malformed success claim redacts arbitrary secret and token echoes`() = runTest {
+        server.enqueue(
+            jsonResponse(
+                201,
+                "{\"credential\":\"returned-token\",\"device\":{},\"echo_a\":\"claim-secret\",\"echo_b\":\"claim-fcm\"}",
+            ),
+        )
+
+        val error = expectError<ApiError.Server> {
+            api.claimPairing(
+                "session",
+                PairingClaimRequestDto("claim-secret", "Phone", "claim-fcm", "0.1.0", "16"),
+            )
+        }
+
+        assertNoSensitiveValues(error, "returned-token", "claim-secret", "claim-fcm")
+    }
+
+    @Test
+    fun `review fix non-success device update redacts arbitrary token echoes`() = runTest {
+        server.enqueue(jsonResponse(400, "{\"arbitrary_echo\":\"update-fcm\"}"))
+
+        val error = expectError<ApiError.Validation> {
+            api.updateDevice(DeviceUpdateDto(fcmToken = FcmTokenUpdate.Set("update-fcm")))
+        }
+
+        assertNoSensitiveValues(error, "update-fcm")
+    }
+
+    @Test
+    fun `review fix malformed success device update redacts arbitrary token echoes`() = runTest {
+        server.enqueue(jsonResponse(200, "{\"arbitrary_echo\":\"update-fcm\"}"))
+
+        val error = expectError<ApiError.Server> {
+            api.updateDevice(DeviceUpdateDto(fcmToken = FcmTokenUpdate.Set("update-fcm")))
+        }
+
+        assertNoSensitiveValues(error, "update-fcm")
     }
 
     @Test
@@ -313,7 +492,7 @@ class OkHttpLamApiTest {
             { it.replyText("id", "answer") },
             { it.dismiss("id") },
             { it.setCheck("id", 0, true) },
-            { it.updateDevice(DeviceUpdateDto("Phone", null, "0.1.0", "16")) },
+            { it.updateDevice(DeviceUpdateDto(name = "Phone")) },
             { it.revokeDevice() },
             { it.claimPairing("session", PairingClaimRequestDto("secret", "Phone", null, "0.1.0", "16")) },
         )
@@ -352,6 +531,11 @@ class OkHttpLamApiTest {
         .onRequestStart(SocketEffect.CloseSocket())
         .build()
 
+    private fun redirectResponse(code: Int, location: HttpUrl): MockResponse = MockResponse.Builder()
+        .code(code)
+        .addHeader("Location", location)
+        .build()
+
     private inline fun <reified T : ApiError> expectError(block: () -> Unit): T = try {
         block()
         fail("Expected ${T::class.java.simpleName}")
@@ -364,6 +548,13 @@ class OkHttpLamApiTest {
     private fun mockwebserver3.RecordedRequest.assertJsonBody(expected: String) {
         assertEquals("application/json; charset=utf-8", headers["Content-Type"])
         assertEquals(expected, body?.utf8().orEmpty())
+    }
+
+    private fun assertNoSensitiveValues(error: ApiError, vararg sensitiveValues: String) {
+        sensitiveValues.forEach { sensitive ->
+            assertFalse(error.responseBody.orEmpty().contains(sensitive))
+        }
+        assertTrue(error.responseBody.orEmpty().contains("[redacted]"))
     }
 
     companion object {

@@ -114,15 +114,24 @@ data class DeviceSummaryDto(
     @SerialName("revoked_at") val revokedAt: String?,
 )
 
-@Serializable
 data class DeviceUpdateDto(
-    val name: String,
-    @SerialName("fcm_token") val fcmToken: String?,
-    @SerialName("app_version") val appVersion: String,
-    @SerialName("android_version") val androidVersion: String,
+    val name: String? = null,
+    val fcmToken: FcmTokenUpdate = FcmTokenUpdate.Unchanged,
+    val appVersion: String? = null,
+    val androidVersion: String? = null,
 ) {
     override fun toString(): String =
         "DeviceUpdateDto(name=$name, fcmToken=${fcmToken.redacted()}, appVersion=$appVersion, androidVersion=$androidVersion)"
+}
+
+sealed interface FcmTokenUpdate {
+    data object Unchanged : FcmTokenUpdate
+
+    data object Clear : FcmTokenUpdate
+
+    data class Set(val value: String) : FcmTokenUpdate {
+        override fun toString(): String = "Set(value=[redacted])"
+    }
 }
 
 @Serializable
@@ -146,3 +155,9 @@ data class PairingClaimResponseDto(
 }
 
 private fun String?.redacted(): String = if (this == null) "null" else "[redacted]"
+
+private fun FcmTokenUpdate.redacted(): String = when (this) {
+    FcmTokenUpdate.Unchanged -> "Unchanged"
+    FcmTokenUpdate.Clear -> "Clear"
+    is FcmTokenUpdate.Set -> toString()
+}
