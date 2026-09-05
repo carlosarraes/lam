@@ -2,6 +2,7 @@ package dev.carraes.lam.ui.settings
 
 import dev.carraes.lam.items.*
 import dev.carraes.lam.diagnostics.*
+import dev.carraes.lam.ui.requests.fixedClock
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.test.*
@@ -18,7 +19,7 @@ class SettingsViewModelTest {
     @Test fun `failed revoke requires second confirmation and never retries automatically`() = runTest {
         val credentials = FakeCredentials()
         val api = FakeApi().apply { revokeError = ApiError.Transport("credential body secret") }
-        val repo = DefaultItemRepository(MemoryStorage(), { api }, credentials, backgroundScope)
+        val repo = DefaultItemRepository(MemoryStorage(), { api }, credentials, backgroundScope, fixedClock)
         repo.refresh()
         val vm = SettingsViewModel(repo, Diagnostics("1.0", "16", "Samsung S24"))
         runCurrent()
@@ -41,7 +42,7 @@ class SettingsViewModelTest {
     @Test fun `replacement session dismisses a stale local erase confirmation`() = runTest {
         val credentials = FakeCredentials()
         val api = FakeApi().apply { revokeError = ApiError.Transport("offline") }
-        val repo = DefaultItemRepository(MemoryStorage(), { api }, credentials, backgroundScope)
+        val repo = DefaultItemRepository(MemoryStorage(), { api }, credentials, backgroundScope, fixedClock)
         repo.refresh()
         val vm = SettingsViewModel(repo, Diagnostics("1.0", "16", "Samsung S24"))
         runCurrent()
@@ -58,7 +59,7 @@ class SettingsViewModelTest {
     @Test fun `diagnostics include versions origin counts last sync and bounded categories without raw errors`() = runTest {
         val storage = MemoryStorage()
         val api = FakeApi()
-        val repo = DefaultItemRepository(storage, { api }, FakeCredentials(), backgroundScope)
+        val repo = DefaultItemRepository(storage, { api }, FakeCredentials(), backgroundScope, fixedClock)
         repo.refresh()
         storage.upsert(listOf(ItemMapper.toEntity(ItemRepositoryTest.item("closed", StatusDto.RESOLVED))))
         api.readError = ApiError.Server(500, "Bearer SECRET FCM request body")

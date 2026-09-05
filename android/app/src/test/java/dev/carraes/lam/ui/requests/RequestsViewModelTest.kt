@@ -135,6 +135,7 @@ internal class RequestsFakeRepository : ItemRepository {
     }
     override fun item(id: String) = openItems.map { items -> items.find { it.id == id } }
     override fun history(query: HistoryQuery) = flowOf(emptyList<Item>())
+    override val cachedHistory = flowOf(emptyList<Item>())
     override suspend fun refreshItem(id: String) = false
     override suspend fun refreshHistory(query: HistoryQuery, cursor: String?) = HistoryResult(false, null)
     override suspend fun answer(id: String, answer: FinalAnswer) = false

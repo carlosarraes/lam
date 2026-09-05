@@ -16,6 +16,9 @@ abstract class ItemDao {
     @Query("SELECT * FROM items WHERE status = 'OPEN' ORDER BY CASE priority WHEN 'CRITICAL' THEN 0 WHEN 'NORMAL' THEN 1 ELSE 2 END, createdAtEpoch DESC, id DESC")
     abstract fun observeOpen(): Flow<List<ItemEntity>>
 
+    @Query("SELECT * FROM items WHERE status != 'OPEN' ORDER BY effectiveClosureAt DESC, id DESC")
+    abstract fun observeCachedHistory(): Flow<List<ItemEntity>>
+
     @Query("SELECT * FROM items WHERE id = :id")
     abstract fun observeItem(id: String): Flow<ItemEntity?>
 

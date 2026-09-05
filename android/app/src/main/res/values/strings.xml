@@ -98,6 +98,7 @@
     </plurals>
     <string name="history_offline">Offline · cached history</string>
     <string name="history_failed">Could not load history. Cached results are shown.</string>
+    <string name="history_incomplete">Searching cached history only. Results may be incomplete.</string>
     <string name="history_empty">No history results</string>
     <string name="history_more">Load older items</string>
     <string name="history_check_done">Completed: %s</string>

@@ -58,6 +58,7 @@ fun HistoryScreen(state: HistoryState, onQuery: (String) -> Unit, onType: (ItemT
                             ?: stringResource(R.string.requests_never_synced), style = MaterialTheme.typography.bodySmall)
                     }
                     if (state.loadFailed) item { Text(stringResource(R.string.history_failed)) }
+                    if (state.incomplete) item { Text(stringResource(R.string.history_incomplete)) }
                     if (state.items.isEmpty() && !state.loading) item { Text(stringResource(R.string.history_empty)) }
                     items(state.items, key = { it.id }) { row ->
                         Card(Modifier.fillMaxWidth().testTag("history:${row.id}")) {

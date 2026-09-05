@@ -1,10 +1,13 @@
 package dev.carraes.lam.ui.settings
 
 import androidx.activity.ComponentActivity
+import android.graphics.Bitmap
 import androidx.compose.runtime.*
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import java.io.File
 import dev.carraes.lam.items.*
 import dev.carraes.lam.security.PairedServer
 import dev.carraes.lam.ui.LamNav
@@ -38,12 +41,14 @@ class SettingsScreenTest {
         compose.onNodeWithText("https://example.com").assertExists()
         compose.onNodeWithText("SECRET", substring = true).assertDoesNotExist()
         compose.onNodeWithText("Notifications are disabled. Requests still sync when you open or refresh the app.").assertExists()
+        screenshot("task9-settings.png")
         compose.onNodeWithText("Android notification settings").performScrollTo().performClick()
         compose.onNodeWithText("Copy diagnostics").performScrollTo().performClick()
         compose.onNodeWithText("Unpair this device").performScrollTo().performClick()
         compose.runOnIdle { assertEquals(0, confirmations); assertEquals(1, copies); assertEquals(1, notificationLinks) }
         compose.onNodeWithText("Revoke and unpair").performClick()
         compose.onNodeWithText("The server could not confirm revocation. Erasing locally cannot revoke the remote credential. Use the CLI to revoke this device.").assertExists()
+        screenshot("task9-local-unpair.png")
         compose.runOnIdle { assertEquals(1, confirmations) }
         compose.onNodeWithText("Erase local data").performClick()
         compose.runOnIdle { assertEquals(2, confirmations) }
@@ -55,7 +60,7 @@ class SettingsScreenTest {
             "Approved", null, ResponseByDto.CLI, "2026-09-03T12:00:00Z", "2026-09-04T12:00:00Z", null, 2)
         val open = closed.copy(id = "open", title = "Cached request", status = StatusDto.OPEN)
         compose.setContent { LamTheme { LamNav(RequestsState(items = listOf(open), loading = false, stale = true), {}, {}, {}, {}, {},
-            historyContent = { onRequests, onSettings -> HistoryScreen(HistoryState(items = listOf(closed), stale = true), {}, {}, {}, {}, {}, {}, onRequests, onSettings) }) } }
+            historyContent = { onRequests, onSettings -> HistoryScreen(HistoryState(items = listOf(closed), stale = true, incomplete = true), {}, {}, {}, {}, {}, {}, onRequests, onSettings) }) } }
         compose.onNodeWithContentDescription("Switch queue").performClick()
         compose.onNodeWithText("History").performClick()
         compose.onNodeWithText("Completed release").assertExists()
@@ -66,8 +71,16 @@ class SettingsScreenTest {
         compose.onNodeWithText("Approve").assertDoesNotExist()
         compose.onNodeWithText("Quick response").assertDoesNotExist()
         compose.onNodeWithText("Dismiss").assertDoesNotExist()
+        compose.onNodeWithText("Searching cached history only. Results may be incomplete.").assertExists()
+        screenshot("task9-offline-history.png")
         compose.onNodeWithContentDescription("Switch queue").performClick()
         compose.onNodeWithText("Requests").performClick()
         compose.onNodeWithText("Cached request", useUnmergedTree = true).assertExists()
+    }
+
+    private fun screenshot(name: String) {
+        compose.waitForIdle()
+        val bitmap = requireNotNull(InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot())
+        File(compose.activity.externalCacheDir, name).outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
     }
 }

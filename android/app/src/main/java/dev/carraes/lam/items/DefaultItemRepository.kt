@@ -3,6 +3,8 @@ package dev.carraes.lam.items
 import dev.carraes.lam.security.CredentialStore
 import dev.carraes.lam.security.PairedServer
 import dev.carraes.lam.diagnostics.*
+import dev.carraes.lam.sync.ConnectivityStatus
+import kotlinx.coroutines.flow.StateFlow
 import java.time.Clock
 import java.time.Instant
 import java.util.UUID
@@ -31,6 +33,7 @@ internal class DefaultItemRepository(
     private val credentials: CredentialStore,
     scope: CoroutineScope,
     private val clock: Clock = Clock.systemUTC(),
+    private val connectivity: StateFlow<ConnectivityStatus> = MutableStateFlow(ConnectivityStatus(true, 0)),
 ) : ItemRepository, DeviceSettings {
     override suspend fun diagnosticData(): DiagnosticData {
         initialized.await()
@@ -42,7 +45,7 @@ internal class DefaultItemRepository(
         return operations.withLock {
             val current = stateLock.withLock {
                 if (generation != expectedSession || paired == null) null
-                else apiProvider()?.let { Session(generation, it) }
+                else apiProvider()?.let { Session(generation, it, connectivity.value.epoch) }
             } ?: return@withLock UnpairResult.SESSION_CHANGED
             try {
                 current.api.revokeDevice()
@@ -65,7 +68,7 @@ internal class DefaultItemRepository(
         credentialChanges.withLock {
             val current = stateLock.withLock {
                 if (generation != expectedSession || paired == null) null
-                else apiProvider()?.let { Session(generation, it) }
+                else apiProvider()?.let { Session(generation, it, connectivity.value.epoch) }
             } ?: return@withLock false
             clearSession(revoked = false, expected = current)
             true
@@ -82,6 +85,7 @@ internal class DefaultItemRepository(
     override val reconciliationSession = session.asStateFlow()
     private var paired: PairedServer? = null
     private var lastSuccess: Instant? = null
+    private var reconciledConnectionEpoch: Long? = null
     private val recentErrors = ArrayDeque<ErrorCategory>()
     // One read recovery at most: operations serialize, and stale state blocks the next final answer.
     private var unresolvedFinalAnswer: String? = null
@@ -90,6 +94,7 @@ internal class DefaultItemRepository(
     private val pairing = MutableSharedFlow<PairedServer?>(replay = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
 
     override val openItems = storage.openItems().map { it.map(ItemMapper::toItem) }
+    override val cachedHistory = storage.cachedHistory().map { it.map(ItemMapper::toItem) }
     override val syncState = state.asStateFlow()
     override val errors = errorEvents.receiveAsFlow()
     val credentialStore: CredentialStore = object : CredentialStore {
@@ -101,6 +106,17 @@ internal class DefaultItemRepository(
     override fun history(query: HistoryQuery) = storage.history(query.key).map { it.map(ItemMapper::toItem) }
 
     init {
+        scope.launch {
+            initialized.await()
+            connectivity.collect { network ->
+                stateLock.withLock {
+                    val previousConnection = state.value is SyncState.Current && reconciledConnectionEpoch != network.epoch
+                    if ((!network.available || previousConnection) && network == connectivity.value && paired != null) {
+                        state.value = SyncState.Stale(lastSuccess, ApiError.Transport("network_unavailable"))
+                    }
+                }
+            }
+        }
         scope.launch {
             // Drain the suspending publisher independently of the lock held by save/clear.
             credentials.observe().conflate().collect {
@@ -167,7 +183,7 @@ internal class DefaultItemRepository(
             return@operation false
         }
         // The generation guard prevents submission after unpair while the preflight read was pending.
-        if (!isCurrent(session)) return@operation false
+        if (!canSubmit(session)) return@operation false
         try {
             val result = when (answer) {
                 is FinalAnswer.Choice -> session.api.replyChoice(id, answer.value)
@@ -191,6 +207,10 @@ internal class DefaultItemRepository(
             if (i == index) check.copy(done = done, at = if (done) clock.instant().toString() else null) else check
         }
         if (!commit(session) { storage.optimistic(snapshot, snapshot.copy(canonical = snapshot.canonical.copy(checks = checks), optimisticTag = tag)) }) return@operation false
+        if (!canSubmit(session)) {
+            withContext(NonCancellable) { commit(session) { storage.rollback(snapshot, tag) } }
+            return@operation false
+        }
         try {
             val canonical = session.api.setCheck(id, index, done)
             commit(session) { storage.upsert(listOf(ItemMapper.toEntity(canonical))) }
@@ -244,6 +264,7 @@ internal class DefaultItemRepository(
 
     private suspend fun reconcile(session: Session): Boolean {
         var unresolved: String? = null
+        if (!connectionIsCurrent(session)) return false
         if (!commit(session) {
             state.value = SyncState.Refreshing
             unresolved = unresolvedFinalAnswer
@@ -255,13 +276,20 @@ internal class DefaultItemRepository(
             if (!commit(session) { storage.upsert(listOf(ItemMapper.toEntity(canonical))) }) return false
         }
         val items = session.api.listOpenItems().map(ItemMapper::toEntity)
-        return commit(session) {
+        var reconciled = false
+        val committed = commit(session) {
             val now = clock.instant()
             storage.reconcile(items, now)
             unresolvedFinalAnswer = null
             lastSuccess = now
-            state.value = SyncState.Current(now)
+            // Connectivity can change while the database transaction suspends. Its epoch is
+            // independent of credential identity, and availability alone is never reconciliation.
+            reconciled = connectionIsCurrent(session)
+            if (reconciled) reconciledConnectionEpoch = session.connectionEpoch
+            state.value = if (reconciled) SyncState.Current(now)
+                else SyncState.Stale(now, ApiError.Transport("network_changed"))
         }
+        return committed && reconciled
     }
 
     private suspend fun mutationFailed(session: Session, id: String, error: Exception, finalAnswer: Boolean = false) {
@@ -289,8 +317,12 @@ internal class DefaultItemRepository(
         initialized.await()
         return operations.withLock {
             val session = stateLock.withLock {
-                if (paired == null || (mutation && !state.value.mutationsEnabled)) null
-                else apiProvider()?.let { Session(generation, it) }
+                val network = connectivity.value
+                if (paired != null && (!network.available || state.value is SyncState.Current && reconciledConnectionEpoch != network.epoch)) {
+                    state.value = SyncState.Stale(lastSuccess, ApiError.Transport("network_unavailable"))
+                }
+                if (paired == null || !network.available || (mutation && !state.value.mutationsEnabled)) null
+                else apiProvider()?.let { Session(generation, it, network.epoch) }
             } ?: return@withLock false
             try {
                 block(session)
@@ -330,6 +362,7 @@ internal class DefaultItemRepository(
         session.value = null
         paired = null
         lastSuccess = null
+        reconciledConnectionEpoch = null
         recentErrors.clear()
         unresolvedFinalAnswer = null
         state.value = if (revoked) SyncState.Revoked else SyncState.Idle
@@ -367,6 +400,13 @@ internal class DefaultItemRepository(
 
     private suspend fun isCurrent(session: Session): Boolean = stateLock.withLock { session.generation == generation }
 
+    private fun connectionIsCurrent(session: Session): Boolean = connectivity.value.let { it.available && it.epoch == session.connectionEpoch }
+
+    private suspend fun canSubmit(session: Session): Boolean = stateLock.withLock {
+        session.generation == generation && connectionIsCurrent(session) &&
+            reconciledConnectionEpoch == session.connectionEpoch && state.value.mutationsEnabled
+    }
+
     private suspend fun commit(session: Session, write: suspend () -> Unit): Boolean = stateLock.withLock {
         if (session.generation != generation) false else {
             write()
@@ -374,7 +414,7 @@ internal class DefaultItemRepository(
         }
     }
 
-    private data class Session(val generation: Long, val api: LamApi)
+    private data class Session(val generation: Long, val api: LamApi, val connectionEpoch: Long)
 }
 
 internal class SessionCleanupException(failures: List<Exception>) :

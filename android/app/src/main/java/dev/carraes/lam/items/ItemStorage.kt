@@ -5,6 +5,7 @@ import kotlinx.coroutines.flow.Flow
 
 internal interface ItemStorage {
     fun openItems(): Flow<List<ItemEntity>>
+    fun cachedHistory(): Flow<List<ItemEntity>>
     fun item(id: String): Flow<ItemEntity?>
     fun history(key: String): Flow<List<ItemEntity>>
     suspend fun get(id: String): ItemEntity?

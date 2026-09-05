@@ -97,12 +97,14 @@ class ItemDaoTest {
         assertEquals(2, store.history("first").first().size)
         store.cacheHistory("first", emptyList(), true)
         assertTrue(store.history("first").first().isEmpty())
+        assertEquals(listOf("expired", "old"), store.cachedHistory().first().map { it.canonical.id })
         assertNotNull(store.get("old"))
         assertEquals(listOf("a"), store.openItems().first().map { it.canonical.id })
         store.clear()
         assertNull(store.get("old"))
         assertNull(store.lastSuccess())
         assertTrue(store.openItems().first().isEmpty())
+        assertTrue(store.cachedHistory().first().isEmpty())
     }
 
     @Test fun derivedExpirationCannotBeReopenedByAnOlderSnapshotWithTheSameVersion() = runTest {

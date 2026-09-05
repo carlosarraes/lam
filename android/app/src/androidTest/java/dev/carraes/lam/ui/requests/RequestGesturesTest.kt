@@ -153,6 +153,7 @@ internal class GestureRepository : ItemRepository {
     }
     override suspend fun refresh() = true
     override fun history(query: HistoryQuery) = flowOf(emptyList<Item>())
+    override val cachedHistory = flowOf(emptyList<Item>())
     override suspend fun refreshHistory(query: HistoryQuery, cursor: String?) = HistoryResult(false, null)
     override suspend fun unpair() = Unit
 }

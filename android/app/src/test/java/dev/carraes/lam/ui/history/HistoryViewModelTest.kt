@@ -3,6 +3,7 @@ package dev.carraes.lam.ui.history
 import dev.carraes.lam.items.*
 import dev.carraes.lam.items.ItemRepositoryTest.Companion.item
 import dev.carraes.lam.items.ItemRepositoryTest.Companion.NOW
+import dev.carraes.lam.ui.requests.fixedClock
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.test.*
@@ -16,11 +17,51 @@ class HistoryViewModelTest {
     @Before fun setup() { Dispatchers.setMain(StandardTestDispatcher()) }
     @After fun teardown() { Dispatchers.resetMain() }
 
+    @Test fun `new offline queries and filters search all cached closed rows with incomplete label`() = runTest {
+        val storage = MemoryStorage()
+        val api = FakeApi()
+        val repo = DefaultItemRepository(storage, { api }, FakeCredentials(), backgroundScope, fixedClock)
+        repo.refresh()
+        val cached = listOf(
+            item("critical", StatusDto.RESOLVED).copy(title = "Deploy", body = "Unique body", name = "Builder", priority = PriorityDto.CRITICAL, checks = emptyList()),
+            item("check", StatusDto.RESOLVED).copy(title = "Verify", name = "Reviewer", priority = PriorityDto.LOW),
+            item("plain", StatusDto.RESOLVED).copy(title = "Note", choices = emptyList(), checks = emptyList()),
+        )
+        api.historyRead = { _, _ -> HistoryPageDto(cached, null) }
+        val vm = HistoryViewModel(repo)
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { vm.state.collect() }
+        runCurrent()
+        assertFalse(vm.state.value.incomplete)
+        api.historyRead = { _, _ -> throw ApiError.Transport("offline") }
+        for ((query, id) in listOf("Deploy" to "critical", "unique body" to "critical", "Reviewer" to "check")) {
+            vm.setQuery(query); runCurrent()
+            assertEquals(id, vm.state.value.items.single().id)
+            assertTrue(vm.state.value.incomplete)
+        }
+        vm.setQuery("HOST:PROJECT"); runCurrent()
+        assertEquals(setOf("critical", "check", "plain"), vm.state.value.items.map { it.id }.toSet())
+        vm.setPriority(PriorityDto.CRITICAL); vm.setType(ItemTypeDto.CHOICE); runCurrent()
+        assertEquals("critical", vm.state.value.items.single().id)
+        vm.setPriority(null); vm.setType(ItemTypeDto.CHECKLIST); runCurrent()
+        assertEquals("check", vm.state.value.items.single().id)
+        vm.setType(ItemTypeDto.PLAIN); runCurrent()
+        assertEquals("plain", vm.state.value.items.single().id)
+        api.historyRead = { query, cursor ->
+            assertEquals(HistoryQuery("HOST:PROJECT", type = ItemTypeDto.PLAIN), query)
+            assertNull(cursor)
+            HistoryPageDto(listOf(item("remote", StatusDto.RESOLVED).copy(choices = emptyList(), checks = emptyList())), "opaque")
+        }
+        vm.refresh(); runCurrent()
+        assertEquals("remote", vm.state.value.items.single().id)
+        assertFalse(vm.state.value.incomplete)
+        assertEquals("opaque", vm.state.value.nextCursor)
+    }
+
     @Test fun `server search and filters replace results while opaque cursor appends tied closure rows`() = runTest {
         val storage = MemoryStorage()
         val api = FakeApi()
         api.open = listOf(item("open"))
-        val repo = DefaultItemRepository(storage, { api }, FakeCredentials(), backgroundScope)
+        val repo = DefaultItemRepository(storage, { api }, FakeCredentials(), backgroundScope, fixedClock)
         repo.refresh()
         val calls = mutableListOf<Pair<HistoryQuery, String?>>()
         api.historyRead = { query, cursor ->
@@ -55,7 +96,7 @@ class HistoryViewModelTest {
     @Test fun `failed read shows cached history and preserves cursor for retry`() = runTest {
         val storage = MemoryStorage()
         val api = FakeApi()
-        val repo = DefaultItemRepository(storage, { api }, FakeCredentials(), backgroundScope)
+        val repo = DefaultItemRepository(storage, { api }, FakeCredentials(), backgroundScope, fixedClock)
         repo.refresh()
         api.historyRead = { _, _ -> HistoryPageDto(listOf(item("cached", StatusDto.RESOLVED)), "next") }
         val vm = HistoryViewModel(repo)

@@ -3,6 +3,7 @@ package dev.carraes.lam.items
 import dev.carraes.lam.security.CredentialStore
 import dev.carraes.lam.security.PairedServer
 import dev.carraes.lam.sync.LifecycleReconciler
+import dev.carraes.lam.sync.ConnectivityStatus
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
@@ -31,6 +32,83 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ItemRepositoryTest {
+    @Test fun `a rapid loss and regain cannot reuse a previous successful connection epoch`() = runTest {
+        val network = MutableStateFlow(ConnectivityStatus(true, 0))
+        val api = FakeApi()
+        val repo = DefaultItemRepository(MemoryStorage(), { api }, FakeCredentials(), backgroundScope, Clock.fixed(NOW, ZoneOffset.UTC), network)
+        repo.refresh()
+        network.value = ConnectivityStatus(false, 1)
+        network.value = ConnectivityStatus(true, 2)
+        // A StateFlow collector may see only the final event. Submission must still be blocked.
+        assertFalse(repo.answer("a", FinalAnswer.Dismiss))
+        runCurrent()
+        assertFalse(repo.syncState.value.mutationsEnabled)
+        assertEquals(0, api.submissions)
+        assertTrue(repo.refresh())
+        assertTrue(repo.syncState.value.mutationsEnabled)
+    }
+
+    @Test fun `foreground network loss disables writes and regain needs a fresh reconciliation`() = runTest {
+        val network = MutableStateFlow(ConnectivityStatus(true, 0))
+        val api = FakeApi()
+        val repo = DefaultItemRepository(MemoryStorage(), { api }, FakeCredentials(), backgroundScope, Clock.fixed(NOW, ZoneOffset.UTC), network)
+        assertTrue(repo.refresh())
+        val session = repo.reconciliationSession.value
+        network.value = ConnectivityStatus(false, 1)
+        runCurrent()
+        assertFalse(repo.syncState.value.mutationsEnabled)
+        assertEquals(NOW, (repo.syncState.value as SyncState.Stale).lastSuccess)
+        assertEquals(listOf("a"), repo.openItems.first().map { it.id })
+        assertEquals(session, repo.reconciliationSession.value)
+        assertFalse(repo.answer("a", FinalAnswer.Dismiss))
+        assertFalse(repo.refresh())
+        assertEquals(listOf("open"), api.calls)
+        network.value = ConnectivityStatus(true, 2)
+        runCurrent()
+        assertFalse(repo.syncState.value.mutationsEnabled)
+        assertTrue(repo.refresh())
+        assertTrue(repo.syncState.value.mutationsEnabled)
+    }
+
+    @Test fun `loss and regain during an active reconcile cannot publish Current from its old connection`() = runTest {
+        val network = MutableStateFlow(ConnectivityStatus(true, 0))
+        val api = FakeApi()
+        val repo = DefaultItemRepository(MemoryStorage(), { api }, FakeCredentials(), backgroundScope, Clock.fixed(NOW, ZoneOffset.UTC), network)
+        repo.refresh()
+        val held = CompletableDeferred<Unit>()
+        api.beforeRead = { held.await() }
+        val refreshing = async { repo.refresh() }
+        runCurrent()
+        network.value = ConnectivityStatus(false, 1)
+        runCurrent()
+        assertTrue(repo.syncState.value is SyncState.Stale)
+        network.value = ConnectivityStatus(true, 2)
+        held.complete(Unit)
+        assertFalse(refreshing.await())
+        assertFalse(repo.syncState.value.mutationsEnabled)
+        api.beforeRead = {}
+        assertTrue(repo.refresh())
+        assertTrue(repo.syncState.value.mutationsEnabled)
+    }
+
+    @Test fun `loss during answer preflight prevents submission even when network returns before preflight completes`() = runTest {
+        val network = MutableStateFlow(ConnectivityStatus(true, 0))
+        val api = FakeApi()
+        val repo = DefaultItemRepository(MemoryStorage(), { api }, FakeCredentials(), backgroundScope, Clock.fixed(NOW, ZoneOffset.UTC), network)
+        repo.refresh()
+        val held = CompletableDeferred<Unit>()
+        api.beforeGet = { held.await() }
+        val answer = async { repo.answer("a", FinalAnswer.Dismiss) }
+        runCurrent()
+        network.value = ConnectivityStatus(false, 1)
+        runCurrent()
+        network.value = ConnectivityStatus(true, 2)
+        held.complete(Unit)
+        assertFalse(answer.await())
+        assertEquals(0, api.submissions)
+        assertFalse(repo.syncState.value.mutationsEnabled)
+    }
+
     @Test fun `self revoke clears cache and credentials only after remote success`() = runTest {
         val f = fixture()
         f.repo.refresh()
@@ -612,6 +690,7 @@ internal class MemoryStorage : ItemStorage {
     private var success: Instant? = null
     var clearError: Exception? = null
     override fun openItems() = rows.map { it.values.filter { row -> row.canonical.status == StatusDto.OPEN } }
+    override fun cachedHistory() = rows.map { it.values.filter { row -> row.canonical.status != StatusDto.OPEN } }
     override fun item(id: String) = rows.map { it[id] }
     override fun history(key: String) = kotlinx.coroutines.flow.combine(rows, members) { all, membership -> membership[key].orEmpty().mapNotNull(all::get) }
     override suspend fun get(id: String) = rows.value[id]

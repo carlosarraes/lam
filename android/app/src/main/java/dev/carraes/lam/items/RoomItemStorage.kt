@@ -7,6 +7,7 @@ internal class RoomItemStorage(private val database: LamDatabase) : ItemStorage 
     private val items = database.itemDao()
     private val metadata = database.syncMetadataDao()
     override fun openItems() = items.observeOpen()
+    override fun cachedHistory() = items.observeCachedHistory()
     override fun item(id: String) = items.observeItem(id)
     override fun history(key: String) = items.observeHistory(key)
     override suspend fun get(id: String) = items.get(id)

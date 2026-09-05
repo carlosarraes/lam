@@ -17,6 +17,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import dev.carraes.lam.sync.LifecycleReconciler
+import dev.carraes.lam.sync.AndroidConnectivityMonitor
 import dev.carraes.lam.items.DeviceSettings
 import dev.carraes.lam.diagnostics.Diagnostics
 
@@ -26,9 +27,11 @@ class AppContainer(
     private val credentials: CredentialComposition = createCredentialComposition(applicationContext)
     private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val database = Room.databaseBuilder(applicationContext, LamDatabase::class.java, "lam-items.db").build()
+    private val connectivity = AndroidConnectivityMonitor(applicationContext)
 
     private val items = DefaultItemRepository(
         RoomItemStorage(database), ::authenticatedApi, credentials.credentialStore, applicationScope,
+        connectivity = connectivity.state,
     )
 
     val itemRepository: ItemRepository = items

@@ -21,6 +21,7 @@ sealed interface FinalAnswer {
 
 interface ItemRepository {
     val openItems: Flow<List<Item>>
+    val cachedHistory: Flow<List<Item>>
     val syncState: StateFlow<SyncState>
     val errors: Flow<Exception>
     fun item(id: String): Flow<Item?>
