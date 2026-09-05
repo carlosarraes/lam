@@ -7,6 +7,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -21,17 +22,24 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.carraes.lam.R
 import dev.carraes.lam.items.*
 import dev.carraes.lam.ui.markdown.*
+import dev.carraes.lam.ui.requests.*
 import dev.carraes.lam.ui.theme.*
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.time.format.FormatStyle
+import kotlinx.coroutines.launch
 
 @Composable
-fun DecisionDetailScreen(viewModel: DecisionViewModel, onBack: () -> Unit) {
+fun DecisionDetailScreen(viewModel: DecisionViewModel, onBack: () -> Unit, checklist: ChecklistViewModel? = null) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val checks = checklist?.state?.collectAsStateWithLifecycle()?.value
     DecisionDetailScreen(state, onBack, viewModel::refresh, viewModel::choose, viewModel::writeReply,
-        viewModel::editReply, viewModel::reviewReply, viewModel::dismissReply, viewModel::confirm, viewModel::dismissConfirmation)
+        viewModel::editReply, viewModel::reviewReply, viewModel::dismissReply, viewModel::confirm, viewModel::dismissConfirmation,
+        onQuickResponse = viewModel::quickResponse, onDismissRequest = viewModel::dismissRequest,
+        onCloseQuick = viewModel::closeQuickResponse, checklist = checks,
+        onCheck = { index, done -> checklist?.setCheck(index, done) },
+        onConsumeFailure = { checklist?.consumeFailure(it) })
 }
 
 @Composable
@@ -47,15 +55,42 @@ fun DecisionDetailScreen(
     onConfirm: (AnswerConfirmation) -> Unit = {},
     onDismissConfirmation: () -> Unit = {},
     onOpenLink: ((String) -> Boolean)? = null,
+    onQuickResponse: () -> Unit = {},
+    onDismissRequest: () -> Unit = {},
+    onCloseQuick: () -> Unit = {},
+    checklist: ChecklistState? = null,
+    onCheck: (Int, Boolean) -> Unit = { _, _ -> },
+    onConsumeFailure: (Long) -> Unit = {},
 ) {
     val context = LocalContext.current
     var destination by rememberSaveable(state.item?.id) { mutableStateOf<String?>(null) }
+    var menu by remember { mutableStateOf(false) }
+    val snackbar = remember { SnackbarHostState() }
+    val snackbarScope = rememberCoroutineScope()
+    val failed = stringResource(R.string.check_failed)
+    LaunchedEffect(checklist?.failure) {
+        checklist?.failure?.let { token ->
+            onConsumeFailure(token)
+            snackbarScope.launch { snackbar.showSnackbar(failed) }
+        }
+    }
+    LaunchedEffect(state.actionsEnabled) { if (!state.actionsEnabled) menu = false }
+    Box(Modifier.fillMaxSize()) {
     Surface(Modifier.fillMaxSize(), color = Graphite) {
         Column(Modifier.safeDrawingPadding()) {
             Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 IconButton(onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.back)) }
                 Text(stringResource(R.string.request_detail), style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
                 TextButton(onRefresh, enabled = !state.refreshing && !state.submitting) { Text(stringResource(R.string.detail_refresh)) }
+                Box {
+                    IconButton({ menu = true }, enabled = state.actionsEnabled && checklist?.saving != true) {
+                        Icon(Icons.Default.MoreVert, stringResource(R.string.more_actions))
+                    }
+                    DropdownMenu(menu, { menu = false }) {
+                        DropdownMenuItem(text = { Text(stringResource(R.string.quick_response)) }, onClick = { menu = false; onQuickResponse() })
+                        DropdownMenuItem(text = { Text(stringResource(R.string.dismiss)) }, onClick = { menu = false; onDismissRequest() })
+                    }
+                }
             }
             Column(Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()).padding(20.dp).testTag("detail-scroll"),
                 verticalArrangement = Arrangement.spacedBy(20.dp)) {
@@ -96,8 +131,7 @@ fun DecisionDetailScreen(
                         if (state.answerFailed) Text(stringResource(R.string.detail_answer_failed), color = Amber)
                         if (state.submitting) Text(stringResource(R.string.detail_sending), modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
                         if (item.checks.isNotEmpty()) {
-                            Text(stringResource(R.string.detail_checklist_read_only), color = MutedText)
-                            item.checks.forEach { check -> Text(stringResource(if (check.done) R.string.detail_check_done else R.string.detail_check_pending, check.label)) }
+                            ChecklistDetailScreen(item.checks, state.actionsEnabled && checklist?.actionsEnabled == true, onCheck, onWriteReply)
                         } else {
                             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 item.choices.forEachIndexed { index, choice ->
@@ -119,11 +153,25 @@ fun DecisionDetailScreen(
             }
         }
     }
+        if (!state.quickOpen) SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).safeDrawingPadding())
+    }
+    DecisionActionSheets(state, checklist, onChoice, onCheck, onWriteReply, onEditReply, onReviewReply,
+        onDismissReply, onConfirm, onDismissConfirmation, onCloseQuick, snackbar)
+    destination?.let { link -> LinkDestinationDialog(link, { destination = null }, onOpenLink ?: { openWebLink(context, it) }) }
+}
+
+@Composable
+fun DecisionActionSheets(state: DecisionState, checklist: ChecklistState?, onChoice: (String) -> Unit,
+    onCheck: (Int, Boolean) -> Unit, onWriteReply: () -> Unit, onEditReply: (String) -> Unit,
+    onReviewReply: () -> Unit, onDismissReply: () -> Unit, onConfirm: (AnswerConfirmation) -> Unit,
+    onDismissConfirmation: () -> Unit, onCloseQuick: () -> Unit, snackbar: SnackbarHostState? = null) {
     val confirmation = state.confirmation
     if (confirmation != null) {
-        AnswerConfirmationSheet(confirmation, state.actionsEnabled, { onConfirm(confirmation) }, onDismissConfirmation)
+        if (confirmation.answer == FinalAnswer.Dismiss) {
+            DismissConfirmation(state.actionsEnabled, { onConfirm(confirmation) }, onDismissConfirmation)
+        } else AnswerConfirmationSheet(confirmation, state.actionsEnabled, { onConfirm(confirmation) }, onDismissConfirmation)
     } else if (state.replyOpen) ReplySheet(state, onEditReply, onReviewReply, onDismissReply)
-    destination?.let { link -> LinkDestinationDialog(link, { destination = null }, onOpenLink ?: { openWebLink(context, it) }) }
+    else if (state.quickOpen) QuickResponseSheet(state, checklist?.actionsEnabled == true, onChoice, onCheck, onWriteReply, onCloseQuick, snackbar)
 }
 
 @Composable

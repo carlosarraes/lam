@@ -30,7 +30,8 @@ import java.time.format.FormatStyle
 @Composable
 fun RequestsScreen(state: RequestsState, onQuery: (String) -> Unit, onType: (ItemTypeDto?) -> Unit,
     onPriority: (PriorityDto?) -> Unit, onClearFilters: () -> Unit, onRefresh: () -> Unit,
-    onHistory: () -> Unit, onSettings: () -> Unit, onItem: (String) -> Unit) {
+    onHistory: () -> Unit, onSettings: () -> Unit, onItem: (String) -> Unit,
+    onQuickResponse: (String) -> Unit = {}, onDismiss: (String) -> Unit = {}) {
     var search by rememberSaveable { mutableStateOf(false) }
     var filters by rememberSaveable { mutableStateOf(false) }
     val activeFilters = listOfNotNull(state.type, state.priority).size
@@ -84,7 +85,10 @@ fun RequestsScreen(state: RequestsState, onQuery: (String) -> Unit, onType: (Ite
                                 style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
-                    items(state.items, key = { "request:${it.id}" }) { item -> RequestCard(item, state.now) { onItem(item.id) } }
+                    items(state.items, key = { "request:${it.id}" }) { item ->
+                        RequestCard(item, state.now, actionsEnabled = state.actionsEnabled,
+                            onQuickResponse = { onQuickResponse(item.id) }, onDismiss = { onDismiss(item.id) }) { onItem(item.id) }
+                    }
                 }
             }
         }

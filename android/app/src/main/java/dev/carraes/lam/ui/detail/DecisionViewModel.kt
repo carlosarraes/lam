@@ -18,6 +18,7 @@ data class DecisionState(
     val submitting: Boolean = false,
     val answerFailed: Boolean = false,
     val replyOpen: Boolean = false,
+    val quickOpen: Boolean = false,
     val reply: String = "",
     val confirmation: AnswerConfirmation? = null,
 ) {
@@ -44,6 +45,7 @@ class DecisionViewModel(
                     old.copy(item = item, sync = sync,
                         confirmation = old.confirmation?.takeIf { !closed && sync.mutationsEnabled && it.version == item.version },
                         replyOpen = old.replyOpen && !closed,
+                        quickOpen = old.quickOpen && !closed && sync.mutationsEnabled,
                         reply = if (closed) "" else old.reply)
                 }
             }
@@ -76,6 +78,20 @@ class DecisionViewModel(
         requestConfirmation(FinalAnswer.Choice(choice), item.version)
     }
 
+    fun quickResponse() {
+        if (!canAnswer()) return
+        val plain = state.value.item!!.let { it.checks.isEmpty() && it.choices.isEmpty() }
+        mutableState.update { it.copy(quickOpen = true, replyOpen = plain, answerFailed = false) }
+    }
+
+    fun closeQuickResponse() {
+        mutableState.update { it.copy(quickOpen = false, replyOpen = false, confirmation = null) }
+    }
+
+    fun dismissRequest() {
+        if (canAnswer()) requestConfirmation(FinalAnswer.Dismiss, state.value.item!!.version)
+    }
+
     fun writeReply() {
         if (canAnswer()) mutableState.update { it.copy(replyOpen = true, answerFailed = false) }
     }
@@ -90,14 +106,19 @@ class DecisionViewModel(
         requestConfirmation(FinalAnswer.Text(current.reply), current.item!!.version)
     }
 
-    fun dismissReply() { mutableState.update { it.copy(replyOpen = false, confirmation = null) } }
+    fun dismissReply() {
+        mutableState.update {
+            val plain = it.item?.let { item -> item.checks.isEmpty() && item.choices.isEmpty() } == true
+            it.copy(replyOpen = false, confirmation = null, quickOpen = it.quickOpen && !plain)
+        }
+    }
     fun dismissConfirmation() { mutableState.update { it.copy(confirmation = null) } }
 
     fun confirm(confirmation: AnswerConfirmation) {
         val current = state.value
         if (!canAnswer() || current.confirmation != confirmation || current.item?.version != confirmation.version) return
         // Consume synchronously, before launching, so two taps cannot start two repository operations.
-        mutableState.update { it.copy(confirmation = null, replyOpen = false, submitting = true, answerFailed = false) }
+        mutableState.update { it.copy(confirmation = null, replyOpen = false, quickOpen = false, submitting = true, answerFailed = false) }
         viewModelScope.launch {
             var succeeded = false
             try {

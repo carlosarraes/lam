@@ -83,9 +83,14 @@
     <string name="detail_expired">Expired</string>
     <string name="detail_outcome_via">%1$s via %2$s</string>
     <string name="detail_phone">phone</string>
-    <string name="detail_checklist_read_only">Checklist · read only</string>
-    <string name="detail_check_done">Complete: %s</string>
-    <string name="detail_check_pending">Pending: %s</string>
+    <string name="quick_response">Quick response</string>
+    <string name="dismiss">Dismiss</string>
+    <string name="dismiss_confirm">Dismiss this request?</string>
+    <string name="dismiss_explanation">This closes the request without a reply.</string>
+    <string name="dismiss_request">Dismiss request</string>
+    <string name="more_actions">More actions</string>
+    <string name="reply_instead">Reply instead</string>
+    <string name="check_failed">Could not save the check. The current server state is shown.</string>
     <string name="history_placeholder">History will be available in a later update.</string>
     <string name="settings_placeholder">Settings will be available in a later update.</string>
     <string name="back">Back</string>

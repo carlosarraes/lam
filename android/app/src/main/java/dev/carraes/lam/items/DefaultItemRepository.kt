@@ -158,7 +158,8 @@ internal class DefaultItemRepository(
                 commit(session) { storage.rollback(snapshot, tag) }
             }
             if (error is CancellationException) throw error
-            mutationFailed(session, id, error)
+            // A final check can close the request; recover its outcome before the open queue prunes it.
+            mutationFailed(session, id, error, finalAnswer = true)
             false
         }
     }
