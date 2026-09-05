@@ -9,8 +9,11 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
@@ -29,34 +32,53 @@ internal class DefaultItemRepository(
     // Network operations are serialized. Credential changes can still invalidate an in-flight call.
     private val operations = Mutex()
     private val stateLock = Mutex()
+    private val credentialChanges = Mutex()
     private val initialized = CompletableDeferred<Unit>()
     private var generation = 0L
     private var paired: PairedServer? = null
     private var lastSuccess: Instant? = null
     private val state = MutableStateFlow<SyncState>(SyncState.Idle)
     private val errorEvents = Channel<Exception>(Channel.BUFFERED)
+    private val pairing = MutableSharedFlow<PairedServer?>(replay = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
 
     override val openItems = storage.openItems().map { it.map(ItemMapper::toItem) }
     override val syncState = state.asStateFlow()
     override val errors = errorEvents.receiveAsFlow()
+    val credentialStore: CredentialStore = object : CredentialStore {
+        override fun observe() = pairing.asSharedFlow()
+        override suspend fun save(server: PairedServer, credential: String) = replaceCredential(server, credential)
+        override suspend fun clear() = unpair()
+    }
     override fun item(id: String) = storage.item(id).map { it?.let(ItemMapper::toItem) }
     override fun history(query: HistoryQuery) = storage.history(query.key).map { it.map(ItemMapper::toItem) }
 
     init {
         scope.launch {
             credentials.observe().collect { server ->
-                stateLock.withLock {
-                    generation++
-                    val changedAccount = paired?.let { it.serverUrl != server?.serverUrl || it.deviceId != server.deviceId } == true
-                    if (server == null || changedAccount) {
-                        storage.clear()
-                        lastSuccess = null
-                    } else if (!initialized.isCompleted) {
-                        lastSuccess = storage.lastSuccess()
+                credentialChanges.withLock {
+                    val failures = mutableListOf<Exception>()
+                    stateLock.withLock state@ {
+                        val restoring = !initialized.isCompleted
+                        // Managed saves already published this session, including same-metadata replacements.
+                        if (!restoring && server == paired) return@state
+                        invalidateSessionLocked(revoked = server == null && state.value == SyncState.Revoked)
+                        try {
+                            if (restoring && server != null) lastSuccess = storage.lastSuccess()
+                            else storage.clear()
+                            paired = server
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (error: Exception) {
+                            failures += error
+                        } finally {
+                            pairing.tryEmit(paired)
+                            initialized.complete(Unit)
+                        }
                     }
-                    paired = server
-                    if (state.value != SyncState.Revoked || server != null) state.value = SyncState.Idle
-                    initialized.complete(Unit)
+                    if (failures.isNotEmpty()) {
+                        attemptCredentialClear(failures)
+                        errorEvents.trySend(SessionCleanupException(failures))
+                    }
                 }
             }
         }
@@ -131,8 +153,39 @@ internal class DefaultItemRepository(
     }
 
     override suspend fun unpair() = withContext(NonCancellable) {
-        clearSession(revoked = false)
-        credentials.clear()
+        credentialChanges.withLock {
+            try {
+                clearSession(revoked = false)
+            } catch (error: SessionCleanupException) {
+                errorEvents.trySend(error)
+                throw error
+            }
+        }
+    }
+
+    private suspend fun replaceCredential(server: PairedServer, credential: String) {
+        require(credential.isNotBlank()) { "credential must not be blank" }
+        initialized.await()
+        withContext(NonCancellable) {
+            credentialChanges.withLock {
+                stateLock.withLock { invalidateSessionLocked(revoked = false) }
+                try {
+                    stateLock.withLock { storage.clear() }
+                    credentials.save(server, credential)
+                    stateLock.withLock {
+                        paired = server
+                        pairing.tryEmit(server)
+                    }
+                } catch (error: Exception) {
+                    pairing.tryEmit(null)
+                    val failures = mutableListOf(error)
+                    attemptCredentialClear(failures)
+                    val failure = SessionCleanupException(failures)
+                    errorEvents.trySend(failure)
+                    throw failure
+                }
+            }
+        }
     }
 
     private suspend fun reconcile(session: Session): Boolean {
@@ -187,13 +240,13 @@ internal class DefaultItemRepository(
     private suspend fun handleFailure(session: Session, error: Exception, emit: Boolean = true) {
         if (error is ApiError.Unauthorized) {
             withContext(NonCancellable) {
-                val cleared = stateLock.withLock {
-                    if (session.generation != generation) false else {
-                        clearSessionLocked(revoked = true)
-                        true
+                credentialChanges.withLock {
+                    try {
+                        clearSession(revoked = true, expected = session)
+                    } catch (cleanupError: SessionCleanupException) {
+                        errorEvents.trySend(cleanupError)
                     }
                 }
-                if (cleared) credentials.clear()
             }
         } else {
             commit(session) { state.value = SyncState.Stale(lastSuccess, error) }
@@ -201,14 +254,41 @@ internal class DefaultItemRepository(
         if (emit && isCurrent(session)) errorEvents.trySend(error)
     }
 
-    private suspend fun clearSession(revoked: Boolean) = stateLock.withLock { clearSessionLocked(revoked) }
-
-    private suspend fun clearSessionLocked(revoked: Boolean) {
+    private fun invalidateSessionLocked(revoked: Boolean) {
         generation++
         paired = null
-        storage.clear()
         lastSuccess = null
         state.value = if (revoked) SyncState.Revoked else SyncState.Idle
+    }
+
+    // The caller holds credentialChanges, so teardown cannot erase a concurrent replacement.
+    private suspend fun clearSession(revoked: Boolean, expected: Session? = null) {
+        val failures = mutableListOf<Exception>()
+        val invalidated = stateLock.withLock {
+            if (expected != null && expected.generation != generation) false else {
+                invalidateSessionLocked(revoked)
+                pairing.tryEmit(null)
+                try {
+                    storage.clear()
+                } catch (error: Exception) {
+                    failures += error
+                }
+                true
+            }
+        }
+        if (!invalidated) return
+        attemptCredentialClear(failures)
+        if (failures.isNotEmpty()) throw SessionCleanupException(failures)
+    }
+
+    private suspend fun attemptCredentialClear(failures: MutableList<Exception>) {
+        try {
+            credentials.clear()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            failures += error
+        }
     }
 
     private suspend fun isCurrent(session: Session): Boolean = stateLock.withLock { session.generation == generation }
@@ -221,4 +301,9 @@ internal class DefaultItemRepository(
     }
 
     private data class Session(val generation: Long, val api: LamApi)
+}
+
+internal class SessionCleanupException(failures: List<Exception>) :
+    Exception("Could not completely update local pairing data") {
+    init { failures.forEach(::addSuppressed) }
 }

@@ -10,10 +10,12 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.*
@@ -262,6 +264,115 @@ class ItemRepositoryTest {
         assertFalse(f.repo.syncState.value.mutationsEnabled)
     }
 
+    @Test fun `credential replacement blocks immediate mutation while its metadata observer is deferred`() = runTest {
+        assertCredentialReplacement(PairedServer("https://other.example/", "other", "Other phone"))
+    }
+
+    @Test fun `same metadata credential replacement requires a new complete reconciliation`() = runTest {
+        assertCredentialReplacement(PairedServer("https://example.com/", "device", "Phone"))
+    }
+
+    @Test fun `managed pairing stream publishes the replacement without waiting for raw metadata delivery`() = runTest {
+        val f = fixture()
+        f.repo.refresh()
+        val observed = mutableListOf<PairedServer?>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            f.repo.credentialStore.observe().collect { observed += it }
+        }
+        f.credentials.publishChanges = false
+        val replacement = PairedServer("https://other.example/", "other", "Phone")
+        f.repo.credentialStore.save(replacement, "replacement")
+        assertEquals(replacement, observed.last())
+        assertFalse(f.repo.syncState.value.mutationsEnabled)
+    }
+
+    @Test fun `old bearer rejection after replacement cannot remove the new credential`() = runTest {
+        val f = fixture()
+        f.repo.refresh()
+        val release = CompletableDeferred<Unit>()
+        f.api.beforeRead = { release.await() }
+        val oldRead = async { f.repo.refresh() }
+        runCurrent()
+        val replacement = PairedServer("https://other.example/", "other", "Phone")
+        f.repo.credentialStore.save(replacement, "replacement")
+        f.api.readError = ApiError.Unauthorized(null)
+        release.complete(Unit)
+        assertFalse(oldRead.await())
+        assertEquals(replacement, f.credentials.state.value)
+        assertEquals(SyncState.Idle, f.repo.syncState.value)
+    }
+
+    @Test fun `unpair preserves both cache and credential cleanup errors while disabling the session`() = runTest {
+        val f = fixture()
+        f.repo.refresh()
+        val cacheFailure = IllegalStateException("cache failed")
+        val credentialFailure = IllegalStateException("credential failed")
+        f.store.clearError = cacheFailure
+        f.credentials.clearError = credentialFailure
+        val failure = runCatching { f.repo.unpair() }.exceptionOrNull()
+        assertNotNull(failure)
+        assertEquals(listOf(cacheFailure, credentialFailure), failure!!.suppressed.toList())
+        assertNull(f.credentials.state.value)
+        assertEquals(SyncState.Idle, f.repo.syncState.value)
+        assertFalse(f.repo.answer("a", FinalAnswer.Dismiss))
+    }
+
+    private suspend fun TestScope.assertCredentialReplacement(server: PairedServer) {
+        val f = fixture()
+        assertTrue(f.repo.refresh())
+        f.credentials.publishChanges = false
+        f.repo.credentialStore.save(server, "replacement")
+        assertEquals(server, f.credentials.state.value)
+        assertFalse("replacement must disable controls before metadata collection", f.repo.syncState.value.mutationsEnabled)
+        assertFalse(f.repo.answer("a", FinalAnswer.Dismiss))
+        assertEquals(0, f.api.submissions)
+        assertTrue(f.repo.openItems.first().isEmpty())
+        assertTrue(f.repo.refresh())
+        f.credentials.publishCurrent()
+        runCurrent()
+        assertTrue("delayed metadata must not invalidate the reconciled replacement", f.repo.syncState.value.mutationsEnabled)
+        assertTrue(f.repo.answer("a", FinalAnswer.Dismiss))
+        assertEquals(1, f.api.submissions)
+    }
+
+    @Test fun `unpair removes credentials and invalidates late response when cache cleanup fails`() = runTest {
+        val f = fixture()
+        f.repo.refresh()
+        val release = CompletableDeferred<Unit>()
+        f.api.beforeRead = { release.await() }
+        val read = async { f.repo.refresh() }
+        runCurrent()
+        val cacheFailure = IllegalStateException("database unavailable")
+        f.store.clearError = cacheFailure
+        val failure = runCatching { f.repo.unpair() }.exceptionOrNull()
+        assertNotNull(failure)
+        assertNull("credential removal must still be attempted", f.credentials.state.value)
+        assertEquals(SyncState.Idle, f.repo.syncState.value)
+        assertTrue("cleanup failure must retain its cause", failure!!.suppressed.contains(cacheFailure))
+        release.complete(Unit)
+        assertFalse(read.await())
+        assertFalse(f.repo.answer("a", FinalAnswer.Dismiss))
+        runCurrent()
+        assertEquals(SyncState.Idle, f.repo.syncState.value)
+    }
+
+    @Test fun `bearer rejection removes credentials and stays revoked when cache cleanup fails`() = runTest {
+        val f = fixture()
+        f.repo.refresh()
+        val cacheFailure = IllegalStateException("database unavailable")
+        f.store.clearError = cacheFailure
+        f.api.readError = ApiError.Unauthorized(null)
+        val error = async { f.repo.errors.first() }
+        assertFalse(f.repo.refresh())
+        assertNull(f.credentials.state.value)
+        assertEquals(SyncState.Revoked, f.repo.syncState.value)
+        assertTrue(error.await().suppressed.contains(cacheFailure))
+        runCurrent()
+        assertEquals(SyncState.Revoked, f.repo.syncState.value)
+        assertFalse(f.repo.answer("a", FinalAnswer.Dismiss))
+        assertFalse(f.repo.refresh())
+    }
+
     private fun TestScope.fixture(): Fixture {
         val store = MemoryStorage()
         val api = FakeApi()
@@ -283,9 +394,20 @@ class ItemRepositoryTest {
 
 private class FakeCredentials : CredentialStore {
     val state = MutableStateFlow<PairedServer?>(PairedServer("https://example.com/", "device", "Phone"))
-    override fun observe() = state
-    override suspend fun save(server: PairedServer, credential: String) { state.value = server }
-    override suspend fun clear() { state.value = null }
+    private val published = MutableSharedFlow<PairedServer?>(replay = 1).apply { tryEmit(state.value) }
+    var publishChanges = true
+    var clearError: Exception? = null
+    override fun observe() = published
+    suspend fun publishCurrent() { published.emit(state.value) }
+    override suspend fun save(server: PairedServer, credential: String) {
+        state.value = server
+        if (publishChanges) publishCurrent()
+    }
+    override suspend fun clear() {
+        state.value = null
+        if (publishChanges) publishCurrent()
+        clearError?.let { throw it }
+    }
 }
 
 private class FakeApi : LamApi {
@@ -317,6 +439,7 @@ private class MemoryStorage : ItemStorage {
     private val rows = MutableStateFlow<Map<String, ItemEntity>>(emptyMap())
     private val members = MutableStateFlow<Map<String, Set<String>>>(emptyMap())
     private var success: Instant? = null
+    var clearError: Exception? = null
     override fun openItems() = rows.map { it.values.filter { row -> row.canonical.status == StatusDto.OPEN } }
     override fun item(id: String) = rows.map { it[id] }
     override fun history(key: String) = kotlinx.coroutines.flow.combine(rows, members) { all, membership -> membership[key].orEmpty().mapNotNull(all::get) }
@@ -348,5 +471,8 @@ private class MemoryStorage : ItemStorage {
     override suspend fun rollback(snapshot: ItemEntity, tag: String) {
         if (rows.value[snapshot.canonical.id]?.optimisticTag == tag) rows.value = rows.value + (snapshot.canonical.id to snapshot)
     }
-    override suspend fun clear() { rows.value = emptyMap(); members.value = emptyMap(); success = null }
+    override suspend fun clear() {
+        clearError?.let { throw it }
+        rows.value = emptyMap(); members.value = emptyMap(); success = null
+    }
 }

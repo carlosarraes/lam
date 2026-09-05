@@ -21,13 +21,13 @@ class AppContainer(
     private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val database = Room.databaseBuilder(applicationContext, LamDatabase::class.java, "lam-items.db").build()
 
-    val itemRepository: ItemRepository = DefaultItemRepository(
+    private val items = DefaultItemRepository(
         RoomItemStorage(database), ::authenticatedApi, credentials.credentialStore, applicationScope,
     )
 
-    val credentialStore: CredentialStore = object : CredentialStore by credentials.credentialStore {
-        override suspend fun clear() = itemRepository.unpair()
-    }
+    val itemRepository: ItemRepository = items
+
+    val credentialStore: CredentialStore = items.credentialStore
 
     internal fun authenticatedApi(): LamApi? = credentials.api()
 }
