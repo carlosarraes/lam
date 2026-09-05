@@ -2,6 +2,7 @@ package dev.carraes.lam
 
 import android.content.Context
 import androidx.room.Room
+import androidx.lifecycle.ProcessLifecycleOwner
 import dev.carraes.lam.items.DefaultItemRepository
 import dev.carraes.lam.items.ItemRepository
 import dev.carraes.lam.items.LamApi
@@ -15,6 +16,8 @@ import dev.carraes.lam.pairing.PairingRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.map
+import dev.carraes.lam.sync.LifecycleReconciler
 
 class AppContainer(
     val applicationContext: Context,
@@ -31,9 +34,14 @@ class AppContainer(
 
     val credentialStore: CredentialStore = items.credentialStore
 
+    val lifecycleReconciler = LifecycleReconciler(
+        itemRepository, credentialStore.observe().map { it != null }, ProcessLifecycleOwner.get().lifecycle,
+        CoroutineScope(applicationScope.coroutineContext + Dispatchers.Main.immediate),
+    )
+
     val pairingRepository = PairingRepository(
         credentialStore,
-        itemRepository::refresh,
+        lifecycleReconciler::refresh,
         DeviceIdentity(android.os.Build.MODEL, BuildConfig.VERSION_NAME, android.os.Build.VERSION.RELEASE),
     )
 

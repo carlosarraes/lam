@@ -38,7 +38,7 @@ class PairingScreenTest {
         var requests = 0; var settings = 0
         var state by mutableStateOf<PairingState>(PairingState.Ready)
         compose.setContent { LamTheme { PairingContent(state, onScan = { requests++; state = PairingState.PermissionDenied },
-            onSettings = { settings++ }, onCancel = {}, onRetryRefresh = {}, scanner = {}) } }
+            onSettings = { settings++ }, onCancel = {}, pairedContent = {}, scanner = {}) } }
         compose.runOnIdle { assertEquals(0, requests) }
         compose.onNodeWithText("Scan pairing code").performClick()
         compose.onNodeWithText("Camera access is needed to scan your terminal QR code.").assertExists()
@@ -47,18 +47,14 @@ class PairingScreenTest {
         compose.runOnIdle { assertEquals(2, requests); assertEquals(1, settings) }
     }
 
-    @Test fun successfulPairingShowsRequestsAndStalePairingOffersRefresh() {
+    @Test fun successfulPairingHandsOffToThePairedApplication() {
         var state by mutableStateOf<PairingState>(PairingState.Claiming)
-        var retries = 0
-        compose.setContent { LamTheme { PairingContent(state, {}, {}, {}, { retries++; state = PairingState.Paired(false) }, {}) } }
+        compose.setContent { LamTheme { PairingContent(state, {}, {}, {}, { Text("Paired application") }, {}) } }
         compose.onNodeWithText("Pairing device…").assertExists()
         compose.onNodeWithText("Scan pairing code").assertDoesNotExist()
         compose.runOnIdle { state = PairingState.Paired(true) }
-        compose.onNodeWithText("Requests").assertExists()
-        compose.onNodeWithText("Retry sync").performClick()
-        compose.runOnIdle { assertEquals(1, retries) }
-        compose.onNodeWithText("Retry sync").assertDoesNotExist()
-        compose.onNodeWithText("Requests").assertExists()
+        compose.onNodeWithText("Paired application").assertExists()
+        compose.onNodeWithText("Scan pairing code").assertDoesNotExist()
     }
 
     @Test fun scanningCanBeCancelledAndLoadingNeverOffersScan() {
@@ -92,7 +88,7 @@ class PairingScreenTest {
             })[PairingViewModel::class.java]
             val state by vm.state.collectAsState()
             LamTheme {
-                PairingContent(state, { vm.permissionResult(true) }, {}, vm::cancelScan, vm::retryRefresh) {
+                PairingContent(state, { vm.permissionResult(true) }, {}, vm::cancelScan, { Text("Paired application") }) {
                     Button(onClick = { vm.onQr("""{"v":1,"server":"https://lam.example","session":"550e8400-e29b-41d4-a716-446655440000","secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}""") }) {
                         Text("Deliver decoded QR")
                     }
@@ -101,7 +97,7 @@ class PairingScreenTest {
         }
         compose.onNodeWithText("Scan pairing code").performClick()
         compose.onNodeWithText("Deliver decoded QR").performClick()
-        compose.onNodeWithText("Requests").assertExists()
+        compose.onNodeWithText("Paired application").assertExists()
         compose.runOnIdle {
             assertEquals(true, saved)
             assertEquals("https://lam.example", metadata.value?.serverUrl)

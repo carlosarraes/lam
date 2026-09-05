@@ -22,11 +22,10 @@ import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.carraes.lam.R
-import dev.carraes.lam.RequestsSmokeSurface
 import dev.carraes.lam.ui.theme.Graphite
 
 @Composable
-fun PairingScreen(viewModel: PairingViewModel) {
+fun PairingScreen(viewModel: PairingViewModel, pairedContent: @Composable () -> Unit) {
     val context = LocalContext.current
     val state by viewModel.state.collectAsStateWithLifecycle()
     val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission(), viewModel::permissionResult)
@@ -40,7 +39,7 @@ fun PairingScreen(viewModel: PairingViewModel) {
         },
         onSettings = { context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, "package:${context.packageName}".toUri())) },
         onCancel = viewModel::cancelScan,
-        onRetryRefresh = viewModel::retryRefresh,
+        pairedContent = pairedContent,
         scanner = { QrScanner(viewModel::onQr, viewModel::cameraFailed) },
     )
 }
@@ -51,11 +50,11 @@ internal fun PairingContent(
     onScan: () -> Unit,
     onSettings: () -> Unit,
     onCancel: () -> Unit,
-    onRetryRefresh: () -> Unit,
+    pairedContent: @Composable () -> Unit,
     scanner: @Composable () -> Unit,
 ) {
     if (state is PairingState.Paired) {
-        RequestsSmokeSurface(state.stale, onRetryRefresh)
+        pairedContent()
         return
     }
     Surface(Modifier.fillMaxSize().testTag("pairing-surface"), color = Graphite) {

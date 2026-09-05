@@ -2,6 +2,63 @@
 <resources>
     <string name="app_name">lam</string>
     <string name="requests_title">Requests</string>
+    <string name="history_title">History</string>
+    <string name="settings_title">Settings</string>
+    <string name="switch_queue">Switch queue</string>
+    <string name="search_requests">Search requests</string>
+    <string name="search_hint">Search title, agent, or body</string>
+    <string name="clear_search">Clear search</string>
+    <string name="close_search">Close search</string>
+    <string name="more_options">More options</string>
+    <string name="filters">Filters</string>
+    <string name="filters_active">Filters · %d</string>
+    <string name="filter_type">Type</string>
+    <string name="filter_priority">Priority</string>
+    <string name="all_types">All types</string>
+    <string name="all_priorities">All priorities</string>
+    <string name="type_plain">Plain</string>
+    <string name="type_choice">Choices</string>
+    <string name="type_checklist">Checklist</string>
+    <string name="priority_critical">Critical</string>
+    <string name="priority_normal">Normal</string>
+    <string name="priority_low">Low</string>
+    <string name="clear_filters">Clear filters</string>
+    <string name="done">Done</string>
+    <string name="requests_loading">Loading requests…</string>
+    <string name="requests_empty">No open requests</string>
+    <string name="requests_empty_hint">New requests will appear here.</string>
+    <string name="requests_no_matches">No matching requests</string>
+    <string name="requests_no_matches_hint">Try another search or clear your filters.</string>
+    <string name="requests_error">Could not load requests</string>
+    <string name="requests_offline">Offline · replies unavailable</string>
+    <string name="requests_last_success">Last synced %s</string>
+    <string name="requests_never_synced">No successful sync yet</string>
+    <string name="requests_refresh">Refresh requests</string>
+    <plurals name="requests_count">
+        <item quantity="one">%d open</item>
+        <item quantity="other">%d open</item>
+    </plurals>
+    <plurals name="requests_match_count">
+        <item quantity="one">%d matching</item>
+        <item quantity="other">%d matching</item>
+    </plurals>
+    <plurals name="request_choice_count">
+        <item quantity="one">%d choice</item>
+        <item quantity="other">%d choices</item>
+    </plurals>
+    <plurals name="request_check_progress">
+        <item quantity="one">%1$d of %2$d complete</item>
+        <item quantity="other">%1$d of %2$d complete</item>
+    </plurals>
+    <string name="request_decision">Decision</string>
+    <string name="request_no_recommendation">No recommendation</string>
+    <string name="request_open">Open request</string>
+    <string name="request_accessibility">%1$s, %2$s, %3$s priority, %4$s, %5$s</string>
+    <string name="request_detail">Request detail</string>
+    <string name="request_detail_placeholder">Full request details will be available in a later update.</string>
+    <string name="history_placeholder">History will be available in a later update.</string>
+    <string name="settings_placeholder">Settings will be available in a later update.</string>
+    <string name="back">Back</string>
     <string name="pairing_title">Pair this device</string>
     <string name="pairing_instructions">Run lam pair in your terminal, then scan its QR code.</string>
     <string name="pairing_scan">Scan pairing code</string>
@@ -21,6 +78,5 @@
     <string name="pairing_server_error">The server could not complete pairing. Run lam pair for a new code.</string>
     <string name="pairing_storage_error">Could not save this device securely. The code was used. Check device storage, then run lam pair again.</string>
     <string name="pairing_camera_error">Could not open the camera. Close other camera apps and try scanning again.</string>
-    <string name="pairing_stale">Paired. Requests have not synced yet.</string>
     <string name="pairing_retry_sync">Retry sync</string>
 </resources>
