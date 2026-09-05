@@ -2,4 +2,25 @@
 <resources>
     <string name="app_name">lam</string>
     <string name="requests_title">Requests</string>
+    <string name="pairing_title">Pair this device</string>
+    <string name="pairing_instructions">Run lam pair in your terminal, then scan its QR code.</string>
+    <string name="pairing_scan">Scan pairing code</string>
+    <string name="pairing_settings">Open settings</string>
+    <string name="pairing_cancel">Cancel</string>
+    <string name="pairing_aim">Point your camera at the terminal QR code.</string>
+    <string name="pairing_claiming">Pairing device…</string>
+    <string name="pairing_permission_denied">Camera access is needed to scan your terminal QR code.</string>
+    <string name="pairing_malformed">This is not a valid lam pairing code. Scan the code from lam pair.</string>
+    <string name="pairing_unsupported">This pairing code needs a newer version of lam. Update the app and try again.</string>
+    <string name="pairing_insecure">This server needs an HTTPS address. Generate a new code with the secure server URL.</string>
+    <string name="pairing_expired">This code expired. Run lam pair for a new code.</string>
+    <string name="pairing_consumed">This code was already used. Run lam pair for a new code.</string>
+    <string name="pairing_cancelled">This pairing was cancelled. Run lam pair for a new code.</string>
+    <string name="pairing_wrong_server">The server could not verify this pairing. Check the terminal server address and generate a new code.</string>
+    <string name="pairing_offline">Could not reach the server. The code may have been used. Check your connection and run lam pair for a new code.</string>
+    <string name="pairing_server_error">The server could not complete pairing. Run lam pair for a new code.</string>
+    <string name="pairing_storage_error">Could not save this device securely. The code was used. Check device storage, then run lam pair again.</string>
+    <string name="pairing_camera_error">Could not open the camera. Close other camera apps and try scanning again.</string>
+    <string name="pairing_stale">Paired. Requests have not synced yet.</string>
+    <string name="pairing_retry_sync">Retry sync</string>
 </resources>

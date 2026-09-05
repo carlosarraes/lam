@@ -9,6 +9,7 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Assert.assertEquals
 import org.junit.Rule
+import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -17,11 +18,18 @@ class MainActivityTest {
     @get:Rule
     val composeRule = createAndroidComposeRule<MainActivity>()
 
-    @Test
-    fun launchesRequestsOnGraphiteSurface() {
-        composeRule.onNodeWithText("Requests").assertExists()
+    @Before fun keepTestActivityAwake() {
+        composeRule.runOnUiThread { composeRule.activity.window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+    }
 
-        val surface = composeRule.onNodeWithTag("requests-surface").captureToImage().toPixelMap()
+    @Test
+    fun launchesPairingOnGraphiteSurface() {
+        composeRule.waitUntil(5_000) {
+            composeRule.onAllNodes(androidx.compose.ui.test.hasText("Scan pairing code")).fetchSemanticsNodes().isNotEmpty()
+        }
+        composeRule.onNodeWithText("Scan pairing code").assertExists()
+
+        val surface = composeRule.onNodeWithTag("pairing-surface").captureToImage().toPixelMap()
         assertEquals(Color(0xFF121212), surface[1, 1])
     }
 }

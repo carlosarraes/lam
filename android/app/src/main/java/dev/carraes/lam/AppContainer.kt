@@ -10,6 +10,8 @@ import dev.carraes.lam.items.RoomItemStorage
 import dev.carraes.lam.security.CredentialComposition
 import dev.carraes.lam.security.CredentialStore
 import dev.carraes.lam.security.createCredentialComposition
+import dev.carraes.lam.pairing.DeviceIdentity
+import dev.carraes.lam.pairing.PairingRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -28,6 +30,12 @@ class AppContainer(
     val itemRepository: ItemRepository = items
 
     val credentialStore: CredentialStore = items.credentialStore
+
+    val pairingRepository = PairingRepository(
+        credentialStore,
+        itemRepository::refresh,
+        DeviceIdentity(android.os.Build.MODEL, BuildConfig.VERSION_NAME, android.os.Build.VERSION.RELEASE),
+    )
 
     internal fun authenticatedApi(): LamApi? = credentials.api()
 }

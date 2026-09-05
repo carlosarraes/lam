@@ -21,20 +21,25 @@ import androidx.compose.ui.unit.dp
 import dev.carraes.lam.ui.theme.Amber
 import dev.carraes.lam.ui.theme.Graphite
 import dev.carraes.lam.ui.theme.LamTheme
+import androidx.lifecycle.viewmodel.compose.viewModel
+import dev.carraes.lam.pairing.PairingScreen
+import dev.carraes.lam.pairing.PairingViewModel
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
             LamTheme {
-                RequestsSmokeSurface()
+                val container = (application as LamApplication).container
+                val pairing = viewModel { PairingViewModel(container.pairingRepository, BuildConfig.DEBUG) }
+                PairingScreen(pairing)
             }
         }
     }
 }
 
 @Composable
-private fun RequestsSmokeSurface() {
+internal fun RequestsSmokeSurface(stale: Boolean = false, onRetry: () -> Unit = {}) {
     Surface(
         modifier = Modifier
             .fillMaxSize()
@@ -54,6 +59,11 @@ private fun RequestsSmokeSurface() {
                     .clip(androidx.compose.foundation.shape.CircleShape)
                     .background(Amber),
             )
+            if (stale) {
+                Spacer(Modifier.height(24.dp))
+                Text(stringResource(R.string.pairing_stale))
+                androidx.compose.material3.TextButton(onRetry) { Text(stringResource(R.string.pairing_retry_sync)) }
+            }
         }
     }
 }
