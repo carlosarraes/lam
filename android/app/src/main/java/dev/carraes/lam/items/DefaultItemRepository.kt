@@ -2,6 +2,7 @@ package dev.carraes.lam.items
 
 import dev.carraes.lam.security.CredentialStore
 import dev.carraes.lam.security.PairedServer
+import dev.carraes.lam.diagnostics.*
 import java.time.Clock
 import java.time.Instant
 import java.util.UUID
@@ -30,7 +31,46 @@ internal class DefaultItemRepository(
     private val credentials: CredentialStore,
     scope: CoroutineScope,
     private val clock: Clock = Clock.systemUTC(),
-) : ItemRepository {
+) : ItemRepository, DeviceSettings {
+    override suspend fun diagnosticData(): DiagnosticData {
+        initialized.await()
+        return stateLock.withLock { DiagnosticData(paired?.serverUrl, lastSuccess, storage.counts(), recentErrors.toList()) }
+    }
+    override val device get() = credentialStore.observe()
+    override suspend fun revoke(expectedSession: Long): UnpairResult {
+        initialized.await()
+        return operations.withLock {
+            val current = stateLock.withLock {
+                if (generation != expectedSession || paired == null) null
+                else apiProvider()?.let { Session(generation, it) }
+            } ?: return@withLock UnpairResult.SESSION_CHANGED
+            try {
+                current.api.revokeDevice()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (error !is ApiError.Unauthorized) {
+                    handleFailure(current, error)
+                    return@withLock if (isCurrent(current)) UnpairResult.UNAVAILABLE
+                        else UnpairResult.SESSION_CHANGED
+                }
+                // A rejected credential is already unusable remotely; local cleanup is sufficient.
+            }
+            if (eraseLocal(expectedSession)) UnpairResult.REVOKED
+            else UnpairResult.SESSION_CHANGED
+        }
+    }
+
+    override suspend fun eraseLocal(expectedSession: Long): Boolean = withContext(NonCancellable) {
+        credentialChanges.withLock {
+            val current = stateLock.withLock {
+                if (generation != expectedSession || paired == null) null
+                else apiProvider()?.let { Session(generation, it) }
+            } ?: return@withLock false
+            clearSession(revoked = false, expected = current)
+            true
+        }
+    }
     // Network operations are serialized. Credential changes can still invalidate an in-flight call.
     private val operations = Mutex()
     private val stateLock = Mutex()
@@ -39,9 +79,10 @@ internal class DefaultItemRepository(
     private var generation = 0L
     // Opaque process-local identity, published only after canonical session setup completes.
     private val session = MutableStateFlow<Long?>(null)
-    val reconciliationSession = session.asStateFlow()
+    override val reconciliationSession = session.asStateFlow()
     private var paired: PairedServer? = null
     private var lastSuccess: Instant? = null
+    private val recentErrors = ArrayDeque<ErrorCategory>()
     // One read recovery at most: operations serialize, and stale state blocks the next final answer.
     private var unresolvedFinalAnswer: String? = null
     private val state = MutableStateFlow<SyncState>(SyncState.Idle)
@@ -264,6 +305,10 @@ internal class DefaultItemRepository(
     }
 
     private suspend fun handleFailure(session: Session, error: Exception, emit: Boolean = true) {
+        if (error !is CancellationException) commit(session) {
+            recentErrors.addLast(errorCategory(error))
+            if (recentErrors.size > 20) recentErrors.removeFirst()
+        }
         if (error is ApiError.Unauthorized) {
             withContext(NonCancellable) {
                 credentialChanges.withLock {
@@ -285,6 +330,7 @@ internal class DefaultItemRepository(
         session.value = null
         paired = null
         lastSuccess = null
+        recentErrors.clear()
         unresolvedFinalAnswer = null
         state.value = if (revoked) SyncState.Revoked else SyncState.Idle
     }

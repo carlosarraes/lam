@@ -10,10 +10,13 @@ import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.ViewModelStoreOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
 import dev.carraes.lam.AppContainer
 import dev.carraes.lam.pairing.PairingScreen
 import dev.carraes.lam.pairing.PairingViewModel
 import dev.carraes.lam.ui.requests.RequestsViewModel
+import dev.carraes.lam.ui.history.*
+import dev.carraes.lam.ui.settings.*
 import dev.carraes.lam.ui.detail.*
 import dev.carraes.lam.R
 import kotlinx.coroutines.launch
@@ -21,13 +24,33 @@ import kotlinx.coroutines.launch
 @Composable
 fun LamApp(container: AppContainer, pairing: PairingViewModel) {
     PairingScreen(pairing) {
+        val session by container.deviceSettings.reconciliationSession.collectAsStateWithLifecycle()
+        key(session) {
+            val owner = remember { object : ViewModelStoreOwner { override val viewModelStore = ViewModelStore() } }
+            DisposableEffect(owner) { onDispose { owner.viewModelStore.clear() } }
+            CompositionLocalProvider(LocalViewModelStoreOwner provides owner) { PairedApp(container) }
+        }
+    }
+}
+
+@Composable
+private fun PairedApp(container: AppContainer) {
         val requests = viewModel { RequestsViewModel(container.itemRepository, container.lifecycleReconciler::refresh) }
         val state by requests.state.collectAsStateWithLifecycle()
         var action by remember { mutableStateOf<Pair<String, Boolean>?>(null) }
         val snackbar = remember { SnackbarHostState() }
         val feedbackScope = rememberCoroutineScope()
         LamNav(state, requests::setQuery, requests::setType, requests::setPriority, requests::clearFilters, requests::refresh,
-            onRequestAction = { id, dismiss -> action = id to dismiss }) { id, onBack ->
+            onRequestAction = { id, dismiss -> action = id to dismiss },
+            historyContent = { onRequests, onSettings ->
+                val history = viewModel { HistoryViewModel(container.itemRepository) }
+                val historyState by history.state.collectAsStateWithLifecycle()
+                HistoryScreen(historyState, history::setQuery, history::setType, history::setPriority,
+                    history::clearFilters, history::refresh, history::loadMore, onRequests, onSettings)
+            }, settingsContent = { onBack ->
+                val settings = viewModel { SettingsViewModel(container.deviceSettings, container.diagnostics) }
+                SettingsScreen(settings, onBack)
+            }) { id, onBack ->
             val detail = viewModel(key = "decision:$id") { DecisionViewModel(id, container.itemRepository, container.lifecycleReconciler::refresh) }
             val checklist = viewModel(key = "checks:$id") { ChecklistViewModel(id, container.itemRepository) }
             DecisionDetailScreen(detail, onBack, checklist)
@@ -36,7 +59,6 @@ fun LamApp(container: AppContainer, pairing: PairingViewModel) {
             RequestActionHost(container, id, dismiss, snackbar, { message -> feedbackScope.launch { snackbar.showSnackbar(message) } }) { action = null }
         } }
         Box(Modifier.fillMaxSize()) { SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).safeDrawingPadding()) }
-    }
 }
 
 @Composable

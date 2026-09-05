@@ -16,7 +16,8 @@ import androidx.compose.ui.unit.dp
 import dev.carraes.lam.R
 
 @Composable
-fun QueueTopBar(title: String, onRequests: () -> Unit, onHistory: () -> Unit, onSettings: () -> Unit, onSearch: (() -> Unit)? = null) {
+fun QueueTopBar(title: String, onRequests: () -> Unit, onHistory: () -> Unit, onSettings: () -> Unit, onSearch: (() -> Unit)? = null,
+    searchLabel: String = stringResource(R.string.search_requests)) {
     var queueMenu by remember { mutableStateOf(false) }
     var overflow by remember { mutableStateOf(false) }
     val switchLabel = stringResource(R.string.switch_queue)
@@ -32,7 +33,7 @@ fun QueueTopBar(title: String, onRequests: () -> Unit, onHistory: () -> Unit, on
                 DropdownMenuItem(text = { Text(stringResource(R.string.history_title)) }, onClick = { queueMenu = false; onHistory() })
             }
         }
-        if (onSearch != null) IconButton(onSearch) { Icon(Icons.Default.Search, stringResource(R.string.search_requests)) }
+        if (onSearch != null) IconButton(onSearch) { Icon(Icons.Default.Search, searchLabel) }
         Spacer(Modifier.weight(1f))
         Box {
             IconButton(onClick = { overflow = true }) { Icon(Icons.Default.MoreVert, stringResource(R.string.more_options)) }

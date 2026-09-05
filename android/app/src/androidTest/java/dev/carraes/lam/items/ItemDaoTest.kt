@@ -24,6 +24,14 @@ class ItemDaoTest {
 
     @After fun tearDown() { database.close() }
 
+    @Test fun diagnosticCountsIncludeAllCachedRowsAndClearWithUnpair() = runTest {
+        assertEquals(dev.carraes.lam.diagnostics.ItemCounts(0, 0), store.counts())
+        store.upsert(listOf(row("open"), row("resolved", StatusDto.RESOLVED), row("expired", StatusDto.EXPIRED)))
+        assertEquals(dev.carraes.lam.diagnostics.ItemCounts(3, 1), store.counts())
+        store.clear()
+        assertEquals(dev.carraes.lam.diagnostics.ItemCounts(0, 0), store.counts())
+    }
+
     @Test fun jsonArraysAndEveryCanonicalFieldRoundTrip() = runTest {
         val original = row().copy(canonical = row().canonical.copy(
             name = "Agent", choices = listOf("quote\"", "comma,", "unicode ☕"),

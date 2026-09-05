@@ -9,6 +9,7 @@ internal interface ItemStorage {
     fun history(key: String): Flow<List<ItemEntity>>
     suspend fun get(id: String): ItemEntity?
     suspend fun lastSuccess(): Instant?
+    suspend fun counts(): dev.carraes.lam.diagnostics.ItemCounts
     suspend fun upsert(items: List<ItemEntity>)
     suspend fun reconcile(items: List<ItemEntity>, at: Instant)
     suspend fun cacheHistory(key: String, items: List<ItemEntity>, replace: Boolean)

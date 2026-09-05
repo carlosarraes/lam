@@ -17,6 +17,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import dev.carraes.lam.sync.LifecycleReconciler
+import dev.carraes.lam.items.DeviceSettings
+import dev.carraes.lam.diagnostics.Diagnostics
 
 class AppContainer(
     val applicationContext: Context,
@@ -30,6 +32,9 @@ class AppContainer(
     )
 
     val itemRepository: ItemRepository = items
+    val deviceSettings: DeviceSettings = items
+    val diagnostics = Diagnostics(BuildConfig.VERSION_NAME, android.os.Build.VERSION.RELEASE,
+        "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} ${android.os.Build.ID}")
 
     val credentialStore: CredentialStore = items.credentialStore
 

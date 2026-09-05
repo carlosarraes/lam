@@ -1,0 +1,79 @@
+package dev.carraes.lam.ui.history
+
+import dev.carraes.lam.items.*
+import dev.carraes.lam.items.ItemRepositoryTest.Companion.item
+import dev.carraes.lam.items.ItemRepositoryTest.Companion.NOW
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.test.*
+import org.junit.After
+import org.junit.Assert.*
+import org.junit.Before
+import org.junit.Test
+
+@OptIn(ExperimentalCoroutinesApi::class)
+class HistoryViewModelTest {
+    @Before fun setup() { Dispatchers.setMain(StandardTestDispatcher()) }
+    @After fun teardown() { Dispatchers.resetMain() }
+
+    @Test fun `server search and filters replace results while opaque cursor appends tied closure rows`() = runTest {
+        val storage = MemoryStorage()
+        val api = FakeApi()
+        api.open = listOf(item("open"))
+        val repo = DefaultItemRepository(storage, { api }, FakeCredentials(), backgroundScope)
+        repo.refresh()
+        val calls = mutableListOf<Pair<HistoryQuery, String?>>()
+        api.historyRead = { query, cursor ->
+            calls += query to cursor
+            when {
+                query.query == "remote body" -> HistoryPageDto(listOf(item("match", StatusDto.RESOLVED)), null)
+                query.priority != null -> HistoryPageDto(listOf(item("priority", StatusDto.RESOLVED)), null)
+                query.type != null -> HistoryPageDto(listOf(item("type", StatusDto.RESOLVED)), null)
+                cursor == "opaque+/==" -> HistoryPageDto(listOf(item("a", StatusDto.RESOLVED)), null)
+                else -> HistoryPageDto(listOf(item("z", StatusDto.RESOLVED)), "opaque+/==")
+            }
+        }
+        val vm = HistoryViewModel(repo)
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { vm.state.collect() }
+        runCurrent()
+        assertEquals(listOf("z"), vm.state.value.items.map { it.id })
+        vm.loadMore(); runCurrent()
+        assertEquals(listOf("z", "a"), vm.state.value.items.map { it.id })
+        assertEquals("opaque+/==", calls.last().second)
+        vm.setQuery("remote body"); runCurrent()
+        assertEquals(listOf("match"), vm.state.value.items.map { it.id })
+        assertEquals(HistoryQuery("remote body") to null, calls.last())
+        vm.setQuery(""); vm.setPriority(PriorityDto.CRITICAL); runCurrent()
+        assertEquals(HistoryQuery(null, PriorityDto.CRITICAL) to null, calls.last())
+        assertEquals(listOf("priority"), vm.state.value.items.map { it.id })
+        vm.setPriority(null); vm.setType(ItemTypeDto.CHECKLIST); runCurrent()
+        assertEquals(HistoryQuery(type = ItemTypeDto.CHECKLIST) to null, calls.last())
+        assertEquals(listOf("type"), vm.state.value.items.map { it.id })
+        assertEquals(listOf("open"), repo.openItems.first().map { it.id })
+    }
+
+    @Test fun `failed read shows cached history and preserves cursor for retry`() = runTest {
+        val storage = MemoryStorage()
+        val api = FakeApi()
+        val repo = DefaultItemRepository(storage, { api }, FakeCredentials(), backgroundScope)
+        repo.refresh()
+        api.historyRead = { _, _ -> HistoryPageDto(listOf(item("cached", StatusDto.RESOLVED)), "next") }
+        val vm = HistoryViewModel(repo)
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { vm.state.collect() }
+        runCurrent()
+        api.historyRead = { _, _ -> throw ApiError.Transport("offline") }
+        vm.loadMore(); runCurrent()
+        assertEquals("cached", vm.state.value.items.single().id)
+        assertTrue(vm.state.value.stale)
+        assertTrue(vm.state.value.loadFailed)
+        assertEquals("next", vm.state.value.nextCursor)
+        assertFalse(repo.syncState.value.mutationsEnabled)
+        api.historyRead = { _, cursor ->
+            assertEquals("next", cursor)
+            HistoryPageDto(listOf(item("older", StatusDto.RESOLVED).copy(resolvedAt = "2026-09-03T11:00:00Z")), null)
+        }
+        vm.loadMore(); runCurrent()
+        assertEquals(listOf("cached", "older"), vm.state.value.items.map { it.id })
+        assertFalse(repo.syncState.value.mutationsEnabled)
+    }
+}

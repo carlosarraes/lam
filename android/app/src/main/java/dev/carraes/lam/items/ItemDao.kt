@@ -10,6 +10,9 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 abstract class ItemDao {
+    @Query("SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END), 0) AS open FROM items")
+    abstract suspend fun counts(): dev.carraes.lam.diagnostics.ItemCounts
+
     @Query("SELECT * FROM items WHERE status = 'OPEN' ORDER BY CASE priority WHEN 'CRITICAL' THEN 0 WHEN 'NORMAL' THEN 1 ELSE 2 END, createdAtEpoch DESC, id DESC")
     abstract fun observeOpen(): Flow<List<ItemEntity>>
 

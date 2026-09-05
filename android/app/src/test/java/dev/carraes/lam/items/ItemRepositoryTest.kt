@@ -31,6 +31,55 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ItemRepositoryTest {
+    @Test fun `self revoke clears cache and credentials only after remote success`() = runTest {
+        val f = fixture()
+        f.repo.refresh()
+        val held = CompletableDeferred<Unit>()
+        f.api.beforeRevoke = { held.await() }
+        val revoke = async { f.repo.revoke(requireNotNull(f.repo.reconciliationSession.value)) }
+        runCurrent()
+        assertNotNull(f.credentials.state.value)
+        assertEquals(1, f.repo.openItems.first().size)
+        held.complete(Unit)
+        assertEquals(UnpairResult.REVOKED, revoke.await())
+        assertNull(f.credentials.state.value)
+        assertTrue(f.repo.openItems.first().isEmpty())
+        assertNull(f.store.lastSuccess())
+        assertEquals(1, f.api.revocations)
+    }
+
+    @Test fun `unavailable revoke preserves pairing until explicit guarded local erase`() = runTest {
+        val f = fixture()
+        f.repo.refresh()
+        val session = requireNotNull(f.repo.reconciliationSession.value)
+        f.api.revokeError = ApiError.Transport("offline secret")
+        assertEquals(UnpairResult.UNAVAILABLE, f.repo.revoke(session))
+        assertNotNull(f.credentials.state.value)
+        assertEquals(1, f.repo.openItems.first().size)
+        assertTrue(f.repo.eraseLocal(session))
+        assertNull(f.credentials.state.value)
+        assertTrue(f.repo.openItems.first().isEmpty())
+        assertEquals(1, f.api.revocations)
+    }
+
+    @Test fun `old confirmations and in flight revoke cannot erase same metadata replacement`() = runTest {
+        val f = fixture()
+        f.repo.refresh()
+        val original = requireNotNull(f.credentials.state.value)
+        val session = requireNotNull(f.repo.reconciliationSession.value)
+        val held = CompletableDeferred<Unit>()
+        f.api.beforeRevoke = { held.await() }
+        val revoke = async { f.repo.revoke(session) }
+        runCurrent()
+        f.repo.credentialStore.save(original, "replacement credential")
+        held.complete(Unit)
+        assertEquals(UnpairResult.SESSION_CHANGED, revoke.await())
+        assertFalse(f.repo.eraseLocal(session))
+        assertEquals(UnpairResult.SESSION_CHANGED, f.repo.revoke(session))
+        assertEquals(original, f.credentials.state.value)
+        assertEquals(1, f.api.revocations)
+    }
+
     @Test fun `session identity is unavailable during restore and replacement and changes with identical metadata`() = runTest {
         val f = fixture()
         assertNull(f.repo.reconciliationSession.value)
@@ -524,6 +573,10 @@ internal class FakeCredentials : CredentialStore {
 }
 
 internal class FakeApi : LamApi {
+    var beforeRevoke: suspend () -> Unit = {}
+    var revokeError: ApiError? = null
+    var revocations = 0
+    var historyRead: (suspend (HistoryQuery, String?) -> HistoryPageDto)? = null
     var open = listOf(ItemRepositoryTest.item())
     var fetched = ItemRepositoryTest.item()
     var result = ItemRepositoryTest.item(status = StatusDto.RESOLVED)
@@ -537,7 +590,8 @@ internal class FakeApi : LamApi {
     var submissions = 0
     override suspend fun listOpenItems(): List<ItemDto> { calls += "open"; beforeRead(); readError?.let { throw it }; return open }
     override suspend fun getItem(id: String): ItemDto { calls += "get:$id"; beforeGet(); readError?.let { throw it }; return fetched }
-    override suspend fun getHistory(query: String?, priority: PriorityDto?, type: ItemTypeDto?, cursor: String?, limit: Int) = history
+    override suspend fun getHistory(query: String?, priority: PriorityDto?, type: ItemTypeDto?, cursor: String?, limit: Int) =
+        historyRead?.invoke(HistoryQuery(query, priority, type), cursor) ?: history
     private suspend fun write(call: String): ItemDto { calls += call; submissions++; beforeWrite(); writeError?.let { throw it }; return result }
     override suspend fun replyChoice(id: String, choice: String) = write("choice:$id:$choice")
     override suspend fun replyText(id: String, text: String) = write("text:$id:$text")
@@ -545,7 +599,10 @@ internal class FakeApi : LamApi {
     override suspend fun setCheck(id: String, index: Int, done: Boolean) = write("check:$id:$index:$done")
     override suspend fun getDevice(): DeviceRegistrationDto = error("unused")
     override suspend fun updateDevice(update: DeviceUpdateDto): DeviceRegistrationDto = error("unused")
-    override suspend fun revokeDevice(): DeviceSummaryDto = error("unused")
+    override suspend fun revokeDevice(): DeviceSummaryDto {
+        revocations++; beforeRevoke(); revokeError?.let { throw it }
+        return DeviceSummaryDto("device", "Phone", "1", "16", "2026-09-04T09:00:00Z", null, false, "2026-09-04T12:00:00Z")
+    }
     override suspend fun claimPairing(sessionId: String, request: PairingClaimRequestDto): PairingClaimResponseDto = error("unused")
 }
 
@@ -559,6 +616,7 @@ internal class MemoryStorage : ItemStorage {
     override fun history(key: String) = kotlinx.coroutines.flow.combine(rows, members) { all, membership -> membership[key].orEmpty().mapNotNull(all::get) }
     override suspend fun get(id: String) = rows.value[id]
     override suspend fun lastSuccess() = success
+    override suspend fun counts() = dev.carraes.lam.diagnostics.ItemCounts(rows.value.size, rows.value.values.count { it.canonical.status == StatusDto.OPEN })
     override suspend fun upsert(items: List<ItemEntity>) {
         rows.value = rows.value.toMutableMap().apply {
             items.forEach { incoming ->

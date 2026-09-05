@@ -11,6 +11,7 @@ internal class RoomItemStorage(private val database: LamDatabase) : ItemStorage 
     override fun history(key: String) = items.observeHistory(key)
     override suspend fun get(id: String) = items.get(id)
     override suspend fun lastSuccess(): Instant? = metadata.lastSuccess()?.let(Instant::parse)
+    override suspend fun counts() = items.counts()
     override suspend fun upsert(items: List<ItemEntity>) = this.items.upsertAll(items)
     override suspend fun reconcile(items: List<ItemEntity>, at: Instant) = database.withTransaction {
         this.items.upsertAll(items)
