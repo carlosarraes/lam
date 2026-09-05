@@ -9,6 +9,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.ViewModelStoreOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
 import dev.carraes.lam.AppContainer
@@ -43,7 +44,11 @@ private fun PairedApp(container: AppContainer) {
         LamNav(state, requests::setQuery, requests::setType, requests::setPriority, requests::clearFilters, requests::refresh,
             onRequestAction = { id, dismiss -> action = id to dismiss },
             historyContent = { onRequests, onSettings ->
-                val history = viewModel { HistoryViewModel(container.itemRepository) }
+                val history = viewModel { HistoryViewModel(container.itemRepository, container.lifecycleReconciler.completedReconciliations) }
+                LifecycleStartEffect(history) {
+                    history.setVisible(true)
+                    onStopOrDispose { history.setVisible(false) }
+                }
                 val historyState by history.state.collectAsStateWithLifecycle()
                 HistoryScreen(historyState, history::setQuery, history::setType, history::setPriority,
                     history::clearFilters, history::refresh, history::loadMore, onRequests, onSettings)

@@ -85,6 +85,12 @@ class OkHttpLamApi(
         serializer = ItemDto.serializer(),
     )
 
+    override suspend fun complete(id: String): ItemDto = postJson(
+        segments = arrayOf("items", id, "resolve"),
+        body = "{}",
+        serializer = ItemDto.serializer(),
+    )
+
     override suspend fun replyText(id: String, text: String): ItemDto = postJson(
         segments = arrayOf("items", id, "resolve"),
         body = json.encodeToString(TextResolution(text)),

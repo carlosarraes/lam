@@ -14,7 +14,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             LamTheme {
                 val container = (application as LamApplication).container
-                val pairing = viewModel { PairingViewModel(container.pairingRepository, BuildConfig.DEBUG) }
+                val pairing = viewModel { PairingViewModel(container.pairingRepository, BuildConfig.DEBUG, container.itemRepository.syncState) }
                 LamApp(container, pairing)
             }
         }

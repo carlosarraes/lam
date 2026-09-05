@@ -44,11 +44,14 @@ fun AnswerConfirmationSheet(confirmation: AnswerConfirmation, enabled: Boolean, 
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             Text(when (val answer = confirmation.answer) {
                 is FinalAnswer.Choice -> stringResource(R.string.detail_confirm_choice, answer.value)
+                FinalAnswer.Complete -> stringResource(R.string.detail_confirm_done)
                 else -> stringResource(R.string.detail_confirm_reply)
             }, style = MaterialTheme.typography.titleLarge)
             if (confirmation.answer is FinalAnswer.Text) Text(confirmation.answer.value)
             Text(stringResource(R.string.detail_reply_resolves), style = MaterialTheme.typography.bodyMedium)
-            Button(onConfirm, enabled = enabled, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(8.dp)) { Text(stringResource(R.string.detail_send_reply)) }
+            Button(onConfirm, enabled = enabled, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(8.dp)) {
+                Text(stringResource(if (confirmation.answer == FinalAnswer.Complete) R.string.detail_send_done else R.string.detail_send_reply))
+            }
             TextButton(onDismiss, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.pairing_cancel)) }
         }
     }

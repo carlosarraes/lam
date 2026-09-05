@@ -16,6 +16,67 @@ class DecisionRepositoryIntegrationTest {
     @Before fun setup() { Dispatchers.setMain(StandardTestDispatcher()) }
     @After fun teardown() { Dispatchers.resetMain() }
 
+    @Test fun plainCompletionPreflightsAndRecoversLostResponseWithoutReplay() = runTest {
+        val f = fixture()
+        f.api.fetched = f.api.fetched.copy(choices = emptyList())
+        assertFalse(f.repo.answer("a", FinalAnswer.Complete))
+        runCurrent()
+        assertEquals(StatusDto.RESOLVED, f.vm.state.value.item?.status)
+        assertEquals(listOf("get:a", "complete:a", "get:a", "open"), f.api.calls)
+        assertEquals(1, f.api.submissions)
+    }
+
+    @Test fun foregroundReconciliationRecoversObservedRemoteClosure() = runTest {
+        val f = fixture()
+        f.api.fetched = f.api.fetched.copy(status = StatusDto.RESOLVED, version = 2,
+            responseChoice = "done", responseBy = ResponseByDto.PHONE)
+        f.api.open = emptyList()
+        assertTrue(f.repo.refresh()); runCurrent()
+        assertEquals(StatusDto.RESOLVED, f.vm.state.value.item?.status)
+        assertEquals(ResponseByDto.PHONE, f.vm.state.value.item?.responseBy)
+        assertTrue(f.repo.openItems.first().isEmpty())
+        assertEquals(listOf("open", "get:a"), f.api.calls)
+    }
+
+    @Test fun failedObservedClosureReadRetainsReadableSnapshotAndBlocksMutations() = runTest {
+        val f = fixture()
+        f.api.open = emptyList()
+        f.api.beforeGet = { throw ApiError.Transport("offline") }
+        assertFalse(f.repo.refresh()); runCurrent()
+        assertEquals("Body", f.vm.state.value.item?.body)
+        assertFalse(f.vm.state.value.actionsEnabled)
+    }
+
+    @Test fun cancellationImmediatelyAfterAnswerCommitRecoversWithoutReplay() = runTest {
+        assertCancelledSubmission(false)
+    }
+
+    @Test fun cancellationImmediatelyAfterFinalCheckCommitRecoversWithoutReplay() = runTest {
+        assertCancelledSubmission(true)
+    }
+
+    private suspend fun TestScope.assertCancelledSubmission(check: Boolean) {
+        val api = FakeApi()
+        val repo = DefaultItemRepository(MemoryStorage(), { api }, FakeCredentials(), backgroundScope)
+        assertTrue(repo.refresh())
+        api.calls.clear()
+        api.beforeWrite = {
+            api.fetched = api.result.copy(version = 2, responseBy = ResponseByDto.PHONE)
+            api.open = emptyList()
+            throw CancellationException("response cancelled after commit")
+        }
+        val submit = launch {
+            if (check) repo.setCheck("a", 0, true) else repo.answer("a", FinalAnswer.Choice("done"))
+        }
+        submit.join()
+        assertTrue(submit.isCancelled)
+        assertFalse(repo.syncState.value.mutationsEnabled)
+        assertTrue(repo.refresh())
+        assertEquals(StatusDto.RESOLVED, repo.item("a").first()?.status)
+        assertEquals(1, api.submissions)
+        assertEquals(listOf("get:a", "open"), api.calls.takeLast(2))
+    }
+
     @Test fun committedReplyWithLostResponseKeepsCanonicalOutcomeOnVisibleDetail() = runTest {
         assertCommittedReply(ApiError.Transport("response lost"))
     }

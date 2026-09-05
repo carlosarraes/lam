@@ -2,6 +2,8 @@ package dev.carraes.lam.sync
 
 import androidx.lifecycle.*
 import dev.carraes.lam.items.SyncState
+import dev.carraes.lam.items.*
+import dev.carraes.lam.ui.detail.DecisionViewModel
 import dev.carraes.lam.ui.requests.RequestsFakeRepository
 import dev.carraes.lam.ui.requests.now
 import kotlinx.coroutines.*
@@ -12,6 +14,63 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class LifecycleReconcilerTest {
+    @Test fun newlyUsableConnectionAndManualRefreshShareOneFastReconciliation() = runTest {
+        val tracker = ConnectivityTracker("vpn", true, initialVpn = true)
+        val api = FakeApi()
+        val repo = DefaultItemRepository(MemoryStorage(), { api }, FakeCredentials(), backgroundScope,
+            connectivity = tracker.state)
+        val owner = Owner()
+        val reconciler = LifecycleReconciler(repo, repo.reconciliationSession, owner.lifecycle, backgroundScope, tracker.state)
+        owner.foreground(); runCurrent()
+        tracker.physicalAvailable("wifi")
+        val manual = async { reconciler.refresh() }
+        runCurrent()
+        assertTrue(manual.await())
+        assertEquals(listOf("open"), api.calls)
+        assertEquals(1L, reconciler.completedReconciliations.value)
+        reconciler.close()
+    }
+    @Test fun delayedPhysicalCallbackReconcilesForegroundLaunchWithoutPolling() = runTest {
+        val tracker = ConnectivityTracker("vpn", true, initialVpn = true)
+        val api = FakeApi()
+        val repo = DefaultItemRepository(MemoryStorage(), { api }, FakeCredentials(), backgroundScope,
+            connectivity = tracker.state)
+        val owner = Owner()
+        val reconciler = LifecycleReconciler(repo, repo.reconciliationSession, owner.lifecycle, backgroundScope, tracker.state)
+        owner.foreground(); runCurrent()
+        assertTrue(api.calls.isEmpty())
+        tracker.physicalAvailable("wifi"); runCurrent()
+        assertEquals(listOf("open"), api.calls)
+        assertTrue(repo.syncState.value.mutationsEnabled)
+        owner.background(); runCurrent()
+        tracker.physicalLost("wifi"); runCurrent()
+        tracker.physicalAvailable("wifi"); runCurrent()
+        advanceTimeBy(600_000); runCurrent()
+        assertEquals(listOf("open"), api.calls)
+        reconciler.close()
+    }
+
+    @Test fun visibleDetailSurvivesLongBackgroundAndRecoversRemoteClosureOnResume() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        try {
+            val api = FakeApi()
+            val repo = DefaultItemRepository(MemoryStorage(), { api }, FakeCredentials(), backgroundScope)
+            val owner = Owner()
+            val reconciler = LifecycleReconciler(repo, repo.reconciliationSession, owner.lifecycle, backgroundScope)
+            owner.foreground(); runCurrent()
+            val vm = DecisionViewModel("a", repo, reconciler::refresh)
+            runCurrent()
+            owner.background(); runCurrent(); advanceTimeBy(600_000); runCurrent()
+            api.open = emptyList()
+            api.fetched = api.result.copy(version = 2, responseBy = ResponseByDto.CLI)
+            api.calls.clear()
+            owner.foreground(); runCurrent()
+            assertEquals(StatusDto.RESOLVED, vm.state.value.item?.status)
+            assertEquals(ResponseByDto.CLI, vm.state.value.item?.responseBy)
+            assertEquals(listOf("open", "get:a"), api.calls)
+            reconciler.close()
+        } finally { Dispatchers.resetMain() }
+    }
     private class Owner : LifecycleOwner {
         override val lifecycle = LifecycleRegistry.createUnsafe(this)
         fun foreground() { lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_START) }

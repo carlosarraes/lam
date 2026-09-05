@@ -211,6 +211,27 @@ class KeystoreCredentialStoreTest {
     }
 
     @Test
+    fun issuedClientHasNoAuthorizationAfterClearOrReplacement() = runBlocking {
+        MockWebServer().use { server ->
+            repeat(4) { server.enqueue(MockResponse().setHeader("Content-Type", "application/json").setBody("[]")) }
+            val composition = createCredentialComposition(context)
+            val paired = pairedServer().copy(serverUrl = server.url("/").toString())
+            composition.credentialStore.save(paired, CREDENTIAL)
+            val oldApi = requireNotNull(composition.api())
+            oldApi.listOpenItems()
+            assertEquals("Bearer $CREDENTIAL", server.takeRequest().getHeader("Authorization"))
+            composition.credentialStore.clear()
+            oldApi.listOpenItems()
+            assertNull(server.takeRequest().getHeader("Authorization"))
+            composition.credentialStore.save(paired, "synthetic-replacement-credential")
+            oldApi.listOpenItems()
+            assertNull(server.takeRequest().getHeader("Authorization"))
+            requireNotNull(composition.api()).listOpenItems()
+            assertEquals("Bearer synthetic-replacement-credential", server.takeRequest().getHeader("Authorization"))
+        }
+    }
+
+    @Test
     fun keystoreOperationsLeaveTheCallingMainThread() = runBlocking {
         val executor = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "credential-device-io")

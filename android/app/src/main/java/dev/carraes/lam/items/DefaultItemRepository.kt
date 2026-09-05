@@ -20,6 +20,8 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
@@ -89,6 +91,7 @@ internal class DefaultItemRepository(
     private val recentErrors = ArrayDeque<ErrorCategory>()
     // One read recovery at most: operations serialize, and stale state blocks the next final answer.
     private var unresolvedFinalAnswer: String? = null
+    private val observedItems = mutableMapOf<String, Int>()
     private val state = MutableStateFlow<SyncState>(SyncState.Idle)
     private val errorEvents = Channel<Exception>(Channel.BUFFERED)
     private val pairing = MutableSharedFlow<PairedServer?>(replay = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
@@ -102,7 +105,25 @@ internal class DefaultItemRepository(
         override suspend fun save(server: PairedServer, credential: String) = replaceCredential(server, credential)
         override suspend fun clear() = unpair()
     }
-    override fun item(id: String) = storage.item(id).map { it?.let(ItemMapper::toItem) }
+    override fun item(id: String) = flow {
+        initialized.await()
+        val observedGeneration = stateLock.withLock {
+            observedItems[id] = (observedItems[id] ?: 0) + 1
+            generation
+        }
+        try {
+            emitAll(storage.item(id).map { it?.let(ItemMapper::toItem) })
+        } finally {
+            withContext(NonCancellable) {
+                stateLock.withLock {
+                    if (generation == observedGeneration) {
+                        val remaining = (observedItems[id] ?: 1) - 1
+                        if (remaining == 0) observedItems.remove(id) else observedItems[id] = remaining
+                    }
+                }
+            }
+        }
+    }
     override fun history(query: HistoryQuery) = storage.history(query.key).map { it.map(ItemMapper::toItem) }
 
     init {
@@ -183,14 +204,18 @@ internal class DefaultItemRepository(
             return@operation false
         }
         // The generation guard prevents submission after unpair while the preflight read was pending.
-        if (!canSubmit(session)) return@operation false
+        if (!prepareSubmission(session, id)) return@operation false
         try {
             val result = when (answer) {
+                FinalAnswer.Complete -> session.api.complete(id)
                 is FinalAnswer.Choice -> session.api.replyChoice(id, answer.value)
                 is FinalAnswer.Text -> session.api.replyText(id, answer.value)
                 FinalAnswer.Dismiss -> session.api.dismiss(id)
             }
-            commit(session) { storage.upsert(listOf(ItemMapper.toEntity(result))) }
+            commit(session) {
+                storage.upsert(listOf(ItemMapper.toEntity(result)))
+                unresolvedFinalAnswer = null
+            }
         } catch (error: ApiError) {
             mutationFailed(session, id, error, finalAnswer = true)
             false
@@ -207,13 +232,16 @@ internal class DefaultItemRepository(
             if (i == index) check.copy(done = done, at = if (done) clock.instant().toString() else null) else check
         }
         if (!commit(session) { storage.optimistic(snapshot, snapshot.copy(canonical = snapshot.canonical.copy(checks = checks), optimisticTag = tag)) }) return@operation false
-        if (!canSubmit(session)) {
+        if (!prepareSubmission(session, id)) {
             withContext(NonCancellable) { commit(session) { storage.rollback(snapshot, tag) } }
             return@operation false
         }
         try {
             val canonical = session.api.setCheck(id, index, done)
-            commit(session) { storage.upsert(listOf(ItemMapper.toEntity(canonical))) }
+            commit(session) {
+                storage.upsert(listOf(ItemMapper.toEntity(canonical)))
+                unresolvedFinalAnswer = null
+            }
         } catch (error: Exception) {
             withContext(NonCancellable) {
                 commit(session) { storage.rollback(snapshot, tag) }
@@ -276,6 +304,17 @@ internal class DefaultItemRepository(
             if (!commit(session) { storage.upsert(listOf(ItemMapper.toEntity(canonical))) }) return false
         }
         val items = session.api.listOpenItems().map(ItemMapper::toEntity)
+        val observedMissing = stateLock.withLock {
+            if (session.generation != generation) return false
+            observedItems.keys.filter { id ->
+                id != unresolved && items.none { it.canonical.id == id } &&
+                    storage.get(id)?.canonical?.status == StatusDto.OPEN
+            }
+        }
+        for (id in observedMissing) {
+            val canonical = session.api.getItem(id)
+            if (!commit(session) { storage.upsert(listOf(ItemMapper.toEntity(canonical))) }) return false
+        }
         var reconciled = false
         val committed = commit(session) {
             val now = clock.instant()
@@ -365,6 +404,7 @@ internal class DefaultItemRepository(
         reconciledConnectionEpoch = null
         recentErrors.clear()
         unresolvedFinalAnswer = null
+        observedItems.clear()
         state.value = if (revoked) SyncState.Revoked else SyncState.Idle
     }
 
@@ -402,9 +442,12 @@ internal class DefaultItemRepository(
 
     private fun connectionIsCurrent(session: Session): Boolean = connectivity.value.let { it.available && it.epoch == session.connectionEpoch }
 
-    private suspend fun canSubmit(session: Session): Boolean = stateLock.withLock {
-        session.generation == generation && connectionIsCurrent(session) &&
+    private suspend fun prepareSubmission(session: Session, id: String): Boolean = stateLock.withLock {
+        val allowed = session.generation == generation && connectionIsCurrent(session) &&
             reconciledConnectionEpoch == session.connectionEpoch && state.value.mutationsEnabled
+        // Cancellation after this point cannot prove the server did not receive the write.
+        if (allowed) unresolvedFinalAnswer = id
+        allowed
     }
 
     private suspend fun commit(session: Session, write: suspend () -> Unit): Boolean = stateLock.withLock {

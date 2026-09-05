@@ -31,6 +31,21 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 @OptIn(ExperimentalTestApi::class)
 class DecisionDetailScreenTest {
+    @Test fun plainDoneRequiresConfirmationAndCompletesWithoutInventingAReply() {
+        val repository = DeviceDetailRepository()
+        repository.current.value = example.copy(choices = emptyList(), checks = emptyList())
+        compose.setContent {
+            val vm = remember { DecisionViewModel("request", repository) }
+            LamTheme { DecisionDetailScreen(vm, onBack = {}) }
+        }
+        compose.waitUntilAtLeastOneExists(hasText("Context"))
+        compose.onNodeWithText("Done").performScrollTo().performClick()
+        compose.onNodeWithText("Mark as done?").assertExists()
+        compose.runOnIdle { assertTrue(repository.answers.isEmpty()) }
+        compose.onNodeWithText("Confirm done").performClick()
+        compose.onNodeWithTag("outcome").performScrollTo().assertExists()
+        compose.runOnIdle { assertEquals(1, repository.answers.size) }
+    }
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
 
     @Before fun keepAwake() {

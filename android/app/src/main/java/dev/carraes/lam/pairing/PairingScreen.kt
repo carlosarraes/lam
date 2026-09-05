@@ -74,6 +74,7 @@ internal fun PairingContent(
                 }
                 else -> {
                     Text(stringResource(R.string.pairing_title), style = MaterialTheme.typography.headlineMedium)
+                    if (state == PairingState.Revoked) Text(stringResource(R.string.pairing_revoked))
                     Text(stringResource(R.string.pairing_instructions))
                     if (state == PairingState.PermissionDenied) Text(stringResource(R.string.pairing_permission_denied))
                     if (state is PairingState.Failed) Text(stringResource(state.problem.messageResource()))

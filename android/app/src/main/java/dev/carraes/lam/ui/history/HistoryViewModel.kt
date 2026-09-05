@@ -20,15 +20,26 @@ data class HistoryState(
     val incomplete: Boolean = false,
 )
 
-class HistoryViewModel(private val repository: ItemRepository) : ViewModel() {
+class HistoryViewModel(private val repository: ItemRepository,
+    reconciliations: StateFlow<Long> = MutableStateFlow(0L),
+) : ViewModel() {
     private val mutableState = MutableStateFlow(HistoryState())
     val state = mutableState.asStateFlow()
     private var revision = 0L
     private var cache: Job? = null
     private var page: Job? = null
     private val fallback = MutableStateFlow(false)
+    private var visible = false
+    private var refreshPending = false
 
     init {
+        viewModelScope.launch {
+            reconciliations.drop(1).collect {
+                if (visible) {
+                    if (state.value.loading) refreshPending = true else fetch(null)
+                }
+            }
+        }
         viewModelScope.launch {
             repository.syncState.collect { sync ->
                 mutableState.update { it.copy(stale = sync is SyncState.Stale, lastSuccess = when (sync) {
@@ -47,11 +58,16 @@ class HistoryViewModel(private val repository: ItemRepository) : ViewModel() {
     fun clearFilters() = change(state.value.query.copy(priority = null, type = null))
     fun refresh() { if (!state.value.loading) fetch(null) }
     fun loadMore() { state.value.nextCursor?.let { if (!state.value.loading) fetch(it) } }
+    fun setVisible(value: Boolean) {
+        visible = value
+        if (!value) refreshPending = false
+    }
 
     private fun change(query: HistoryQuery) { if (query != state.value.query) select(query) }
 
     private fun select(query: HistoryQuery) {
         revision++
+        refreshPending = false
         cache?.cancel()
         page?.cancel()
         fallback.value = false
@@ -84,6 +100,10 @@ class HistoryViewModel(private val repository: ItemRepository) : ViewModel() {
                 mutableState.update {
                     it.copy(loading = false, loadFailed = !result.succeeded, incomplete = !result.succeeded,
                         nextCursor = if (result.succeeded) result.nextCursor else it.nextCursor)
+                }
+                if (refreshPending && visible) {
+                    refreshPending = false
+                    fetch(null)
                 }
             }
         }

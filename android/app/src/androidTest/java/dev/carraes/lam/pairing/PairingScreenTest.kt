@@ -28,6 +28,11 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class PairingScreenTest {
+    @Test fun revokedPairingExplainsWhyAndOffersScanning() {
+        compose.setContent { LamTheme { PairingContent(PairingState.Revoked, {}, {}, {}, {}, {}) } }
+        compose.onNodeWithText("This device was revoked").assertExists()
+        compose.onNodeWithText("Scan pairing code").assertExists()
+    }
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
 
     @Before fun keepTestActivityAwake() {

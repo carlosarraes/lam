@@ -1,6 +1,7 @@
 package dev.carraes.lam.items
 
 interface LamApi {
+    suspend fun complete(id: String): ItemDto
     suspend fun listOpenItems(): List<ItemDto>
 
     suspend fun getItem(id: String): ItemDto

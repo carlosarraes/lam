@@ -14,6 +14,7 @@ class LifecycleReconciler(
     private val sessions: StateFlow<Long?>,
     private val lifecycle: Lifecycle,
     scope: CoroutineScope,
+    private val connectivity: StateFlow<ConnectivityStatus> = MutableStateFlow(ConnectivityStatus(true, 0)),
 ) : AutoCloseable {
     private val owner = SupervisorJob(scope.coroutineContext[Job])
     private val work = CoroutineScope(scope.coroutineContext + owner)
@@ -22,29 +23,35 @@ class LifecycleReconciler(
         foreground.value = lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
     }
     private val lock = Mutex()
-    private data class Refresh(val session: Long, val result: Deferred<Boolean>)
+    private data class Refresh(val session: Long, val epoch: Long, val result: Deferred<Boolean>)
     private var inFlight: Refresh? = null
+    private val completed = MutableStateFlow(0L)
+    val completedReconciliations = completed.asStateFlow()
 
     init {
         lifecycle.addObserver(observer)
         work.launch {
             var seenForeground = false
             var observedSession: Long? = null
-            combine(sessions, foreground) { session, active -> session to active }.distinctUntilChanged().collect { (session, active) ->
+            combine(sessions, foreground, connectivity) { session, active, network -> Triple(session, active, network) }
+                .distinctUntilChanged().collect { (session, active, network) ->
                 // A direct post-save refresh can precede delivery of a queued old session event.
                 lock.withLock {
-                    if (session != sessions.value) return@collect
-                    if (inFlight?.session != session) {
+                    if (session != sessions.value || network != connectivity.value) return@collect
+                    if (inFlight?.session != session || inFlight?.epoch != network.epoch) {
                         inFlight?.result?.cancel()
                         inFlight = null
                     }
                 }
                 if (observedSession != session) seenForeground = false
                 observedSession = session
-                if (session != null && active) {
-                    val alreadyRefreshed = !seenForeground && repository.syncState.value is SyncState.Current
+                if (session != null && active && network.available) {
+                    val firstForeground = !seenForeground
                     seenForeground = true
-                    if (!alreadyRefreshed) work.launch { refresh(session) }
+                    work.launch(start = CoroutineStart.UNDISPATCHED) {
+                        // A post-pairing read can finish after this trigger was queued.
+                        if (!firstForeground || repository.syncState.value !is SyncState.Current) refresh(session)
+                    }
                 }
             }
         }
@@ -55,12 +62,16 @@ class LifecycleReconciler(
     private suspend fun refresh(session: Long): Boolean {
         val operation = lock.withLock {
             if (session != sessions.value) return false
+            val network = connectivity.value
+            if (!network.available) return false
             val current = inFlight
-            if (current?.session == session && !current.result.isCompleted) current.result else {
+            if (current?.session == session && current.epoch == network.epoch && !current.result.isCompleted) current.result else {
                 current?.result?.cancel()
                 work.async {
-                    if (session == sessions.value) repository.refresh() else false
-                }.also { inFlight = Refresh(session, it) }
+                    val succeeded = session == sessions.value && repository.refresh()
+                    if (succeeded && session == sessions.value && connectivity.value == network) completed.value++
+                    succeeded
+                }.also { inFlight = Refresh(session, network.epoch, it) }
             }
         }
         return operation.await()

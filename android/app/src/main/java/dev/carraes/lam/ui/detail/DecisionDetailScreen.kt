@@ -39,7 +39,7 @@ fun DecisionDetailScreen(viewModel: DecisionViewModel, onBack: () -> Unit, check
         onQuickResponse = viewModel::quickResponse, onDismissRequest = viewModel::dismissRequest,
         onCloseQuick = viewModel::closeQuickResponse, checklist = checks,
         onCheck = { index, done -> checklist?.setCheck(index, done) },
-        onConsumeFailure = { checklist?.consumeFailure(it) })
+        onConsumeFailure = { checklist?.consumeFailure(it) }, onComplete = viewModel::complete)
 }
 
 @Composable
@@ -61,6 +61,7 @@ fun DecisionDetailScreen(
     checklist: ChecklistState? = null,
     onCheck: (Int, Boolean) -> Unit = { _, _ -> },
     onConsumeFailure: (Long) -> Unit = {},
+    onComplete: () -> Unit = {},
 ) {
     val context = LocalContext.current
     var destination by rememberSaveable(state.item?.id) { mutableStateOf<String?>(null) }
@@ -134,6 +135,11 @@ fun DecisionDetailScreen(
                             ChecklistDetailScreen(item.checks, state.actionsEnabled && checklist?.actionsEnabled == true, onCheck, onWriteReply)
                         } else {
                             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                if (item.choices.isEmpty()) {
+                                    Button(onComplete, enabled = state.actionsEnabled, modifier = Modifier.fillMaxWidth()) {
+                                        Text(stringResource(R.string.done))
+                                    }
+                                }
                                 item.choices.forEachIndexed { index, choice ->
                                     val recommended = choice == item.recommendedChoice
                                     OutlinedButton(onClick = { onChoice(choice) }, enabled = state.actionsEnabled,

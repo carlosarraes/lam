@@ -143,11 +143,30 @@ class PairingViewModelTest {
     }
 
     @Test fun revokedDuringFirstRefreshReturnsToPairing() = runTest {
-        val store = Store()
-        val vm = PairingViewModel(repository(store, refresh = { store.clear(); false }), false)
+        val store = FakeCredentials().apply { state.value = null; publishCurrent() }
+        val api = FakeApi().apply { readError = ApiError.Unauthorized(null) }
+        val items = DefaultItemRepository(MemoryStorage(), { api }, store, backgroundScope)
+        val pairing = PairingRepository(items.credentialStore, items::refresh, DeviceIdentity("Pixel", "0.1.0", "16"),
+            { _, _, _ -> response() })
+        val vm = PairingViewModel(pairing, false, items.syncState)
         runCurrent(); vm.permissionResult(true); vm.onQr(qr()); advanceUntilIdle()
+        assertEquals(PairingState.Revoked, vm.state.value)
+        assertNull(store.state.value)
+    }
+
+    @Test fun existingSessionUnauthorizedExplainsRevocationButVoluntaryUnpairDoesNot() = runTest {
+        val store = FakeCredentials()
+        val api = FakeApi()
+        val items = DefaultItemRepository(MemoryStorage(), { api }, store, backgroundScope)
+        val pairing = PairingRepository(items.credentialStore, items::refresh, DeviceIdentity("Pixel", "0.1.0", "16"))
+        val vm = PairingViewModel(pairing, false, items.syncState)
+        runCurrent(); assertTrue(items.refresh())
+        api.readError = ApiError.Unauthorized(null)
+        assertFalse(items.refresh()); runCurrent()
+        assertEquals(PairingState.Revoked, vm.state.value)
+        items.credentialStore.save(PairedServer("https://lam.example", "replacement", "Pixel"), "synthetic")
+        runCurrent(); items.unpair(); runCurrent()
         assertEquals(PairingState.Ready, vm.state.value)
-        assertNull(store.credential)
     }
 
     @Test fun permissionDenialCanRetryAndCancelIgnoresLateFrames() = runTest {

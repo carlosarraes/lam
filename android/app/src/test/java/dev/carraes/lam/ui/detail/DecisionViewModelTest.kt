@@ -15,6 +15,26 @@ class DecisionViewModelTest {
     @Before fun setup() { Dispatchers.setMain(StandardTestDispatcher()) }
     @After fun teardown() { Dispatchers.resetMain() }
 
+    @Test fun plainCompletionIsConfirmedSingleSubmitAndStaleGuarded() = runTest {
+        val repo = DetailFakeRepository()
+        repo.current.value = detailItem.copy(choices = emptyList(), checks = emptyList())
+        val vm = DecisionViewModel("request", repo)
+        runCurrent()
+        vm.complete()
+        val first = vm.state.value.confirmation!!
+        assertEquals(FinalAnswer.Complete, first.answer)
+        assertTrue(repo.answers.isEmpty())
+        repo.syncState.value = SyncState.Stale(null, ApiError.Transport("offline")); runCurrent()
+        vm.confirm(first); vm.complete(); runCurrent()
+        assertTrue(repo.answers.isEmpty())
+        assertNull(vm.state.value.confirmation)
+        repo.syncState.value = SyncState.Current(Instant.parse("2026-09-04T12:00:00Z")); runCurrent()
+        vm.complete()
+        val current = vm.state.value.confirmation!!
+        vm.confirm(current); vm.confirm(current); runCurrent()
+        assertEquals(listOf(FinalAnswer.Complete), repo.answers)
+    }
+
     @Test fun everyChoiceNeedsConfirmationAndDoubleConfirmationOnlySendsOnce() = runTest {
         val repo = DetailFakeRepository()
         val vm = DecisionViewModel("request", repo)

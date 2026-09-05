@@ -44,6 +44,7 @@ class AppContainer(
     val lifecycleReconciler = LifecycleReconciler(
         itemRepository, items.reconciliationSession, ProcessLifecycleOwner.get().lifecycle,
         CoroutineScope(applicationScope.coroutineContext + Dispatchers.Main.immediate),
+        connectivity.state,
     )
 
     val pairingRepository = PairingRepository(

@@ -24,6 +24,9 @@
     <string name="priority_low">Low</string>
     <string name="clear_filters">Clear filters</string>
     <string name="done">Done</string>
+    <string name="detail_confirm_done">Mark as done?</string>
+    <string name="detail_send_done">Confirm done</string>
+    <string name="pairing_revoked">This device was revoked</string>
     <string name="requests_loading">Loading requests…</string>
     <string name="requests_empty">No open requests</string>
     <string name="requests_empty_hint">New requests will appear here.</string>

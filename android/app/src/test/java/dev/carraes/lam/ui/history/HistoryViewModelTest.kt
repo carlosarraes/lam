@@ -4,6 +4,8 @@ import dev.carraes.lam.items.*
 import dev.carraes.lam.items.ItemRepositoryTest.Companion.item
 import dev.carraes.lam.items.ItemRepositoryTest.Companion.NOW
 import dev.carraes.lam.ui.requests.fixedClock
+import androidx.lifecycle.*
+import dev.carraes.lam.sync.LifecycleReconciler
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.test.*
@@ -16,6 +18,58 @@ import org.junit.Test
 class HistoryViewModelTest {
     @Before fun setup() { Dispatchers.setMain(StandardTestDispatcher()) }
     @After fun teardown() { Dispatchers.resetMain() }
+
+    @Test fun completedReconciliationWhileHistoryIsLoadingQueuesOneVisibleRefresh() = runTest {
+        val api = FakeApi()
+        val repo = DefaultItemRepository(MemoryStorage(), { api }, FakeCredentials(), backgroundScope, fixedClock)
+        repo.refresh()
+        val completions = MutableStateFlow(0L)
+        val gate = CompletableDeferred<Unit>()
+        var reads = 0
+        api.historyRead = { query, cursor ->
+            reads++
+            assertEquals(HistoryQuery(), query)
+            assertNull(cursor)
+            if (reads == 1) gate.await()
+            HistoryPageDto(listOf(item("fresh", StatusDto.RESOLVED)), null)
+        }
+        val vm = HistoryViewModel(repo, completions)
+        vm.setVisible(true); runCurrent()
+        completions.value++; runCurrent(); completions.value++; runCurrent()
+        assertEquals(1, reads)
+        gate.complete(Unit); runCurrent()
+        assertEquals(2, reads)
+        assertEquals(listOf("fresh"), vm.state.value.items.map { it.id })
+        assertFalse(vm.state.value.loading)
+    }
+
+    @Test fun visibleHistoryRefreshesOnceOnResumeWithoutPollingOrSyncFeedback() = runTest {
+        val api = FakeApi()
+        val repo = DefaultItemRepository(MemoryStorage(), { api }, FakeCredentials(), backgroundScope, fixedClock)
+        val owner = object : LifecycleOwner {
+            override val lifecycle = LifecycleRegistry.createUnsafe(this)
+        }
+        val reconciler = LifecycleReconciler(repo, repo.reconciliationSession, owner.lifecycle, backgroundScope)
+        owner.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_START); runCurrent()
+        var historyReads = 0
+        api.historyRead = { _, _ -> historyReads++; api.history }
+        val vm = HistoryViewModel(repo, reconciler.completedReconciliations)
+        vm.setVisible(true)
+        runCurrent()
+        assertEquals(1, historyReads)
+        owner.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_STOP); runCurrent()
+        api.history = HistoryPageDto(listOf(item("new", StatusDto.RESOLVED)), null)
+        owner.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_START); runCurrent()
+        assertEquals(listOf("new"), vm.state.value.items.map { it.id })
+        assertEquals(2, historyReads)
+        vm.setVisible(false)
+        owner.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_STOP); runCurrent()
+        owner.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_START); runCurrent()
+        assertEquals(2, historyReads)
+        advanceTimeBy(600_000); runCurrent()
+        assertEquals(2, historyReads)
+        reconciler.close()
+    }
 
     @Test fun `new offline queries and filters search all cached closed rows with incomplete label`() = runTest {
         val storage = MemoryStorage()

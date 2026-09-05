@@ -78,6 +78,13 @@ class DecisionViewModel(
         requestConfirmation(FinalAnswer.Choice(choice), item.version)
     }
 
+    fun complete() {
+        val item = state.value.item ?: return
+        if (canAnswer() && item.choices.isEmpty() && item.checks.isEmpty()) {
+            requestConfirmation(FinalAnswer.Complete, item.version)
+        }
+    }
+
     fun quickResponse() {
         if (!canAnswer()) return
         val plain = state.value.item!!.let { it.checks.isEmpty() && it.choices.isEmpty() }

@@ -5,11 +5,15 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import dev.carraes.lam.items.SyncState
 import kotlinx.coroutines.launch
 
 sealed interface PairingState {
     data object Loading : PairingState
     data object Ready : PairingState
+    data object Revoked : PairingState
     data object PermissionDenied : PairingState
     data object Scanning : PairingState
     data object Claiming : PairingState
@@ -17,7 +21,9 @@ sealed interface PairingState {
     data class Paired(val stale: Boolean) : PairingState
 }
 
-class PairingViewModel(private val repository: PairingRepository, private val allowLocalHttp: Boolean) : ViewModel() {
+class PairingViewModel(private val repository: PairingRepository, private val allowLocalHttp: Boolean,
+    private val syncState: StateFlow<SyncState> = MutableStateFlow(SyncState.Idle),
+) : ViewModel() {
     private val mutableState = MutableStateFlow<PairingState>(PairingState.Loading)
     val state = mutableState.asStateFlow()
     private var paired = false
@@ -25,11 +31,12 @@ class PairingViewModel(private val repository: PairingRepository, private val al
 
     init {
         viewModelScope.launch {
-            repository.observePairing().collect { server ->
+            combine(repository.observePairing(), syncState) { server, sync -> server to sync }.collect { (server, sync) ->
                 val changed = paired != (server != null)
                 paired = server != null
                 if (mutableState.value != PairingState.Claiming && (changed || mutableState.value == PairingState.Loading)) {
-                    mutableState.value = if (paired) PairingState.Paired(true) else PairingState.Ready
+                    mutableState.value = if (paired) PairingState.Paired(true)
+                        else if (sync == SyncState.Revoked) PairingState.Revoked else PairingState.Ready
                 }
             }
         }
@@ -61,6 +68,7 @@ class PairingViewModel(private val repository: PairingRepository, private val al
             mutableState.value = when {
                 result.problem != null -> PairingState.Failed(result.problem)
                 paired -> PairingState.Paired(result.stale)
+                syncState.value == SyncState.Revoked -> PairingState.Revoked
                 else -> PairingState.Ready
             }
         }

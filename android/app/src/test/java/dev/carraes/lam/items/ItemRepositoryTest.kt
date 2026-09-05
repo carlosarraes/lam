@@ -690,6 +690,7 @@ internal class FakeApi : LamApi {
         historyRead?.invoke(HistoryQuery(query, priority, type), cursor) ?: history
     private suspend fun write(call: String): ItemDto { calls += call; submissions++; beforeWrite(); writeError?.let { throw it }; return result }
     override suspend fun replyChoice(id: String, choice: String) = write("choice:$id:$choice")
+    override suspend fun complete(id: String) = write("complete:$id")
     override suspend fun replyText(id: String, text: String) = write("text:$id:$text")
     override suspend fun dismiss(id: String) = write("dismiss:$id")
     override suspend fun setCheck(id: String, index: Int, done: Boolean) = write("check:$id:$index:$done")

@@ -14,6 +14,7 @@ data class HistoryQuery(val query: String? = null, val priority: PriorityDto? = 
 data class HistoryResult(val succeeded: Boolean, val nextCursor: String?)
 
 sealed interface FinalAnswer {
+    data object Complete : FinalAnswer
     data class Choice(val value: String) : FinalAnswer
     data class Text(val value: String) : FinalAnswer
     data object Dismiss : FinalAnswer

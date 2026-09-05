@@ -34,6 +34,17 @@ class OkHttpLamApiTest {
         server.close()
     }
 
+    @Test fun `plain completion posts an empty resolve object without retry`() = runTest {
+        server.enqueue(jsonResponse(body = ITEM_JSON))
+        api.complete("plain")
+        server.takeRequest().apply {
+            assertEquals("POST", method)
+            assertEquals("/api/items/plain/resolve", target)
+            assertEquals("{}", body!!.utf8())
+        }
+        assertEquals(1, server.requestCount)
+    }
+
     @Test
     fun `open listing injects the current bearer and decodes every item field`() = runTest {
         server.enqueue(jsonResponse(body = "[$ITEM_JSON]"))
