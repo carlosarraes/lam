@@ -4,6 +4,18 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ConnectivityTrackerTest {
+    @Test fun `unobserved startup network cannot keep VPN online after the last observed network is lost`() {
+        val tracker = ConnectivityTracker(null, false)
+        // A startup network excluded by the passive request delivers no callback and cannot
+        // enter membership. There is deliberately no physical-snapshot seeding API.
+        tracker.seedDefault("vpn", true, true)
+        assertFalse(tracker.state.value.available)
+        tracker.physicalAvailable("observed-wifi")
+        assertTrue(tracker.state.value.available)
+        tracker.physicalLost("observed-wifi")
+        assertFalse(tracker.state.value.available)
+    }
+
     @Test fun `default snapshot does not overwrite newer callbacks`() {
         val tracker = ConnectivityTracker(null, false)
         tracker.available("mobile")
@@ -45,22 +57,13 @@ class ConnectivityTrackerTest {
         assertFalse(tracker.state.value.available)
     }
 
-    @Test fun `physical snapshot cannot resurrect network lost during seeding`() {
-        val tracker = ConnectivityTracker("vpn", true, initialVpn = true)
-        tracker.physicalLost("old-wifi")
+    @Test fun `physical callbacks delivered before default startup snapshot settle VPN availability`() {
+        val tracker = ConnectivityTracker(null, false)
         tracker.physicalAvailable("mobile")
-        tracker.seedPhysicalNetworks(setOf("old-wifi"))
-        tracker.physicalLost("mobile")
         assertFalse(tracker.state.value.available)
-    }
-
-    @Test fun `physical snapshot seeds untouched networks without overwriting callback arrivals`() {
-        val tracker = ConnectivityTracker("vpn", true, initialVpn = true)
-        tracker.physicalAvailable("mobile")
-        tracker.seedPhysicalNetworks(setOf("wifi"))
-        tracker.physicalLost("mobile")
+        tracker.seedDefault("vpn", true, true)
         assertTrue(tracker.state.value.available)
-        tracker.physicalLost("wifi")
+        tracker.physicalLost("mobile")
         assertFalse(tracker.state.value.available)
     }
 

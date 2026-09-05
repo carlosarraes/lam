@@ -28,16 +28,9 @@ internal class AndroidConnectivityMonitor(context: Context) {
             override fun onAvailable(network: Network) = tracker.physicalAvailable(network)
             override fun onLost(network: Network) = tracker.physicalLost(network)
         })
-        // Snapshot only at startup, after registration. Delivered callbacks win over the seed.
-        // allNetworks is available on API 29; callbacks replace it for steady-state observation.
-        @Suppress("DEPRECATION")
-        val physicalNetworks = manager.allNetworks.filter { network ->
-            manager.getNetworkCapabilities(network)?.let {
-                it.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-                    it.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
-            } == true
-        }.toSet()
-        tracker.seedPhysicalNetworks(physicalNetworks)
+        // Physical membership comes only from this request's callbacks. An allNetworks snapshot
+        // can include restricted networks whose loss this observer would never receive.
+        // The default snapshot is safe: delivered default callbacks take precedence in the tracker.
         val initialNetwork = manager.activeNetwork
         val capabilities = manager.getNetworkCapabilities(initialNetwork)
         tracker.seedDefault(initialNetwork, capabilities.isValidated(), capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true)

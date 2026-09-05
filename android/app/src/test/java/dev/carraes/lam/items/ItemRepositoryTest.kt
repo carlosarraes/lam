@@ -4,6 +4,7 @@ import dev.carraes.lam.security.CredentialStore
 import dev.carraes.lam.security.PairedServer
 import dev.carraes.lam.sync.LifecycleReconciler
 import dev.carraes.lam.sync.ConnectivityStatus
+import dev.carraes.lam.sync.ConnectivityTracker
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
@@ -32,6 +33,23 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ItemRepositoryTest {
+    @Test fun `VPN startup waits for observed physical membership then permits fresh reconciliation`() = runTest {
+        val network = ConnectivityTracker(null, false)
+        network.seedDefault("vpn", true, true)
+        val api = FakeApi()
+        val repo = DefaultItemRepository(MemoryStorage(), { api }, FakeCredentials(), backgroundScope, Clock.fixed(NOW, ZoneOffset.UTC), network.state)
+        assertFalse(repo.refresh())
+        assertTrue(api.calls.isEmpty())
+        network.physicalAvailable("observed-wifi")
+        runCurrent()
+        assertFalse(repo.syncState.value.mutationsEnabled)
+        assertTrue(repo.refresh())
+        assertTrue(repo.syncState.value.mutationsEnabled)
+        network.physicalLost("observed-wifi")
+        runCurrent()
+        assertFalse(repo.syncState.value.mutationsEnabled)
+    }
+
     @Test fun `a rapid loss and regain cannot reuse a previous successful connection epoch`() = runTest {
         val network = MutableStateFlow(ConnectivityStatus(true, 0))
         val api = FakeApi()

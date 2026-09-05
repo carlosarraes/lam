@@ -11,7 +11,6 @@ internal class ConnectivityTracker(initialNetwork: Any?, initialAvailable: Boole
     private var defaultVpn = initialVpn
     private var defaultCallbackReceived = false
     private val physicalNetworks = mutableSetOf<Any>()
-    private var physicalCallbacksBeforeSeed: MutableSet<Any>? = mutableSetOf()
     private val status = MutableStateFlow(ConnectivityStatus(initialAvailable && !initialVpn, 0))
     val state = status.asStateFlow()
 
@@ -34,21 +33,12 @@ internal class ConnectivityTracker(initialNetwork: Any?, initialAvailable: Boole
     }
 
     @Synchronized fun physicalAvailable(network: Any) {
-        physicalCallbacksBeforeSeed?.add(network)
         physicalNetworks.add(network)
         publish()
     }
 
     @Synchronized fun physicalLost(network: Any) {
-        physicalCallbacksBeforeSeed?.add(network)
         physicalNetworks.remove(network)
-        publish()
-    }
-
-    @Synchronized fun seedPhysicalNetworks(networks: Set<Any>) {
-        val callbacks = physicalCallbacksBeforeSeed ?: return
-        physicalNetworks.addAll(networks - callbacks)
-        physicalCallbacksBeforeSeed = null
         publish()
     }
 
