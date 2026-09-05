@@ -1,8 +1,13 @@
 package dev.carraes.lam.pairing
 
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
 import dev.carraes.lam.items.*
 import dev.carraes.lam.security.CredentialStore
 import dev.carraes.lam.security.PairedServer
+import dev.carraes.lam.sync.ConnectivityStatus
+import dev.carraes.lam.sync.LifecycleReconciler
 import java.io.IOException
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
@@ -124,6 +129,59 @@ class PairingViewModelTest {
         vm.retryRefresh(); advanceUntilIdle()
         assertEquals(PairingState.Paired(false), vm.state.value)
         assertEquals(1, claims)
+    }
+
+    @Test fun connectionLossDuringInitialRefreshLeavesSavedPairingAndCanRefreshWithoutReclaiming() = runTest {
+        val store = Store()
+        val network = MutableStateFlow(ConnectivityStatus(true, 0))
+        val api = FakeApi().apply { beforeRead = { awaitCancellation() } }
+        val items = DefaultItemRepository(MemoryStorage(), { api }, store, backgroundScope, connectivity = network)
+        val owner = object : LifecycleOwner {
+            override val lifecycle = LifecycleRegistry.createUnsafe(this)
+        }
+        val reconciler = LifecycleReconciler(items, items.reconciliationSession, owner.lifecycle, backgroundScope, network)
+        owner.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_START)
+        var claims = 0
+        val repo = PairingRepository(items.credentialStore, reconciler::refresh, DeviceIdentity("Pixel", "0.1.0", "16")) {
+            _, _, _ -> claims++; response()
+        }
+        val vm = PairingViewModel(repo, false, items.syncState)
+        try {
+            runCurrent()
+            vm.permissionResult(true)
+            assertTrue(vm.onQr(qr()))
+            runCurrent()
+            assertEquals("device-credential", store.credential)
+            assertEquals(listOf("open"), api.calls)
+            network.value = ConnectivityStatus(false, 1)
+            runCurrent()
+            assertEquals(PairingState.Paired(true), vm.state.value)
+            assertEquals("device-credential", store.credential)
+            assertFalse(vm.onQr(qr()))
+
+            api.beforeRead = {}
+            network.value = ConnectivityStatus(true, 2)
+            runCurrent()
+            vm.retryRefresh()
+            runCurrent()
+            assertEquals(PairingState.Paired(false), vm.state.value)
+            assertEquals(1, claims)
+        } finally { reconciler.close() }
+    }
+
+    @Test fun cancellingPairingCallerDuringInitialRefreshStillPropagatesCancellation() = runTest {
+        val store = Store()
+        val repo = repository(store, refresh = { awaitCancellation() })
+        var returned = false
+        val job = launch {
+            repo.pair(PairingPayload.parse(qr(), false))
+            returned = true
+        }
+        runCurrent()
+        assertEquals("device-credential", store.credential)
+        job.cancelAndJoin()
+        assertFalse(returned)
+        assertEquals("device-credential", store.credential)
     }
 
     @Test fun waitsForRestorationAndShowsExistingPairing() = runTest {

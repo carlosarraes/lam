@@ -75,8 +75,10 @@ class PairingRepository(
 
     suspend fun refresh(): Boolean = try {
         reconcile()
-    } catch (cancelled: CancellationException) {
-        throw cancelled
+    } catch (_: CancellationException) {
+        // A shared refresh can be cancelled on a connection change while this caller remains active.
+        currentCoroutineContext().ensureActive()
+        false
     } catch (_: Exception) {
         false
     }
