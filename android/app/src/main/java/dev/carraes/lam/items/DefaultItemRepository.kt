@@ -15,6 +15,8 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.conflate
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
@@ -54,8 +56,11 @@ internal class DefaultItemRepository(
 
     init {
         scope.launch {
-            credentials.observe().collect { server ->
+            // Drain the suspending publisher independently of the lock held by save/clear.
+            credentials.observe().conflate().collect {
                 credentialChanges.withLock {
+                    // Queued transitions can supersede the wake-up event. Read replayed current metadata.
+                    val server = credentials.observe().first()
                     val failures = mutableListOf<Exception>()
                     stateLock.withLock state@ {
                         val restoring = !initialized.isCompleted

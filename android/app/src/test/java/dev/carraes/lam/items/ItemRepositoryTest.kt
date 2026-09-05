@@ -6,14 +6,18 @@ import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runCurrent
@@ -272,6 +276,45 @@ class ItemRepositoryTest {
         assertCredentialReplacement(PairedServer("https://example.com/", "device", "Phone"))
     }
 
+    @Test fun `queued credential replacements finish with a suspending metadata publisher`() = runTest {
+        assertQueuedCredentialTransitions(clearLast = false)
+    }
+
+    @Test fun `queued credential replacements followed by unpair finish without restoring a prior pairing`() = runTest {
+        assertQueuedCredentialTransitions(clearLast = true)
+    }
+
+    private suspend fun TestScope.assertQueuedCredentialTransitions(clearLast: Boolean) {
+        val f = fixture()
+        f.repo.refresh()
+        val release = CompletableDeferred<Unit>()
+        var saves = 0
+        f.credentials.beforeSave = { if (saves++ == 0) release.await() }
+        val servers = (1..3).map { PairedServer("https://example.com/", "device-$it", "Phone $it") }
+        val writes = servers.mapIndexed { index, server ->
+            backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                if (clearLast && index == 2) f.repo.credentialStore.clear()
+                else f.repo.credentialStore.save(server, "credential-$index")
+            }
+        }
+        release.complete(Unit)
+        val completed = withTimeoutOrNull(1_000) { writes.joinAll(); true }
+        if (completed == null) {
+            // Removing the test subscriber releases a blocked emit even inside NonCancellable teardown.
+            backgroundScope.cancel()
+            writes.joinAll()
+        }
+        assertEquals("credential transitions must complete without a flow/transition-lock cycle", true, completed)
+        runCurrent()
+        val expected = if (clearLast) null else servers.last()
+        assertEquals(expected, f.credentials.state.value)
+        assertEquals(expected, f.repo.credentialStore.observe().first())
+        assertEquals(SyncState.Idle, f.repo.syncState.value)
+        assertTrue(f.repo.openItems.first().isEmpty())
+        assertFalse(f.repo.answer("a", FinalAnswer.Dismiss))
+        if (!clearLast) assertTrue(f.repo.refresh())
+    }
+
     @Test fun `managed pairing stream publishes the replacement without waiting for raw metadata delivery`() = runTest {
         val f = fixture()
         f.repo.refresh()
@@ -397,9 +440,11 @@ private class FakeCredentials : CredentialStore {
     private val published = MutableSharedFlow<PairedServer?>(replay = 1).apply { tryEmit(state.value) }
     var publishChanges = true
     var clearError: Exception? = null
+    var beforeSave: suspend () -> Unit = {}
     override fun observe() = published
     suspend fun publishCurrent() { published.emit(state.value) }
     override suspend fun save(server: PairedServer, credential: String) {
+        beforeSave()
         state.value = server
         if (publishChanges) publishCurrent()
     }
