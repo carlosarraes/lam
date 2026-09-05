@@ -4,8 +4,14 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-08-01",
   "observability": { "enabled": true },
-  "durable_objects": { "bindings": [{ "name": "TOPIC", "class_name": "Topic" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Topic"] }],
+  "durable_objects": { "bindings": [
+    { "name": "TOPIC", "class_name": "Topic" },
+    { "name": "EVENTS", "class_name": "EventStream" }
+  ] },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Topic"] },
+    { "tag": "v2", "new_sqlite_classes": ["EventStream"] }
+  ],
   "d1_databases": [
     { "binding": "DB", "database_name": "lam", "migrations_dir": "./migrations" }
   ]

@@ -1,6 +1,10 @@
 import type { D1Migration } from "@cloudflare/vitest-pool-workers";
-import { applyD1Migrations, env, SELF } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { applyD1Migrations, env, runInDurableObject, SELF } from "cloudflare:test";
+import { Effect } from "effect";
+import { describe, expect, it, vi } from "vitest";
+import { Env } from "../src/Env";
+import type { ItemEvent } from "../src/domain/Event";
+import { Events } from "../src/services/Events";
 
 const enc = new TextEncoder();
 async function itemToken(secret: string, id: string): Promise<string> {
@@ -120,6 +124,196 @@ function historyCursorFixture(closed_at: string, id: string): string {
   const bytes = new TextEncoder().encode(JSON.stringify({ closed_at, id }));
   return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
+
+describe("structured events", () => {
+  const stream = () => env.EVENTS.get(env.EVENTS.idFromName("global"));
+  const publish = (event: ItemEvent) => Effect.runPromise(
+    Effect.flatMap(Events, (events) => events.publish(event)).pipe(
+      Effect.provide(Events.Default),
+      Effect.provideService(Env, { ...env, LAM_TOKEN: "test-token", LAM_HMAC_SECRET: "test-secret", NTFY_TOPIC: "test-topic" }),
+    ),
+  );
+  const nextFrame = (socket: WebSocket) => new Promise<string | ArrayBuffer>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.removeEventListener("message", onMessage);
+      reject(new Error("Event frame timed out"));
+    }, 1000);
+    const onMessage = (message: MessageEvent) => {
+      clearTimeout(timer);
+      resolve(message.data);
+    };
+    socket.addEventListener("message", onMessage, { once: true });
+  });
+  const connect = async () => {
+    const device = await registerFakeDevice();
+    const response = await SELF.fetch("http://lam/events", { headers: { ...device.headers, Upgrade: "websocket" } });
+    expect(response.status).toBe(101);
+    const socket = response.webSocket!;
+    socket.accept();
+    return socket;
+  };
+
+  it("upgrades only an authenticated device bearer", async () => {
+    const device = await registerFakeDevice();
+    const response = await SELF.fetch("http://lam/events", { headers: { ...device.headers, Upgrade: "websocket" } });
+    expect(response.status).toBe(101);
+    const socket = response.webSocket!;
+    socket.accept();
+    socket.close();
+  });
+
+  it.each([
+    ["missing", {}, 401],
+    ["unknown", { Authorization: "Bearer fake-unknown-device" }, 401],
+    ["master", AUTH, 403],
+  ])("rejects the %s bearer before socket upgrade", async (_name, headers, status) => {
+    const response = await SELF.fetch("http://lam/events", { headers: { ...headers, Upgrade: "websocket" } });
+    expect(response.status).toBe(status);
+    expect(response.webSocket).toBeNull();
+  });
+
+  it("rejects a revoked device before socket upgrade", async () => {
+    const device = await registerFakeDevice();
+    await env.DB.prepare("UPDATE devices SET revoked_at = ? WHERE id = ?").bind(new Date().toISOString(), device.id).run();
+    const response = await SELF.fetch("http://lam/events", { headers: { ...device.headers, Upgrade: "websocket" } });
+    expect(response.status).toBe(401);
+  });
+
+  it("requires a WebSocket upgrade for an authenticated device", async () => {
+    const device = await registerFakeDevice();
+    expect((await SELF.fetch("http://lam/events", { headers: device.headers })).status).toBe(426);
+  });
+
+  it.each([
+    { event: "item.created", item_id: "created-item", version: 0, status: "open" },
+    { event: "item.changed", item_id: "changed-item", version: 2, status: "open" },
+    { event: "item.closed", item_id: "closed-item", version: 3, status: "resolved" },
+  ] as const)("broadcasts exact $event JSON text to two devices", async (event) => {
+    const first = await connect();
+    const second = await connect();
+    try {
+      const frames = Promise.all([nextFrame(first), nextFrame(second)]);
+      await publish(event);
+      for (const frame of await frames) {
+        expect(typeof frame).toBe("string");
+        expect(JSON.parse(frame as string)).toEqual(event);
+      }
+    } finally {
+      first.close();
+      second.close();
+    }
+  });
+
+  it("starts a new subscription without replaying prior invalidations", async () => {
+    await publish({ event: "item.created", item_id: "before-connect", version: 0, status: "open" });
+    const socket = await connect();
+    try {
+      const frame = nextFrame(socket);
+      await publish({ event: "item.changed", item_id: "after-connect", version: 1, status: "open" });
+      expect(JSON.parse(await frame as string)).toEqual({ event: "item.changed", item_id: "after-connect", version: 1, status: "open" });
+    } finally {
+      socket.close();
+    }
+  });
+
+  it("cleans up a closed subscriber and continues delivering to the other", async () => {
+    const first = await connect();
+    const second = await connect();
+    try {
+      const closed = new Promise<void>((resolve) => first.addEventListener("close", () => resolve(), { once: true }));
+      first.close();
+      await closed;
+      await expect.poll(() => runInDurableObject(stream(), (_instance, state) => state.getWebSockets().length)).toBe(1);
+      const frame = nextFrame(second);
+      await publish({ event: "item.closed", item_id: "still-delivered", version: 4, status: "dismissed" });
+      expect(JSON.parse(await frame as string)).toEqual({ event: "item.closed", item_id: "still-delivered", version: 4, status: "dismissed" });
+    } finally {
+      first.close();
+      second.close();
+    }
+  });
+
+  it("closes a failed peer without interrupting healthy subscribers", async () => {
+    const first = await connect();
+    const second = await connect();
+    try {
+      const frames: unknown[] = [];
+      let closed = 0;
+      for (const socket of [first, second]) {
+        socket.addEventListener("message", (message) => { frames.push(JSON.parse(message.data as string)); });
+        socket.addEventListener("close", () => { closed++; });
+      }
+      await runInDurableObject(stream(), async (instance, state) => {
+        const failed = state.getWebSockets()[0];
+        const send = vi.spyOn(failed, "send").mockImplementation(() => { throw new Error("Simulated socket send failure"); });
+        try {
+          await instance.publish({ event: "item.changed", item_id: "healthy-peer", version: 5, status: "open" });
+        } finally {
+          send.mockRestore();
+        }
+      });
+      await expect.poll(() => frames).toEqual([{ event: "item.changed", item_id: "healthy-peer", version: 5, status: "open" }]);
+      await expect.poll(() => closed).toBe(1);
+      await expect.poll(() => runInDurableObject(stream(), (_instance, state) => state.getWebSockets().length)).toBe(1);
+    } finally {
+      first.close();
+      second.close();
+    }
+  });
+
+  it.each([
+    { event: "item.deleted" }, { item_id: "" }, { version: -1 }, { version: 1.5 }, { version: "1" }, { status: "unknown" },
+    { body: "private body" }, { title: "private title" }, { choices: ["answer"] }, { checks: [] },
+    { recommendation: "private recommendation" }, { recommended_choice: "answer" }, { response_text: "private response" },
+    { response_choice: "answer" }, { response_by: "phone" }, { unexpected: true },
+  ])("rejects malformed or extra event properties before broadcasting: %j", async (invalid) => {
+    const socket = await connect();
+    try {
+      const frame = nextFrame(socket);
+      const event = { event: "item.changed", item_id: "schema-item", version: 1, status: "open", ...invalid } as ItemEvent;
+      await runInDurableObject(stream(), async (instance) => {
+        await expect(instance.publish(event)).rejects.toThrow("Invalid item event");
+      });
+      await publish({ event: "item.changed", item_id: "safe-item", version: 2, status: "open" });
+      expect(JSON.parse(await frame as string)).toEqual({ event: "item.changed", item_id: "safe-item", version: 2, status: "open" });
+    } finally {
+      socket.close();
+    }
+  });
+
+  it("does not expose an HTTP publication route", async () => {
+    const device = await registerFakeDevice();
+    const response = await SELF.fetch("http://lam/events", { ...publicJson({ event: "item.created" }), headers: device.headers });
+    expect(response.status).toBe(404);
+  });
+
+  it.each(["RPC", "lookup"])("propagates %s publication failures as a redacted typed error", async (source) => {
+    const stub = stream();
+    const failure = vi.spyOn(stub, "publish").mockRejectedValue(new Error("fake-secret-in-transport-error"));
+    const get = vi.spyOn(env.EVENTS, "get").mockImplementation(() => {
+      if (source === "lookup") throw new Error("fake-secret-in-transport-error");
+      return stub;
+    });
+    try {
+      const result = await Effect.runPromise(
+        Effect.flatMap(Events, (events) => events.publish({ event: "item.changed", item_id: "failed-publication", version: 1, status: "open" })).pipe(
+          Effect.provide(Events.Default),
+          Effect.provideService(Env, { ...env, LAM_TOKEN: "test-token", LAM_HMAC_SECRET: "test-secret", NTFY_TOPIC: "test-topic" }),
+          Effect.either,
+        ),
+      );
+      expect(result._tag).toBe("Left");
+      if (result._tag === "Left") {
+        expect(result.left).toMatchObject({ _tag: "EventPublishError" });
+        expect(JSON.stringify(result.left)).not.toContain("fake-secret-in-transport-error");
+        expect("cause" in result.left).toBe(false);
+      }
+    } finally {
+      get.mockRestore();
+      failure.mockRestore();
+    }
+  });
+});
 
 describe("auth", () => {
   it("rejects missing bearer", async () => {

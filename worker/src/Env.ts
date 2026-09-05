@@ -1,4 +1,5 @@
 import { Context } from "effect";
+import type { EventStream } from "./events/stream";
 import type { Topic } from "./ntfy/topic";
 
 export interface Bindings {
@@ -7,6 +8,7 @@ export interface Bindings {
   LAM_HMAC_SECRET: string;
   NTFY_TOPIC: string;
   TOPIC: DurableObjectNamespace<Topic>;
+  EVENTS: DurableObjectNamespace<EventStream>;
 }
 
 export class Env extends Context.Tag("lam/Env")<Env, Bindings>() {}

@@ -2,6 +2,7 @@ import { HttpRouter, HttpServerResponse } from "@effect/platform";
 import { Effect } from "effect";
 import { api, bearer } from "./api";
 import { devices } from "./devices";
+import { events } from "./events";
 import { ntfy } from "./ntfy";
 import { pairingAdmin, pairingClaims } from "./pairings";
 import { phone } from "./phone";
@@ -14,6 +15,7 @@ export const app = HttpRouter.empty.pipe(
   HttpRouter.concat(devices.pipe(HttpRouter.use(bearer))),
   HttpRouter.concat(pairingAdmin.pipe(HttpRouter.use(bearer))),
   HttpRouter.concat(pairingClaims),
+  HttpRouter.concat(events),
   HttpRouter.concat(phone),
   HttpRouter.concat(ntfy),
   HttpRouter.catchTags({
