@@ -3,12 +3,12 @@ package dev.carraes.lam.ui.requests
 import android.graphics.Bitmap
 import androidx.activity.ComponentActivity
 import androidx.compose.runtime.*
-import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
 import androidx.compose.ui.unit.dp
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
 import dev.carraes.lam.items.*
 import dev.carraes.lam.ui.detail.*
 import dev.carraes.lam.ui.theme.LamTheme
@@ -62,7 +62,7 @@ class ChecklistInteractionsTest {
         compose.onNodeWithTag("quick-reply").performClick()
         compose.onNodeWithTag("reply-input").assertExists()
         compose.runOnIdle { vm.dismissReply() }
-        screenshot("task8-quick-checklist.png")
+        screenshot("task8-quick-checklist.png", hasTestTag("quick-check-1"))
         compose.onNodeWithTag("quick-check-1").performClick()
         compose.onNodeWithTag("quick-check-1").assertDoesNotExist()
         compose.onNodeWithTag("outcome").assertExists()
@@ -80,7 +80,7 @@ class ChecklistInteractionsTest {
         compose.onNodeWithText("Review reply").performScrollTo().assertIsNotEnabled()
         compose.onNodeWithTag("reply-input").performTextReplacement("Proceed carefully")
         compose.onNodeWithText("Review reply").performScrollTo().performClick()
-        screenshot("task8-quick-reply.png")
+        screenshot("task8-quick-reply.png", hasText("Send this reply?"))
         compose.onNodeWithText("Send reply").performClick()
         compose.runOnIdle { assertEquals(listOf(FinalAnswer.Text("Proceed carefully")), repo.answers) }
     }
@@ -109,8 +109,11 @@ class ChecklistInteractionsTest {
         compose.runOnIdle { assertNull(checks.state.value.failure) }
     }
 
-    private fun screenshot(name: String) {
-        val bitmap = compose.onAllNodes(isRoot()).onLast().captureToImage().asAndroidBitmap()
+    private fun screenshot(name: String, sheetContent: SemanticsMatcher? = null) {
+        if (sheetContent != null) compose.onNode(sheetContent).assertIsDisplayed()
+        compose.waitForIdle()
+        // Capture the composed display, including the separate bottom-sheet window.
+        val bitmap = requireNotNull(InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot())
         File(compose.activity.externalCacheDir, name).outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
     }
 }

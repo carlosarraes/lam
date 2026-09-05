@@ -67,12 +67,18 @@ fun RequestCard(item: Item, now: Instant, actionsEnabled: Boolean = false,
         modifier = Modifier.fillMaxWidth().absoluteOffset { IntOffset(drag.roundToInt(), 0) }
             .testTag("request-card-${item.id}")
             .pointerInput(item.id, actionsEnabled, threshold) {
-                if (actionsEnabled) detectHorizontalDragGestures(
-                    onHorizontalDrag = { change, amount -> change.consume(); drag = (drag + amount).coerceIn(-threshold * 1.5f, threshold * 1.5f) },
+                detectHorizontalDragGestures(
+                    onHorizontalDrag = { change, amount ->
+                        // Consume stale-card swipes too, so releasing in bounds cannot open detail.
+                        change.consume()
+                        if (actionsEnabled) drag = (drag + amount).coerceIn(-threshold * 1.5f, threshold * 1.5f)
+                    },
                     onDragEnd = {
                         val completed = drag
                         drag = 0f
-                        if (completed >= threshold) currentDismiss() else if (completed <= -threshold) currentQuick()
+                        if (actionsEnabled) {
+                            if (completed >= threshold) currentDismiss() else if (completed <= -threshold) currentQuick()
+                        }
                     },
                     onDragCancel = { drag = 0f },
                 )

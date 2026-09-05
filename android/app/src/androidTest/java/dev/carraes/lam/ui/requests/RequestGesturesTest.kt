@@ -73,10 +73,13 @@ class RequestGesturesTest {
             assertEquals(setOf("Quick response", "Dismiss"), actions.map { it.label }.toSet())
             actions.forEach { assertTrue(it.action()) }
         }
-        compose.runOnIdle { assertEquals(2, quick); assertEquals(2, dismiss); enabled = false }
+        compose.runOnIdle { assertEquals(2, quick); assertEquals(2, dismiss); assertEquals(0, opens); enabled = false }
         assertFalse(card.fetchSemanticsNode().config.contains(SemanticsActions.CustomActions))
         card.performTouchInput { swipeLeft() }
-        card.performClick()
+        compose.runOnIdle { assertEquals("A stale-card swipe must not open detail", 0, opens) }
+        card.performTouchInput { swipeRight() }
+        compose.runOnIdle { assertEquals("A stale-card swipe must not open detail", 0, opens) }
+        card.performTouchInput { click() }
         compose.runOnIdle { assertEquals(2, quick); assertEquals(2, dismiss); assertEquals(1, opens) }
     }
 
