@@ -19,7 +19,7 @@ class LifecycleReconcilerTest {
     }
 
     @Test fun restoredPairingRefreshesOnLaunchAndEveryResumeIncludingAfterFailure() = runTest {
-        val owner = Owner(); val repo = RequestsFakeRepository(); val paired = MutableStateFlow(true)
+        val owner = Owner(); val repo = RequestsFakeRepository(); val paired = MutableStateFlow<Long?>(1L)
         val reconciler = LifecycleReconciler(repo, paired, owner.lifecycle, backgroundScope)
         runCurrent(); assertEquals(0, repo.refreshes)
         owner.foreground(); runCurrent(); assertEquals(1, repo.refreshes)
@@ -34,11 +34,11 @@ class LifecycleReconcilerTest {
     }
 
     @Test fun pairingAndSimultaneousManualAndForegroundTriggersShareOneRefresh() = runTest {
-        val owner = Owner(); val repo = RequestsFakeRepository(); val paired = MutableStateFlow(false)
+        val owner = Owner(); val repo = RequestsFakeRepository(); val paired = MutableStateFlow<Long?>(null)
         repo.gate = CompletableDeferred()
         val reconciler = LifecycleReconciler(repo, paired, owner.lifecycle, backgroundScope)
         owner.foreground(); runCurrent(); assertEquals(0, repo.refreshes)
-        paired.value = true
+        paired.value = 1L
         val one = async { reconciler.refresh() }; val two = async { reconciler.refresh() }
         runCurrent(); assertEquals(1, repo.refreshes)
         owner.background(); runCurrent(); owner.foreground(); runCurrent()
@@ -52,9 +52,26 @@ class LifecycleReconcilerTest {
     @Test fun completedPairingRefreshIsNotRepeatedOnFirstForeground() = runTest {
         val owner = Owner(); val repo = RequestsFakeRepository()
         repo.syncState.value = SyncState.Current(now)
-        val reconciler = LifecycleReconciler(repo, MutableStateFlow(true), owner.lifecycle, backgroundScope)
+        val reconciler = LifecycleReconciler(repo, MutableStateFlow(1L), owner.lifecycle, backgroundScope)
         owner.foreground(); runCurrent(); assertEquals(0, repo.refreshes)
         owner.background(); runCurrent(); owner.foreground(); runCurrent(); assertEquals(1, repo.refreshes)
         reconciler.close()
+    }
+
+    @Test fun closingCancelsSuspendedRefreshAndRemovesTheForegroundObserver() = runTest {
+        val owner = Owner(); val repo = RequestsFakeRepository()
+        repo.gate = CompletableDeferred()
+        val reconciler = LifecycleReconciler(repo, MutableStateFlow(1L), owner.lifecycle, backgroundScope)
+        owner.foreground()
+        val waiting = async { reconciler.refresh() }
+        runCurrent()
+        assertEquals(1, repo.refreshes)
+        assertEquals(1, owner.lifecycle.observerCount)
+        reconciler.close()
+        runCurrent()
+        assertTrue(waiting.isCancelled)
+        assertEquals(0, owner.lifecycle.observerCount)
+        owner.background(); owner.foreground(); runCurrent()
+        assertEquals(1, repo.refreshes)
     }
 }

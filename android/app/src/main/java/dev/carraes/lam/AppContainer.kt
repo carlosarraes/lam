@@ -16,7 +16,6 @@ import dev.carraes.lam.pairing.PairingRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.flow.map
 import dev.carraes.lam.sync.LifecycleReconciler
 
 class AppContainer(
@@ -35,7 +34,7 @@ class AppContainer(
     val credentialStore: CredentialStore = items.credentialStore
 
     val lifecycleReconciler = LifecycleReconciler(
-        itemRepository, credentialStore.observe().map { it != null }, ProcessLifecycleOwner.get().lifecycle,
+        itemRepository, items.reconciliationSession, ProcessLifecycleOwner.get().lifecycle,
         CoroutineScope(applicationScope.coroutineContext + Dispatchers.Main.immediate),
     )
 

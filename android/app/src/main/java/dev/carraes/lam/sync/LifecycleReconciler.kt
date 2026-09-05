@@ -11,7 +11,7 @@ import kotlinx.coroutines.sync.withLock
 
 class LifecycleReconciler(
     private val repository: ItemRepository,
-    paired: Flow<Boolean>,
+    private val sessions: StateFlow<Long?>,
     private val lifecycle: Lifecycle,
     scope: CoroutineScope,
 ) : AutoCloseable {
@@ -22,26 +22,46 @@ class LifecycleReconciler(
         foreground.value = lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
     }
     private val lock = Mutex()
-    private var inFlight: Deferred<Boolean>? = null
+    private data class Refresh(val session: Long, val result: Deferred<Boolean>)
+    private var inFlight: Refresh? = null
 
     init {
         lifecycle.addObserver(observer)
         work.launch {
             var seenForeground = false
-            combine(paired, foreground) { ready, active -> ready to active }.distinctUntilChanged().collect { (ready, active) ->
-                if (!ready) seenForeground = false
-                if (ready && active) {
+            var observedSession: Long? = null
+            combine(sessions, foreground) { session, active -> session to active }.distinctUntilChanged().collect { (session, active) ->
+                // A direct post-save refresh can precede delivery of a queued old session event.
+                lock.withLock {
+                    if (session != sessions.value) return@collect
+                    if (inFlight?.session != session) {
+                        inFlight?.result?.cancel()
+                        inFlight = null
+                    }
+                }
+                if (observedSession != session) seenForeground = false
+                observedSession = session
+                if (session != null && active) {
                     val alreadyRefreshed = !seenForeground && repository.syncState.value is SyncState.Current
                     seenForeground = true
-                    if (!alreadyRefreshed) work.launch { refresh() }
+                    if (!alreadyRefreshed) work.launch { refresh(session) }
                 }
             }
         }
     }
 
-    suspend fun refresh(): Boolean {
+    suspend fun refresh(): Boolean = sessions.value?.let { refresh(it) } ?: false
+
+    private suspend fun refresh(session: Long): Boolean {
         val operation = lock.withLock {
-            inFlight?.takeUnless { it.isCompleted } ?: work.async { repository.refresh() }.also { inFlight = it }
+            if (session != sessions.value) return false
+            val current = inFlight
+            if (current?.session == session && !current.result.isCompleted) current.result else {
+                current?.result?.cancel()
+                work.async {
+                    if (session == sessions.value) repository.refresh() else false
+                }.also { inFlight = Refresh(session, it) }
+            }
         }
         return operation.await()
     }

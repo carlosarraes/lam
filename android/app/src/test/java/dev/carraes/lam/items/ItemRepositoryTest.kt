@@ -2,6 +2,10 @@ package dev.carraes.lam.items
 
 import dev.carraes.lam.security.CredentialStore
 import dev.carraes.lam.security.PairedServer
+import dev.carraes.lam.sync.LifecycleReconciler
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneOffset
@@ -27,6 +31,68 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ItemRepositoryTest {
+    @Test fun `session identity is unavailable during restore and replacement and changes with identical metadata`() = runTest {
+        val f = fixture()
+        assertNull(f.repo.reconciliationSession.value)
+        runCurrent()
+        assertNotNull(f.repo.reconciliationSession.value)
+        val originalSession = f.repo.reconciliationSession.value
+        val originalServer = requireNotNull(f.credentials.state.value)
+        val saved = CompletableDeferred<Unit>()
+        f.credentials.beforeSave = { saved.await() }
+        val saving = async { f.repo.credentialStore.save(originalServer, "synthetic-replacement") }
+        runCurrent()
+        assertNull("no session may be used while replacement persistence is pending", f.repo.reconciliationSession.value)
+        assertEquals(SyncState.Idle, f.repo.syncState.value)
+        saved.complete(Unit)
+        saving.await()
+        assertNotNull(f.repo.reconciliationSession.value)
+        val replacementSession = f.repo.reconciliationSession.value
+        assertNotEquals(originalSession, replacementSession)
+        f.repo.unpair()
+        assertNull(f.repo.reconciliationSession.value)
+    }
+
+    @Test fun `replacement pairing gets its own refresh while previous session is suspended`() = runTest {
+        assertReplacementReconciles(sameMetadata = false, unpair = true)
+    }
+
+    @Test fun `same metadata replacement refresh starts before the observer consumes the save`() = runTest {
+        assertReplacementReconciles(sameMetadata = true, unpair = false)
+    }
+
+    private suspend fun TestScope.assertReplacementReconciles(sameMetadata: Boolean, unpair: Boolean) {
+        val f = fixture()
+        val lifecycleOwner = object : LifecycleOwner {
+            override val lifecycle = LifecycleRegistry.createUnsafe(this)
+        }
+        val held = CompletableDeferred<Unit>()
+        f.api.beforeRead = { held.await() }
+        val reconciler = LifecycleReconciler(f.repo, f.repo.reconciliationSession, lifecycleOwner.lifecycle, backgroundScope)
+        lifecycleOwner.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_START)
+        runCurrent()
+        assertEquals(listOf("open"), f.api.calls)
+        val original = requireNotNull(f.credentials.state.value)
+        if (unpair) f.repo.unpair()
+        val replacement = if (sameMetadata) original else original.copy(deviceId = "device-b")
+        f.repo.credentialStore.save(replacement, "synthetic-replacement")
+        // Start the pairing callback without yielding to the lifecycle collector after save.
+        f.api.beforeRead = {}
+        f.api.open = listOf(item("session-b"))
+        val pairingRefresh = async(start = CoroutineStart.UNDISPATCHED) { reconciler.refresh() }
+        runCurrent()
+        assertTrue("B must complete without waiting for A's suspended transport", pairingRefresh.isCompleted)
+        held.complete(Unit)
+        assertTrue("B must reconcile itself instead of inheriting A's invalidated result", pairingRefresh.await())
+        assertEquals(SyncState.Current(NOW), f.repo.syncState.value)
+        assertEquals(listOf("session-b"), f.repo.openItems.first().map { it.id })
+        assertEquals(listOf("open", "open"), f.api.calls)
+        f.credentials.publishCurrent()
+        runCurrent()
+        assertEquals("delayed metadata must not start another refresh", 2, f.api.calls.size)
+        reconciler.close()
+    }
+
     @Test fun `mapping retains canonical fields and derives fallback source and closure`() {
         val dto = item().copy(name = " ", status = StatusDto.EXPIRED, expiresAt = "2026-09-04T10:00:00Z")
         val entity = ItemMapper.toEntity(dto)

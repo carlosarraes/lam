@@ -37,6 +37,9 @@ internal class DefaultItemRepository(
     private val credentialChanges = Mutex()
     private val initialized = CompletableDeferred<Unit>()
     private var generation = 0L
+    // Opaque process-local identity, published only after canonical session setup completes.
+    private val session = MutableStateFlow<Long?>(null)
+    val reconciliationSession = session.asStateFlow()
     private var paired: PairedServer? = null
     private var lastSuccess: Instant? = null
     private val state = MutableStateFlow<SyncState>(SyncState.Idle)
@@ -76,6 +79,7 @@ internal class DefaultItemRepository(
                         } catch (error: Exception) {
                             failures += error
                         } finally {
+                            session.value = paired?.let { generation }
                             pairing.tryEmit(paired)
                             initialized.complete(Unit)
                         }
@@ -179,6 +183,7 @@ internal class DefaultItemRepository(
                     credentials.save(server, credential)
                     stateLock.withLock {
                         paired = server
+                        session.value = generation
                         pairing.tryEmit(server)
                     }
                 } catch (error: Exception) {
@@ -261,6 +266,7 @@ internal class DefaultItemRepository(
 
     private fun invalidateSessionLocked(revoked: Boolean) {
         generation++
+        session.value = null
         paired = null
         lastSuccess = null
         state.value = if (revoked) SyncState.Revoked else SyncState.Idle
