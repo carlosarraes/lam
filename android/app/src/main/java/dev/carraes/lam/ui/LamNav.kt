@@ -17,10 +17,15 @@ import dev.carraes.lam.items.*
 import dev.carraes.lam.ui.requests.*
 import dev.carraes.lam.ui.components.QueueTopBar
 import dev.carraes.lam.ui.theme.Graphite
+import dev.carraes.lam.ui.detail.DecisionDetailScreen
+import dev.carraes.lam.ui.detail.DecisionState
 
 @Composable
 fun LamNav(state: RequestsState, onQuery: (String) -> Unit, onType: (ItemTypeDto?) -> Unit,
-    onPriority: (PriorityDto?) -> Unit, onClearFilters: () -> Unit, onRefresh: () -> Unit) {
+    onPriority: (PriorityDto?) -> Unit, onClearFilters: () -> Unit, onRefresh: () -> Unit,
+    detailContent: @Composable (String, () -> Unit) -> Unit = { _, onBack ->
+        DecisionDetailScreen(DecisionState(loading = false, loadFailed = true), onBack)
+    }) {
     val nav = rememberNavController()
     fun queue(route: String) { nav.navigate(route) { popUpTo("requests"); launchSingleTop = true } }
     NavHost(navController = nav, startDestination = "requests") {
@@ -41,8 +46,7 @@ fun LamNav(state: RequestsState, onQuery: (String) -> Unit, onType: (ItemTypeDto
             Placeholder(stringResource(R.string.settings_title), stringResource(R.string.settings_placeholder), onBack = { nav.popBackStack() })
         }
         composable("item/{id}", arguments = listOf(navArgument("id") { type = NavType.StringType })) { entry ->
-            Placeholder(stringResource(R.string.request_detail), stringResource(R.string.request_detail_placeholder),
-                id = entry.arguments?.getString("id"), onBack = { nav.popBackStack() })
+            detailContent(requireNotNull(entry.arguments?.getString("id"))) { nav.popBackStack() }
         }
     }
 }

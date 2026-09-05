@@ -11,6 +11,8 @@ import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.carraes.lam.items.*
 import dev.carraes.lam.ui.LamNav
+import dev.carraes.lam.ui.detail.DecisionDetailScreen
+import dev.carraes.lam.ui.detail.DecisionState
 import dev.carraes.lam.ui.theme.LamTheme
 import java.io.File
 import java.time.Instant
@@ -50,14 +52,16 @@ class RequestsScreenTest {
         val decision = item("decision", "Approve the release", "Builder", PriorityDto.CRITICAL)
         val checklist = item("checks", "Release checklist", "Reviewer").copy(checks = listOf(CheckDto("Tests", true, null), CheckDto("Deploy", false, null)))
         compose.setContent { LamTheme { LamNav(RequestsState(items = listOf(decision, checklist), loading = false,
-            stale = true, now = now), {}, {}, {}, {}, {}) } }
+            stale = true, now = now), {}, {}, {}, {}, {}, detailContent = { id, onBack ->
+                DecisionDetailScreen(DecisionState(item = listOf(decision, checklist).single { it.id == id }, loading = false), onBack)
+            }) } }
         compose.onNodeWithText("Private body text", useUnmergedTree = true).assertDoesNotExist()
         compose.onNodeWithContentDescription("Approve the release, Builder, Critical priority, Decision, 2 choices, No recommendation, Open request").assertHasClickAction()
         compose.onNodeWithContentDescription("Release checklist, Reviewer, Normal priority, Checklist, 1 of 2 complete, Open request").assertHasClickAction()
         compose.onAllNodesWithText("No recommendation", useUnmergedTree = true).assertCountEquals(1)
         compose.onNodeWithContentDescription("Approve the release, Builder, Critical priority, Decision, 2 choices, No recommendation, Open request").performClick()
         compose.onNodeWithText("Request detail").assertExists()
-        compose.onNodeWithText("decision").assertExists()
+        compose.onNodeWithText("Private body text").assertExists()
         compose.onNodeWithContentDescription("Back").performClick()
         compose.onNodeWithText("Approve the release", useUnmergedTree = true).assertExists()
     }
