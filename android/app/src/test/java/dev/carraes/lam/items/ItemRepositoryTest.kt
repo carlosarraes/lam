@@ -139,12 +139,14 @@ class ItemRepositoryTest {
         val f = fixture()
         f.repo.refresh()
         f.api.writeError = ApiError.Transport("timeout")
+        f.api.beforeWrite = { f.api.fetched = item(status = StatusDto.DISMISSED).copy(version = 2) }
         f.api.open = emptyList()
         assertFalse(f.repo.answer("a", FinalAnswer.Dismiss))
         assertEquals(1, f.api.submissions)
-        assertEquals(listOf("open", "get:a", "dismiss:a", "open"), f.api.calls)
+        assertEquals(listOf("open", "get:a", "dismiss:a", "get:a", "open"), f.api.calls)
         assertEquals(SyncState.Current(NOW), f.repo.syncState.value)
         assertTrue(f.repo.openItems.first().isEmpty())
+        assertEquals(StatusDto.DISMISSED, f.repo.item("a").first()?.status)
     }
 
     @Test fun `failed reconciliation leaves cache stale and blocks mutations`() = runTest {
@@ -501,7 +503,7 @@ class ItemRepositoryTest {
     }
 }
 
-private class FakeCredentials : CredentialStore {
+internal class FakeCredentials : CredentialStore {
     val state = MutableStateFlow<PairedServer?>(PairedServer("https://example.com/", "device", "Phone"))
     private val published = MutableSharedFlow<PairedServer?>(replay = 1).apply { tryEmit(state.value) }
     var publishChanges = true
@@ -521,7 +523,7 @@ private class FakeCredentials : CredentialStore {
     }
 }
 
-private class FakeApi : LamApi {
+internal class FakeApi : LamApi {
     var open = listOf(ItemRepositoryTest.item())
     var fetched = ItemRepositoryTest.item()
     var result = ItemRepositoryTest.item(status = StatusDto.RESOLVED)
@@ -529,11 +531,12 @@ private class FakeApi : LamApi {
     var readError: ApiError? = null
     var writeError: ApiError? = null
     var beforeRead: suspend () -> Unit = {}
+    var beforeGet: suspend () -> Unit = {}
     var beforeWrite: suspend () -> Unit = {}
     val calls = mutableListOf<String>()
     var submissions = 0
     override suspend fun listOpenItems(): List<ItemDto> { calls += "open"; beforeRead(); readError?.let { throw it }; return open }
-    override suspend fun getItem(id: String): ItemDto { calls += "get:$id"; readError?.let { throw it }; return fetched }
+    override suspend fun getItem(id: String): ItemDto { calls += "get:$id"; beforeGet(); readError?.let { throw it }; return fetched }
     override suspend fun getHistory(query: String?, priority: PriorityDto?, type: ItemTypeDto?, cursor: String?, limit: Int) = history
     private suspend fun write(call: String): ItemDto { calls += call; submissions++; beforeWrite(); writeError?.let { throw it }; return result }
     override suspend fun replyChoice(id: String, choice: String) = write("choice:$id:$choice")
@@ -546,7 +549,7 @@ private class FakeApi : LamApi {
     override suspend fun claimPairing(sessionId: String, request: PairingClaimRequestDto): PairingClaimResponseDto = error("unused")
 }
 
-private class MemoryStorage : ItemStorage {
+internal class MemoryStorage : ItemStorage {
     private val rows = MutableStateFlow<Map<String, ItemEntity>>(emptyMap())
     private val members = MutableStateFlow<Map<String, Set<String>>>(emptyMap())
     private var success: Instant? = null

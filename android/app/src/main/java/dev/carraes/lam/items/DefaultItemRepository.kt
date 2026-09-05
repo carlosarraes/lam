@@ -42,6 +42,8 @@ internal class DefaultItemRepository(
     val reconciliationSession = session.asStateFlow()
     private var paired: PairedServer? = null
     private var lastSuccess: Instant? = null
+    // One read recovery at most: operations serialize, and stale state blocks the next final answer.
+    private var unresolvedFinalAnswer: String? = null
     private val state = MutableStateFlow<SyncState>(SyncState.Idle)
     private val errorEvents = Channel<Exception>(Channel.BUFFERED)
     private val pairing = MutableSharedFlow<PairedServer?>(replay = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
@@ -133,7 +135,7 @@ internal class DefaultItemRepository(
             }
             commit(session) { storage.upsert(listOf(ItemMapper.toEntity(result))) }
         } catch (error: ApiError) {
-            mutationFailed(session, id, error)
+            mutationFailed(session, id, error, finalAnswer = true)
             false
         }
     }
@@ -199,23 +201,36 @@ internal class DefaultItemRepository(
     }
 
     private suspend fun reconcile(session: Session): Boolean {
-        if (!commit(session) { state.value = SyncState.Refreshing }) return false
+        var unresolved: String? = null
+        if (!commit(session) {
+            state.value = SyncState.Refreshing
+            unresolved = unresolvedFinalAnswer
+        }) return false
+        // An absent open row says nothing about its answer. Recover that outcome before pruning it.
+        // If either read fails, retain the snapshot and pending ID for the next explicit reconciliation.
+        unresolved?.let { id ->
+            val canonical = session.api.getItem(id)
+            if (!commit(session) { storage.upsert(listOf(ItemMapper.toEntity(canonical))) }) return false
+        }
         val items = session.api.listOpenItems().map(ItemMapper::toEntity)
         return commit(session) {
             val now = clock.instant()
             storage.reconcile(items, now)
+            unresolvedFinalAnswer = null
             lastSuccess = now
             state.value = SyncState.Current(now)
         }
     }
 
-    private suspend fun mutationFailed(session: Session, id: String, error: Exception) {
+    private suspend fun mutationFailed(session: Session, id: String, error: Exception, finalAnswer: Boolean = false) {
         handleFailure(session, error)
         if (error is ApiError.Transport || error is ApiError.AlreadyClosed || error is ApiError.Server) {
             // A write may have committed remotely. Never replay it; establish canonical state first.
             if (!isCurrent(session)) return
             try {
-                if (error is ApiError.AlreadyClosed) {
+                if (finalAnswer) {
+                    if (!commit(session) { unresolvedFinalAnswer = id }) return
+                } else if (error is ApiError.AlreadyClosed) {
                     val canonical = session.api.getItem(id)
                     commit(session) { storage.upsert(listOf(ItemMapper.toEntity(canonical))) }
                 }
@@ -269,6 +284,7 @@ internal class DefaultItemRepository(
         session.value = null
         paired = null
         lastSuccess = null
+        unresolvedFinalAnswer = null
         state.value = if (revoked) SyncState.Revoked else SyncState.Idle
     }
 
