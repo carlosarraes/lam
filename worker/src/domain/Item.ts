@@ -2,6 +2,8 @@ import { Data, Schema } from "effect";
 
 export const Priority = Schema.Literal("low", "normal", "critical");
 export type Priority = typeof Priority.Type;
+export const ItemKind = Schema.Literal("request", "fyi");
+export type ItemKind = typeof ItemKind.Type;
 export const Status = Schema.Literal("open", "resolved", "dismissed", "retracted", "expired");
 export type Status = typeof Status.Type;
 export const ResponseBy = Schema.Literal("phone", "cli");
@@ -42,6 +44,7 @@ export type Check = typeof Check.Type;
 
 export class Item extends Schema.Class<Item>("Item")({
   id: Schema.String,
+  kind: ItemKind,
   /** Who is asking: `session:window` from the agent's multiplexer, or an explicit label. */
   name: Schema.String,
   title: Schema.String,
@@ -60,6 +63,7 @@ export class Item extends Schema.Class<Item>("Item")({
   response_by: Schema.NullOr(ResponseBy),
   created_at: Schema.String,
   resolved_at: Schema.NullOr(Schema.String),
+  seen_at: Schema.NullOr(Schema.String),
   expires_at: Schema.NullOr(Schema.String),
   /** Bumped on every mutation; `wait?since=` returns once it moves. */
   version: Schema.Number,
@@ -85,27 +89,59 @@ export const ItemRow = Schema.Struct({
 });
 export type ItemRow = typeof ItemRow.Type;
 
-export const NewItem = Schema.Struct({
+const NewItemCommon = {
   /** The CLI always sends this; the API tolerates its absence so an older binary mid-run keeps working. */
   name: Schema.optionalWith(Schema.String, { default: () => "" }),
   title: Title,
   body: Schema.optionalWith(Body, { default: () => "" }),
   source_host: Schema.optionalWith(Schema.String, { default: () => "" }),
   source_project: Schema.optionalWith(Schema.String, { default: () => "" }),
-  priority: Schema.optionalWith(Priority, { default: () => "normal" as const }),
-  choices: Schema.optionalWith(Schema.Array(Choice).pipe(Schema.maxItems(MAX_CHOICES)), { default: () => [] }),
-  /** Sub-items the human ticks off; the item auto-resolves when all are done. Exclusive with choices. */
-  checks: Schema.optionalWith(Schema.Array(CheckLabel).pipe(Schema.maxItems(MAX_CHECKS)), { default: () => [] }),
-  recommendation: Schema.optionalWith(Schema.NullOr(Recommendation), { default: () => null }),
-  recommended_choice: Schema.optionalWith(Schema.NullOr(Choice), { default: () => null }),
   link: Schema.optional(Schema.String.pipe(Schema.pattern(/^https?:\/\//))),
   /** Seconds until the item expires; omitted = never. */
   ttl: Schema.optional(Schema.Int.pipe(Schema.positive())),
+};
+
+const choices = Schema.optionalWith(Schema.Array(Choice).pipe(Schema.maxItems(MAX_CHOICES)), { default: () => [] });
+const checks = Schema.optionalWith(Schema.Array(CheckLabel).pipe(Schema.maxItems(MAX_CHECKS)), { default: () => [] });
+
+export const NewItem = Schema.Struct({
+  ...NewItemCommon,
+  priority: Schema.optionalWith(Priority, { default: () => "normal" as const }),
+  choices,
+  /** Sub-items the human ticks off; the item auto-resolves when all are done. Exclusive with choices. */
+  checks,
+  recommendation: Schema.optionalWith(Schema.NullOr(Recommendation), { default: () => null }),
+  recommended_choice: Schema.optionalWith(Schema.NullOr(Choice), { default: () => null }),
 }).pipe(
   Schema.filter((i) => i.choices.length === 0 || i.checks.length === 0 || "choices and checks are mutually exclusive"),
   Schema.filter((i) => i.recommended_choice === null || i.choices.includes(i.recommended_choice) || "recommended_choice must exactly match one choice"),
 );
 export type NewItem = typeof NewItem.Type;
+
+const NewFyi = Schema.Struct({
+  ...NewItemCommon,
+  kind: Schema.Literal("fyi"),
+  priority: Schema.optionalWith(Priority, { default: () => "normal" as const }),
+});
+
+const NewTypedRequest = Schema.Struct({
+  ...NewItemCommon,
+  kind: Schema.Literal("request"),
+  priority: Schema.optionalWith(Schema.Literal("normal", "critical"), { default: () => "normal" as const }),
+  choices,
+  checks,
+  recommendation: Schema.optional(Recommendation),
+  recommended_choice: Schema.optional(Choice),
+}).pipe(
+  Schema.filter((i) => i.choices.length === 0 || i.checks.length === 0 || "choices and checks are mutually exclusive"),
+  Schema.filter((i) => i.checks.length > 0 || i.recommendation !== undefined || "request recommendation is required"),
+  Schema.filter((i) => i.checks.length === 0 || (i.recommendation === undefined && i.recommended_choice === undefined) || "checklists prohibit recommendation fields"),
+  Schema.filter((i) => i.choices.length === 0 || (i.recommended_choice !== undefined && i.choices.includes(i.recommended_choice)) || "recommended_choice must exactly match one choice"),
+  Schema.filter((i) => i.choices.length > 0 || i.recommended_choice === undefined || "recommended_choice requires choices"),
+);
+
+export const NewTypedItem = Schema.Union(NewFyi, NewTypedRequest);
+export type NewTypedItem = typeof NewTypedItem.Type;
 
 export const Resolution = Schema.Struct({
   choice: Schema.optional(Schema.String),

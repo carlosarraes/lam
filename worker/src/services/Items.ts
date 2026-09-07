@@ -1,6 +1,6 @@
 import { Effect, Option, Schema } from "effect";
 import { Env } from "../Env";
-import { AlreadyClosed, BadRequest, Conflict, DbError, Item, ItemRow, MAX_CHECKS, NotFound, type NewItem, type ResponseBy, type Status } from "../domain/Item";
+import { AlreadyClosed, BadRequest, Conflict, DbError, Item, ItemRow, MAX_CHECKS, NotFound, type ItemKind, type NewItem, type ResponseBy, type Status } from "../domain/Item";
 
 const ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
 const newId = () => Array.from(crypto.getRandomValues(new Uint8Array(5)), (b) => ALPHABET[b % ALPHABET.length]).join("");
@@ -11,6 +11,7 @@ const db = <A>(run: (db: D1Database) => Promise<A>) =>
 const toItem = (row: typeof ItemRow.Type) =>
   new Item({
     id: row.id,
+    kind: row.kind,
     name: row.name,
     title: row.title,
     body: row.body,
@@ -28,6 +29,7 @@ const toItem = (row: typeof ItemRow.Type) =>
     response_by: row.response_by,
     created_at: row.created_at,
     resolved_at: row.resolved_at,
+    seen_at: row.seen_at,
     expires_at: row.expires_at,
     version: row.version,
   });
@@ -39,8 +41,9 @@ const decodeRow = (row: unknown) =>
   );
 
 /** Stable request identity; optional values use exactly the defaults persisted by `NewItem`. */
-export const canonicalDedupeInput = (input: NewItem) =>
+export const canonicalDedupeInput = (input: NewItem, kind: ItemKind = "request") =>
   JSON.stringify({
+    ...(kind === "fyi" ? { kind } : {}),
     name: input.name ?? "",
     title: input.title,
     body: input.body ?? "",
@@ -53,8 +56,8 @@ export const canonicalDedupeInput = (input: NewItem) =>
     recommended_choice: input.recommended_choice ?? null,
   });
 
-const dedupeKey = async (input: NewItem) => {
-  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonicalDedupeInput(input))));
+const dedupeKey = async (input: NewItem, kind: ItemKind) => {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonicalDedupeInput(input, kind))));
   return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
 };
 
@@ -148,6 +151,7 @@ const mutateChecks = (id: string, f: (item: Item) => Effect.Effect<ChecksUpdate,
   Effect.gen(function* () {
     for (let attempt = 0; attempt < 3; attempt++) {
       const item = yield* Items.get(id);
+      if (item.kind === "fyi") return yield* new BadRequest({ message: "FYIs do not have checks" });
       if (item.status !== "open") return yield* new AlreadyClosed({ id });
       const u = yield* f(item);
       const now = new Date().toISOString();
@@ -173,15 +177,16 @@ export interface Closing {
 
 export class Items extends Effect.Service<Items>()("lam/Items", {
   succeed: {
-    create: (input: NewItem) =>
+    create: (input: NewItem, kind: ItemKind = "request") =>
       Effect.gen(function* () {
         const { ttl, link = "", checks, recommendation = null, recommended_choice = null, ...fields } = input;
         const now = Date.now();
         const created_at = new Date(now).toISOString();
         const expires_at = ttl === undefined ? null : new Date(now + ttl * 1000).toISOString();
-        const key = yield* Effect.promise(() => dedupeKey(input));
+        const key = yield* Effect.promise(() => dedupeKey(input, kind));
         const item = new Item({
           ...fields,
+          kind,
           link,
           checks: checks.map((label) => ({ label, done: false, at: null })),
           recommendation,
@@ -194,25 +199,26 @@ export class Items extends Effect.Service<Items>()("lam/Items", {
           response_by: null,
           created_at,
           resolved_at: null,
+          seen_at: null,
           expires_at,
         });
         yield* db((d) =>
           d
             .prepare(
-              `INSERT INTO items (id, name, title, body, source_host, source_project, priority, choices, checks, recommendation, recommended_choice, link, status, created_at, expires_at, dedupe_key)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)`,
+              `INSERT INTO items (id, kind, name, title, body, source_host, source_project, priority, choices, checks, recommendation, recommended_choice, link, status, created_at, expires_at, dedupe_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)`,
             )
-            .bind(item.id, item.name, item.title, item.body, item.source_host, item.source_project, item.priority, JSON.stringify(item.choices), JSON.stringify(item.checks), item.recommendation, item.recommended_choice, item.link, item.created_at, item.expires_at, key)
+            .bind(item.id, item.kind, item.name, item.title, item.body, item.source_host, item.source_project, item.priority, JSON.stringify(item.choices), JSON.stringify(item.checks), item.recommendation, item.recommended_choice, item.link, item.created_at, item.expires_at, key)
             .run(),
         );
         return item;
       }),
 
     /** An open, unexpired item with identical content — a retry of a push whose response was lost. */
-    findDuplicate: (input: NewItem) =>
+    findDuplicate: (input: NewItem, kind: ItemKind = "request") =>
       Effect.gen(function* () {
         const now = new Date().toISOString();
-        const key = yield* Effect.promise(() => dedupeKey(input));
+        const key = yield* Effect.promise(() => dedupeKey(input, kind));
         const keyed = yield* db((d) =>
           d
             .prepare(
@@ -223,6 +229,8 @@ export class Items extends Effect.Service<Items>()("lam/Items", {
             .first(),
         );
         if (keyed) return Option.some(yield* decodeRow(keyed));
+
+        if (kind === "fyi") return Option.none<Item>();
 
         const legacy = yield* db((d) =>
           d
@@ -348,6 +356,10 @@ export class Items extends Effect.Service<Items>()("lam/Items", {
     /** Transitions an open, unexpired item; NotFound if missing, AlreadyClosed otherwise. */
     close: (id: string, c: Closing) =>
       Effect.gen(function* () {
+        const current = yield* Items.get(id);
+        if (current.kind === "fyi" && c.status === "resolved") {
+          return yield* new BadRequest({ message: "FYIs cannot be answered" });
+        }
         const now = new Date().toISOString();
         const result = yield* db((d) =>
           d
@@ -361,6 +373,33 @@ export class Items extends Effect.Service<Items>()("lam/Items", {
         const item = yield* Items.get(id);
         if (!result.meta.changes) return yield* new AlreadyClosed({ id });
         return item;
+      }),
+
+    /** Marks an FYI seen once. Repeating the same intent returns its canonical closed state. */
+    seen: (id: string, version: number) =>
+      Effect.gen(function* () {
+        const current = yield* Items.get(id);
+        if (current.kind !== "fyi") return yield* new BadRequest({ message: "only FYIs can be marked seen" });
+        if (current.seen_at !== null) return { item: current, changed: false };
+        if (current.status !== "open") return yield* new AlreadyClosed({ id });
+        if (current.version !== version) return yield* new Conflict({ id });
+
+        const now = new Date().toISOString();
+        const result = yield* db((d) =>
+          d
+            .prepare(
+              `UPDATE items
+               SET status = 'dismissed', seen_at = ?, resolved_at = ?, response_choice = NULL,
+                   response_text = NULL, response_by = NULL, version = version + 1
+               WHERE id = ? AND kind = 'fyi' AND status = 'open' AND seen_at IS NULL AND version = ?`,
+            )
+            .bind(now, now, id, version)
+            .run(),
+        );
+        const updated = yield* Items.get(id);
+        if (result.meta.changes) return { item: updated, changed: true };
+        if (updated.seen_at !== null) return { item: updated, changed: false };
+        return yield* new Conflict({ id });
       }),
   },
 }) {
