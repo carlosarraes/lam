@@ -27,20 +27,41 @@ const seenOnVisibleRender = `<script>
 (() => {
   const form = document.getElementById("seen-form");
   let attempted = false;
+  let pending = false;
   const visible = () => document.readyState === "complete" && document.visibilityState === "visible" && !document.prerendering;
+  const submit = async () => {
+    if (pending) return;
+    pending = true;
+    attempted = true;
+    try {
+      const response = await fetch(form.action, { method: "POST", body: new URLSearchParams(new FormData(form)) });
+      if (response.status === 409) {
+        const canonical = await fetch(window.location.href, { cache: "no-store" });
+        if (!canonical.ok) throw new Error("Refresh failed");
+        const page = new DOMParser().parseFromString(await canonical.text(), "text/html");
+        document.title = page.title;
+        // Parsed scripts stay inert: an open conflict waits for explicit manual retry.
+        document.body.replaceWith(page.body);
+        return;
+      }
+      if (!response.ok) throw new Error("Seen failed");
+      document.getElementById("read-status").textContent = "Seen";
+      document.getElementById("fyi-actions").hidden = true;
+    } catch {
+      document.getElementById("read-status").textContent = "Could not mark seen. Use Mark seen to retry.";
+    } finally {
+      pending = false;
+    }
+  };
+  form.addEventListener("submit", event => {
+    event.preventDefault();
+    submit();
+  });
   const markSeen = () => {
     if (attempted || !visible()) return;
     requestAnimationFrame(() => requestAnimationFrame(async () => {
       if (attempted || !visible()) return;
-      attempted = true;
-      try {
-        const response = await fetch(form.action, { method: "POST", body: new URLSearchParams(new FormData(form)) });
-        if (!response.ok) throw new Error("Seen failed");
-        document.getElementById("read-status").textContent = "Seen";
-        document.getElementById("fyi-actions").hidden = true;
-      } catch {
-        document.getElementById("read-status").textContent = "Could not mark seen. Use Mark seen to retry.";
-      }
+      await submit();
     }));
   };
   window.addEventListener("load", markSeen);

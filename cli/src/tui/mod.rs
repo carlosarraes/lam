@@ -153,6 +153,13 @@ impl App {
     /// check cursor. Only when it is gone (resolved, filtered away) does the cursor reset. This
     /// feeds the requests tab only — a refresh landing while you read history must not move it.
     pub fn set_items(&mut self, items: Vec<Item>) {
+        if let Some(item) = self
+            .reader_item
+            .as_ref()
+            .and_then(|reader| items.iter().find(|item| item.id == reader.id).cloned())
+        {
+            self.reconcile_item(item);
+        }
         let previous = self
             .visible_of(Tab::Requests)
             .get(self.requests.selected)
@@ -301,6 +308,10 @@ impl App {
         self.status = s.into();
     }
 
+    fn set_connection_status(&mut self, status: String) {
+        self.set_status(self.seen_error.clone().unwrap_or(status));
+    }
+
     fn current(&self) -> Option<&Item> {
         self.reader_item
             .as_ref()
@@ -329,22 +340,36 @@ impl App {
         action
     }
 
+    fn reconcile_item(&mut self, item: Item) {
+        if self
+            .reader_item
+            .as_ref()
+            .is_some_and(|reader| reader.id == item.id && reader.version <= item.version)
+        {
+            if item.status != "open" {
+                self.seen_error = None;
+            }
+            self.reader_item = Some(item.clone());
+        }
+        if let Some(row) = self
+            .requests
+            .items
+            .iter_mut()
+            .find(|row| row.id == item.id && row.version <= item.version)
+        {
+            *row = item.clone();
+        }
+        if item.status != "open" {
+            self.requests
+                .items
+                .retain(|row| row.id != item.id || row.version > item.version);
+            self.clamp_of(Tab::Requests);
+        }
+    }
+
     fn seen_result(&mut self, item: Option<Item>, error: Option<String>) {
         if let Some(item) = item {
-            if self
-                .reader_item
-                .as_ref()
-                .is_some_and(|reader| reader.id == item.id)
-            {
-                self.reader_item = Some(item.clone());
-            }
-            if let Some(row) = self.requests.items.iter_mut().find(|row| row.id == item.id) {
-                *row = item.clone();
-            }
-            if item.status != "open" {
-                self.requests.items.retain(|row| row.id != item.id);
-                self.clamp_of(Tab::Requests);
-            }
+            self.reconcile_item(item);
         }
         self.set_busy(false);
         self.seen_error = error;
@@ -585,6 +610,7 @@ impl App {
 /// only do if the loop is still reading keys.
 enum Job {
     Refresh,
+    ReloadItem(String),
     History {
         before: Option<String>,
     },
@@ -607,6 +633,7 @@ enum Job {
 
 enum Msg {
     Items(Vec<Item>),
+    Item(Box<Item>),
     Seen {
         item: Option<Box<Item>>,
         error: Option<String>,
@@ -638,6 +665,30 @@ fn mark_seen(client: &Client, id: &str, version: u64, tx: &mpsc::Sender<Msg>) {
     });
 }
 
+fn dismiss(client: &Client, id: &str, tx: &mpsc::Sender<Msg>) -> Result<()> {
+    let item = client.dismiss(id)?;
+    let _ = tx.send(Msg::Item(Box::new(item)));
+    Ok(())
+}
+
+fn refresh_items(app: &mut App, items: Vec<Item>, jobs: &mpsc::Sender<Job>) {
+    app.set_items(items);
+    if let Some(reader) = app.reader_item.as_ref().filter(|reader| {
+        reader.status == "open" && !app.requests.items.iter().any(|item| item.id == reader.id)
+    }) {
+        let _ = jobs.send(Job::ReloadItem(reader.id.clone()));
+    }
+    app.set_busy(false);
+    app.set_connection_status("live".into());
+}
+
+fn reload_item(client: &Client, id: &str, tx: &mpsc::Sender<Msg>) {
+    let _ = tx.send(match client.show(id) {
+        Ok(item) => Msg::Item(Box::new(item)),
+        Err(error) => Msg::Failed(format!("reader refresh failed: {error}")),
+    });
+}
+
 pub fn run(silent: bool) -> Result<i32> {
     let cfg = Config::load()?;
     let client = Client::new(&cfg)?;
@@ -649,6 +700,10 @@ pub fn run(silent: bool) -> Result<i32> {
     let net_tx = tx.clone();
     std::thread::spawn(move || {
         while let Ok(job) = work.recv() {
+            if let Job::ReloadItem(id) = job {
+                reload_item(&client, &id, &net_tx);
+                continue;
+            }
             // History short-circuits: every other job ends by re-reading the open queue, and a
             // page of closed items has no reason to pay for that.
             if let Job::History { before } = job {
@@ -666,13 +721,13 @@ pub fn run(silent: bool) -> Result<i32> {
                 Job::Resolve { id, choice, text } => client
                     .resolve(&id, &Resolution { choice, text })
                     .map(|_| ()),
-                Job::Dismiss(id) => client.dismiss(&id).map(|_| ()),
+                Job::Dismiss(id) => dismiss(&client, &id, &net_tx),
                 Job::Seen { id, version } => {
                     mark_seen(&client, &id, version, &net_tx);
                     Ok(())
                 }
                 Job::SetCheck { id, index, done } => client.set_check(&id, index, done).map(|_| ()),
-                Job::History { .. } => unreachable!("handled above"),
+                Job::History { .. } | Job::ReloadItem(_) => unreachable!("handled above"),
             };
             if let Err(e) = outcome {
                 let _ = net_tx.send(Msg::Failed(format!("{e}")));
@@ -747,10 +802,10 @@ fn event_loop(
 
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                Msg::Items(items) => {
-                    app.set_items(items);
-                    app.set_busy(false);
-                    app.set_status(app.seen_error.clone().unwrap_or_else(|| "live".into()));
+                Msg::Items(items) => refresh_items(app, items, jobs),
+                Msg::Item(item) => {
+                    app.reconcile_item(*item);
+                    app.set_connection_status("live".into());
                 }
                 Msg::Seen { item, error } => app.seen_result(item.map(|item| *item), error),
                 Msg::History { items, end } => {
@@ -778,7 +833,7 @@ fn event_loop(
                     }
                     refresh();
                 }
-                Msg::Status(s) => app.set_status(s),
+                Msg::Status(s) => app.set_connection_status(s),
             }
         }
         if last_refresh.elapsed() > REFRESH {
@@ -955,6 +1010,132 @@ mod tests {
                 version: 7
             })
         );
+    }
+
+    #[test]
+    fn fyi_seen_error_survives_connection_status() {
+        let mut a = App::new("host".into());
+        a.set_items(vec![fyi()]);
+        a.handle(key('m'));
+        a.seen_result(None, Some("seen failed: offline".into()));
+        a.set_connection_status("live".into());
+        assert_eq!(a.status, "seen failed: offline");
+    }
+
+    #[test]
+    fn fyi_reader_reconciles_canonical_queue_updates() {
+        let mut a = App::new("host".into());
+        a.set_items(vec![fyi()]);
+        a.handle(key('m'));
+        let mut canonical = fyi();
+        canonical.version = 8;
+        canonical.body = "Updated canonical content".into();
+        a.set_items(vec![canonical]);
+        assert_eq!(a.current().unwrap().version, 8);
+        assert_eq!(a.current().unwrap().body, "Updated canonical content");
+    }
+
+    #[tokio::test]
+    async fn fyi_remote_close_requests_canonical_reader_after_queue_removal() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let mut canonical = fyi();
+        canonical.status = "retracted".into();
+        canonical.version = 10;
+        Mock::given(method("GET"))
+            .and(path("/items/news1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&canonical))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut a = App::new("host".into());
+        a.set_items(vec![fyi()]);
+        a.handle(key('m'));
+        a.seen_result(Some(fyi()), Some("seen failed: offline".into()));
+        let (tx, rx) = mpsc::channel();
+        refresh_items(&mut a, vec![], &tx);
+        let Job::ReloadItem(id) = rx.try_recv().expect("missing open reader must be reloaded")
+        else {
+            panic!("expected reader reload");
+        };
+        assert_eq!(a.current().unwrap().status, "open", "never invent closure");
+        assert!(a.reader);
+        let cfg = Config {
+            server: server.uri(),
+            token: "tok".into(),
+            topic: "top".into(),
+            ntfy: None,
+        };
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            reload_item(&Client::new(&cfg).unwrap(), &id, &result_tx);
+        })
+        .join()
+        .unwrap();
+        let Msg::Item(item) = result_rx.recv().unwrap() else {
+            panic!("expected canonical item");
+        };
+        a.reconcile_item(*item);
+        assert_eq!(a.current().unwrap().status, "retracted");
+        assert_eq!(a.current().unwrap().version, 10);
+        assert!(a.current().unwrap().seen_at.is_none());
+        assert_eq!(a.handle(key('d')), None);
+        assert!(a.reader);
+        refresh_items(&mut a, vec![], &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "closed reader does not reload again"
+        );
+    }
+
+    #[tokio::test]
+    async fn fyi_dismiss_preserves_canonical_response_for_pinned_reader() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let mut canonical = fyi();
+        canonical.status = "dismissed".into();
+        canonical.version = 9;
+        canonical.response_by = Some("pc".into());
+        Mock::given(method("POST"))
+            .and(path("/items/news1/dismiss"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&canonical))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cfg = Config {
+            server: server.uri(),
+            token: "tok".into(),
+            topic: "top".into(),
+            ntfy: None,
+        };
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            dismiss(&Client::new(&cfg).unwrap(), "news1", &tx).unwrap();
+        })
+        .join()
+        .unwrap();
+        let mut a = App::new("host".into());
+        a.set_items(vec![fyi()]);
+        a.handle(key('m'));
+        a.seen_result(Some(fyi()), Some("seen failed: offline".into()));
+        assert_eq!(a.handle(key('d')), Some(Action::Dismiss("news1".into())));
+        let Msg::Item(item) = rx
+            .try_recv()
+            .expect("dismiss must deliver its canonical item to the UI")
+        else {
+            panic!("expected canonical item");
+        };
+        a.reconcile_item(*item);
+        a.set_items(vec![]);
+        assert_eq!(a.current().unwrap().status, "dismissed");
+        assert_eq!(a.current().unwrap().version, 9);
+        assert_eq!(a.current().unwrap().response_by.as_deref(), Some("pc"));
+        assert!(a.current().unwrap().seen_at.is_none());
+        assert_eq!(a.handle(key('d')), None);
+        assert!(a.reader);
+        assert!(a.seen_error.is_none());
     }
 
     #[test]

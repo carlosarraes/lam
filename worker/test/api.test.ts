@@ -997,6 +997,50 @@ describe("FYI phone delivery", () => {
     expect(await get(item.id)).toMatchObject({ status: "dismissed", seen_at: null, response_by: "phone", version: 1 });
     expect((await seen(item.id, await itemToken("test-secret", item.id), "0")).status).toBe(409);
     expect(await get(item.id)).toMatchObject({ seen_at: null, version: 1 });
+    const canonicalPage = await SELF.fetch(message.actions.find((a: { label: string }) => a.label === "Read").url);
+    expect(canonicalPage.status).toBe(200);
+    const html = await canonicalPage.text();
+    expect(html).toContain("Already-authorized work is complete.");
+    expect(html).toContain("role=status>dismissed</p>");
+    expect(html).not.toContain("<form");
+    expect(await get(item.id)).toMatchObject({ status: "dismissed", seen_at: null, version: 1 });
+  });
+});
+
+describe("phone form decoding", () => {
+  it("preserves percent escapes, plus signs, Unicode, and duplicate-field rejection", async () => {
+    const item = await push({ title: "form Unicode" });
+    const token = await itemToken("test-secret", item.id);
+    const post = (body: string) => SELF.fetch(`http://lam/r/${item.id}?t=${token}`, {
+      method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body,
+    });
+    for (const body of ["", "text=", "text=+++", "text=one&text=two"]) {
+      expect((await post(body)).status).toBe(400);
+      expect((await SELF.fetch(`http://lam/items/${item.id}`, { headers: AUTH }).then((r) => r.json<any>())).status).toBe("open");
+    }
+    expect((await post("text=Ol%C3%A1+%F0%9F%8C%8D+%2B+%26+%3D+%25+日本語")).status).toBe(200);
+    expect(await SELF.fetch(`http://lam/items/${item.id}`, { headers: AUTH }).then((r) => r.json<any>())).toMatchObject({
+      status: "resolved", response_text: "Olá 🌍 + & = % 日本語", response_by: "phone",
+    });
+  });
+
+  it("preserves blank and missing version validation and encoded checklist values", async () => {
+    const response = await SELF.fetch("http://lam/v2/items", json({ kind: "fyi", name: "test:form", title: `Form version #${++seq}`, body: "FYI" }));
+    const item = await response.json<any>();
+    const token = await itemToken("test-secret", item.id);
+    for (const body of ["", "version=", "version=0&version=0"]) {
+      expect((await SELF.fetch(`http://lam/r/${item.id}/seen?t=${token}`, {
+        method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body,
+      })).status).toBe(400);
+    }
+    const checklist = await push({ title: "encoded check", checks: ["Only check"] });
+    const checkToken = await itemToken("test-secret", checklist.id);
+    expect((await SELF.fetch(`http://lam/r/${checklist.id}/checks/0?t=${checkToken}`, {
+      method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: "done=%74rue",
+    })).status).toBe(200);
+    expect(await SELF.fetch(`http://lam/items/${checklist.id}`, { headers: AUTH }).then((r) => r.json<any>())).toMatchObject({
+      status: "resolved", checks: [{ label: "Only check", done: true }],
+    });
   });
 });
 
