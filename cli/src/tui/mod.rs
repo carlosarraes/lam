@@ -52,7 +52,7 @@ enum Focus {
 enum Mode {
     Normal,
     Reply(String),
-    /// Live-filtering by agent name or title.
+    /// Live-filtering by title, agent display name, or body.
     Filter,
 }
 
@@ -262,7 +262,7 @@ impl App {
         self.scroll = (self.scroll as i32 + delta).clamp(0, max.max(0)) as u16;
     }
 
-    /// One tab's items matching the current filter, which matches on agent name or title. The
+    /// One tab's items matching the current filter on title, agent display name, or body. The
     /// filter is shared: it applies to whichever tab you are looking at.
     fn visible_of(&self, tab: Tab) -> Vec<&Item> {
         let items = match tab {
@@ -275,7 +275,11 @@ impl App {
         let f = self.filter.to_lowercase();
         items
             .iter()
-            .filter(|i| i.name.to_lowercase().contains(&f) || i.title.to_lowercase().contains(&f))
+            .filter(|i| {
+                draw::source(i).to_lowercase().contains(&f)
+                    || i.title.to_lowercase().contains(&f)
+                    || i.body.to_lowercase().contains(&f)
+            })
             .collect()
     }
 
@@ -982,6 +986,41 @@ mod tests {
         assert_eq!(a.current().unwrap().id, selected, "still on the same item");
         assert_eq!(a.check_sel, check_sel, "check cursor survives a refresh");
         assert_eq!(a.scroll, scroll, "reading position survives a refresh");
+    }
+
+    #[test]
+    fn slash_searches_body_and_display_name_without_losing_selection_clamping() {
+        for query in ["release", "agent", "rationale", "h:p"] {
+            let mut a = App::new("host".into());
+            let mut target = item("match", "open", &["yes"], "");
+            target.title = "Release approval".into();
+            target.name = if query == "h:p" { "" } else { "Agent" }.into();
+            target.body = "RATIONALE only in the body".into();
+            let mut other = item("other", "open", &[], "");
+            other.source_host = "elsewhere".into();
+            a.set_items(vec![target, other]);
+            a.handle(key('j'));
+            a.handle(key('/'));
+            for c in query.chars() {
+                a.handle(key(c));
+            }
+            assert_eq!(a.visible().len(), 1, "query: {query}");
+            assert_eq!(a.current().unwrap().id, "match", "query: {query}");
+            a.handle(KeyEvent::from(KeyCode::Enter));
+            assert_eq!(
+                a.handle(key('1')),
+                Some(Action::Resolve {
+                    id: "match".into(),
+                    choice: Some("yes".into()),
+                    text: None,
+                })
+            );
+            a.handle(key('/'));
+            a.handle(key('z'));
+            assert!(a.current().is_none());
+            a.handle(KeyEvent::from(KeyCode::Esc));
+            assert_eq!(a.visible().len(), 2);
+        }
     }
 
     #[test]

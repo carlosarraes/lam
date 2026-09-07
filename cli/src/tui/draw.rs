@@ -27,6 +27,16 @@ impl App {
     /// as markdown it would print twice, once as text and once as the destination.
     fn reader_markdown(item: &Item) -> String {
         let mut md = format!("# {}\n\n", item.title);
+        if item.checks.is_empty() {
+            if let Some(recommendation) = &item.recommendation {
+                md.push_str("## Recommendation\n\n");
+                if let Some(choice) = &item.recommended_choice {
+                    md.push_str(&format!("Recommended choice: {choice}\n\n"));
+                }
+                md.push_str(recommendation);
+                md.push_str("\n\n");
+            }
+        }
         if !item.body.is_empty() {
             md.push_str(&item.body);
             md.push_str("\n\n");
@@ -44,6 +54,18 @@ impl App {
     /// The reader document: markdown restyled into lam's palette, then the link.
     fn reader_document(item: &Item) -> Text<'static> {
         let mut doc = adopt_palette(tui_markdown::from_str(&Self::reader_markdown(item)));
+        if item.checks.is_empty() && item.recommendation.is_some() {
+            if let Some(choice) = &item.recommended_choice {
+                let label = format!("Recommended choice: {choice}");
+                if let Some(line) = doc
+                    .lines
+                    .iter_mut()
+                    .find(|line| line.to_string().starts_with("Recommended choice: "))
+                {
+                    *line = Line::from(Span::styled(label, ACCENT));
+                }
+            }
+        }
         if !item.link.is_empty() {
             doc.lines.push(Line::raw(""));
             doc.lines
@@ -205,6 +227,30 @@ impl App {
                     format!("{} · {} · {when} {stamp} ago", source(i), i.priority),
                     META,
                 ))];
+                // Keep the canonical answer visible in history's fixed-height detail pane.
+                if let Some(answer) = i.response_choice.as_deref().or(i.response_text.as_deref()) {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "{} via {}: {answer}",
+                            i.status,
+                            i.response_by.as_deref().unwrap_or("?")
+                        ),
+                        outcome(i).1,
+                    )));
+                }
+                if i.checks.is_empty() {
+                    if let Some(recommendation) = &i.recommendation {
+                        lines.push(Line::from(Span::styled("Recommendation", BOLD)));
+                        if let Some(choice) = &i.recommended_choice {
+                            lines.push(Line::from(Span::styled(
+                                format!("Recommended choice: {choice}"),
+                                ACCENT,
+                            )));
+                        }
+                        lines.extend(recommendation.lines().map(|l| Line::raw(l.to_string())));
+                        lines.push(Line::raw(""));
+                    }
+                }
                 lines.extend(i.body.lines().map(|l| Line::raw(l.to_string())));
                 if !i.link.is_empty() {
                     lines.push(Line::from(Span::styled(i.link.clone(), LINK)));
@@ -226,16 +272,6 @@ impl App {
                             label,
                         ),
                     ]));
-                }
-                if let Some(answer) = i.response_choice.as_deref().or(i.response_text.as_deref()) {
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            "{} via {}: {answer}",
-                            i.status,
-                            i.response_by.as_deref().unwrap_or("?")
-                        ),
-                        outcome(i).1,
-                    )));
                 }
                 lines
             }
@@ -289,7 +325,13 @@ impl App {
                     .choices
                     .iter()
                     .enumerate()
-                    .flat_map(|(n, c)| key(&(n + 1).to_string(), c))
+                    .flat_map(|(n, c)| {
+                        let mut hint = key(&(n + 1).to_string(), c);
+                        if i.checks.is_empty() && i.recommended_choice.as_ref() == Some(c) {
+                            hint[1] = Span::styled(format!(" {c} (recommended)   "), ACCENT);
+                        }
+                        hint
+                    })
                     .collect();
                 if !i.checks.is_empty() {
                     spans.extend(key(
@@ -361,7 +403,7 @@ fn key<'a>(k: &str, label: &str) -> Vec<Span<'a>> {
 }
 
 /// Who is asking: the agent's name, falling back to host:project for pre-name items.
-fn source(i: &Item) -> String {
+pub(super) fn source(i: &Item) -> String {
     if !i.name.is_empty() {
         return i.name.clone();
     }
@@ -428,6 +470,31 @@ pub(super) fn outcome(i: &Item) -> (&'static str, Style, String) {
 const HISTORY_FIXED: usize = 2 + 7 + 21 + 17 + 5;
 const REQUESTS_FIXED: usize = 2 + 7 + 21 + 5;
 
+/// Fit a queue column in terminal cells, including wide characters and the ellipsis.
+fn column(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut used = Span::raw(text).width();
+    let mut result = text.to_string();
+    if used > width {
+        result.clear();
+        used = 0;
+        for c in text.chars() {
+            let cells = Span::raw(c.to_string()).width();
+            if used + cells >= width {
+                break;
+            }
+            result.push(c);
+            used += cells;
+        }
+        result.push('…');
+        used += 1;
+    }
+    result.push_str(&" ".repeat(width - used));
+    result
+}
+
 /// Returns the `Line` rather than a `ListItem` so tests can read back what was rendered.
 fn row(i: &Item, tab: Tab, width: u16) -> Line<'_> {
     let open = i.status == "open";
@@ -462,23 +529,271 @@ fn row(i: &Item, tab: Tab, width: u16) -> Line<'_> {
         (false, _) => RULE,
     };
     let text = if open { Style::default() } else { DIM };
-    let title_w = (width as usize).saturating_sub(REQUESTS_FIXED).max(10);
-    Line::from(vec![
-        Span::styled("▍ ", gutter),
-        Span::styled(format!("{:<6} ", i.id), if open { META } else { DIM }),
-        Span::styled(format!("{:<20} ", source(i)), if open { LINK } else { DIM }),
-        Span::styled(
-            format!("{:<title_w$}", ellipsis(&title, title_w.saturating_sub(1))),
-            text,
-        ),
-        Span::styled(format!("{:>5}", age(&i.created_at)), DIM),
-    ])
+    let signal = if i.checks.is_empty() {
+        if open && i.recommendation.is_none() {
+            "! recommendation missing".into()
+        } else {
+            i.recommended_choice
+                .as_ref()
+                .map(|c| format!("→ {c}"))
+                .unwrap_or_default()
+        }
+    } else {
+        String::new()
+    };
+    let signal = column(
+        &signal,
+        Span::raw(&signal)
+            .width()
+            .min(24)
+            .min((width as usize).saturating_sub(3)),
+    );
+    let signal_w = if signal.is_empty() {
+        0
+    } else {
+        Span::raw(&signal).width() + 1
+    };
+    // Reader-width rows keep the title and signal; metadata returns when it fits.
+    let metadata = width as usize >= REQUESTS_FIXED + signal_w + 10;
+    let fixed = if metadata { REQUESTS_FIXED } else { 2 };
+    let title_w = (width as usize).saturating_sub(fixed + signal_w);
+    let mut spans = vec![Span::styled(column("▍ ", 2.min(width as usize)), gutter)];
+    if metadata {
+        spans.push(Span::styled(
+            format!("{} ", column(&i.id, 6)),
+            if open { META } else { DIM },
+        ));
+        spans.push(Span::styled(
+            format!("{} ", column(&source(i), 20)),
+            if open { LINK } else { DIM },
+        ));
+    }
+    spans.push(Span::styled(
+        if title_w == 0 {
+            String::new()
+        } else {
+            format!("{} ", column(&title, title_w - 1))
+        },
+        text,
+    ));
+    if !signal.is_empty() {
+        spans.push(Span::styled(
+            format!(" {signal}"),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    if metadata {
+        spans.push(Span::styled(format!("{:>5}", age(&i.created_at)), DIM));
+    }
+    Line::from(spans)
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::tests::item;
     use super::*;
+
+    fn render(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    fn screen_text(buf: &ratatui::buffer::Buffer) -> String {
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn recommended() -> Item {
+        let mut i = item("rec01", "open", &["wait", "ship"], "");
+        i.title = "Release decision".into();
+        i.body = "Body follows the rationale.".into();
+        i.recommendation = Some("Tests passed. Ship this version.".into());
+        i.recommended_choice = Some("ship".into());
+        i
+    }
+
+    #[test]
+    fn recommendation_rows_keep_the_signal_visible_at_reader_width() {
+        let mut i = recommended();
+        i.title = "A very long title that competes with the recommendation".into();
+        for width in [34, 60, 100] {
+            let line = row(&i, Tab::Requests, width);
+            let text = row_text(&i, Tab::Requests, width);
+            assert!(text.contains("→ ship"), "{width}: {text}");
+            assert!(line.width() <= width as usize, "{width}: {text}");
+            assert!(line
+                .spans
+                .iter()
+                .any(|s| s.content.contains("→ ship") && s.style.fg == Some(Color::Yellow)));
+        }
+    }
+
+    #[test]
+    fn recommendation_rows_fit_tiny_terminals_and_wide_characters() {
+        let mut i = recommended();
+        i.title = "发布版本 🚀 发布版本 🚀".into();
+        i.name = "a long agent name that exceeds its column".into();
+        i.recommended_choice = Some("发布🚀版本".into());
+        for width in [1, 10, 20, 34, 60, 100] {
+            let line = row(&i, Tab::Requests, width);
+            assert!(line.width() <= width as usize, "width {width}: {line}");
+            let mut a = App::new("host".into());
+            a.set_items(vec![i.clone()]);
+            for reader in [false, true] {
+                a.reader = reader;
+                render(&a, width, 12);
+            }
+        }
+    }
+
+    #[test]
+    fn recommendation_text_without_a_choice_still_precedes_the_body() {
+        let mut i = recommended();
+        i.choices.clear();
+        i.recommended_choice = None;
+        let mut a = App::new("host".into());
+        a.set_items(vec![i]);
+        for reader in [false, true] {
+            a.reader = reader;
+            let text = screen_text(&render(&a, 110, 24));
+            assert!(text.find("Tests passed.").unwrap() < text.find("Body follows").unwrap());
+            assert!(!text.contains("! recommendation missing"));
+            assert!(!text.contains("Recommended choice:"));
+        }
+    }
+
+    #[test]
+    fn reader_keeps_the_recommended_choice_literal() {
+        let mut i = recommended();
+        i.choices = vec!["**ship**".into()];
+        i.recommended_choice = Some("**ship**".into());
+        let doc = App::reader_document(&i);
+        assert!(doc
+            .lines
+            .iter()
+            .any(|line| line.to_string() == "Recommended choice: **ship**"));
+    }
+
+    #[test]
+    fn recommendation_missing_warning_is_only_for_open_non_checklists() {
+        let mut i = item("old01", "open", &[], "");
+        for width in [34, 100] {
+            let text = row_text(&i, Tab::Requests, width);
+            assert!(text.contains("! recommendation missing"), "{text}");
+            assert!(row(&i, Tab::Requests, width).width() <= width as usize);
+        }
+        i.checks.push(crate::client::Check {
+            label: "Verify".into(),
+            done: false,
+            at: None,
+        });
+        assert!(!row_text(&i, Tab::Requests, 100).contains("recommendation"));
+        i.checks.clear();
+        for status in ["resolved", "dismissed", "expired", "retracted"] {
+            i.status = status.into();
+            for tab in [Tab::Requests, Tab::History] {
+                assert!(!row_text(&i, tab, 100).contains("recommendation"));
+            }
+        }
+    }
+
+    #[test]
+    fn recommendation_precedes_the_body_in_detail_and_reader() {
+        let mut a = App::new("host".into());
+        a.set_items(vec![recommended()]);
+        for reader in [false, true] {
+            a.reader = reader;
+            let buf = render(&a, 110, 24);
+            let text = screen_text(&buf);
+            let heading = text.find("Recommendation").expect(&text);
+            let choice = text.find("Recommended choice: ship").expect(&text);
+            let rationale = text.find("Tests passed. Ship this version.").expect(&text);
+            let body = text.find("Body follows the rationale.").expect(&text);
+            assert!(
+                heading < choice && choice < rationale && rationale < body,
+                "{text}"
+            );
+            let choice_cells = buf
+                .content
+                .windows("Recommended choice: ship".len())
+                .find(|cells| {
+                    cells.iter().map(|c| c.symbol()).collect::<String>()
+                        == "Recommended choice: ship"
+                })
+                .unwrap();
+            assert!(
+                choice_cells.iter().all(|c| c.fg == Color::Yellow),
+                "reader: {reader}"
+            );
+        }
+    }
+
+    #[test]
+    fn recommended_footer_keeps_choice_numbers_and_actions() {
+        let mut a = App::new("host".into());
+        a.set_items(vec![recommended()]);
+        let buf = render(&a, 110, 24);
+        let footer: String = (0..110).map(|x| buf[(x, 22)].symbol()).collect();
+        assert!(footer.contains("1 wait"), "{footer}");
+        assert!(footer.contains("2 ship (recommended)"), "{footer}");
+        let marker = footer.find("ship (recommended)").unwrap() as u16;
+        assert_eq!(buf[(marker, 22)].fg, Color::Yellow);
+        assert_eq!(
+            a.handle(super::super::tests::key('2')),
+            Some(super::super::Action::Resolve {
+                id: "rec01".into(),
+                choice: Some("ship".into()),
+                text: None,
+            })
+        );
+        assert_eq!(
+            a.handle(super::super::tests::key('1')),
+            Some(super::super::Action::Resolve {
+                id: "rec01".into(),
+                choice: Some("wait".into()),
+                text: None,
+            })
+        );
+    }
+
+    #[test]
+    fn history_keeps_actual_outcome_when_it_differs_from_recommendation() {
+        let mut i = recommended();
+        i.status = "resolved".into();
+        i.response_choice = Some("wait".into());
+        i.response_by = Some("phone".into());
+        let mut a = App::new("host".into());
+        a.add_history(vec![i], true);
+        a.tab = Tab::History;
+        let text = screen_text(&render(&a, 110, 24));
+        assert!(text.contains("✓ wait"), "{text}");
+        assert!(text.contains("resolved via phone: wait"), "{text}");
+        assert!(text.contains("Recommended choice: ship"), "{text}");
+        assert!(!text.contains("2 ship (recommended)"), "{text}");
+        assert_eq!(a.handle(super::super::tests::key('2')), None);
+    }
+
+    #[test]
+    fn a_long_recommendation_does_not_hide_the_history_response() {
+        let mut i = recommended();
+        i.status = "resolved".into();
+        i.recommendation = Some("A line of rationale.\n".repeat(10));
+        i.response_choice = Some("wait".into());
+        i.response_by = Some("phone".into());
+        let mut a = App::new("host".into());
+        a.add_history(vec![i], true);
+        a.tab = Tab::History;
+        let text = screen_text(&render(&a, 110, 24));
+        assert!(text.contains("resolved via phone: wait"), "{text}");
+    }
 
     #[test]
     fn reader_markdown_carries_title_link_and_checks() {

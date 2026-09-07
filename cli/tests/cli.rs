@@ -574,6 +574,64 @@ async fn check_add_rejects_an_oversized_label_before_loading_config() {
 }
 
 #[tokio::test]
+async fn push_without_recommendation_never_contacts_the_configured_server() {
+    let (server, dir) = setup().await;
+    let out = lam(&dir, &["push", "Approve the release"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--recommendation is required"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn list_and_show_preserve_present_and_nullable_recommendation_fields() {
+    let (server, dir) = setup().await;
+    let mut recommended = item("rec01", "open", None);
+    recommended["recommendation"] = "Tests passed. Ship this version.".into();
+    recommended["recommended_choice"] = "ship".into();
+    recommended["choices"] = serde_json::json!(["wait", "ship"]);
+    let legacy = pre_milestone_item("old01");
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(vec![recommended.clone(), legacy.clone()]),
+        )
+        .mount(&server)
+        .await;
+    for value in [&recommended, &legacy] {
+        Mock::given(method("GET"))
+            .and(path(format!("/items/{}", value["id"].as_str().unwrap())))
+            .respond_with(ResponseTemplate::new(200).set_body_json(value))
+            .mount(&server)
+            .await;
+    }
+    let out = lam(&dir, &["list", "--json"]);
+    assert!(out.status.success());
+    let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    for (index, id) in ["rec01", "old01"].iter().enumerate() {
+        let out = lam(&dir, &["show", id]);
+        assert!(out.status.success());
+        let shown: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        for value in [&list[index], &shown] {
+            let expected = if index == 0 {
+                serde_json::json!("Tests passed. Ship this version.")
+            } else {
+                serde_json::Value::Null
+            };
+            assert_eq!(value.get("recommendation"), Some(&expected));
+            let expected = if index == 0 {
+                serde_json::json!("ship")
+            } else {
+                serde_json::Value::Null
+            };
+            assert_eq!(value.get("recommended_choice"), Some(&expected));
+        }
+    }
+    let out = lam(&dir, &["list"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 2);
+}
+
+#[tokio::test]
 async fn show_decodes_a_pre_milestone_item_response() {
     let (server, dir) = setup().await;
     Mock::given(method("GET"))
