@@ -25,18 +25,8 @@ const SELECTION: Color = Color::Rgb(0x2a, 0x24, 0x16);
 impl App {
     /// The item's body as markdown with its checklist. The link is appended after rendering —
     /// as markdown it would print twice, once as text and once as the destination.
-    fn reader_markdown(item: &Item) -> String {
-        let mut md = format!("# {}\n\n", item.title);
-        if item.checks.is_empty() {
-            if let Some(recommendation) = &item.recommendation {
-                md.push_str("## Recommendation\n\n");
-                if let Some(choice) = &item.recommended_choice {
-                    md.push_str(&format!("Recommended choice: {choice}\n\n"));
-                }
-                md.push_str(recommendation);
-                md.push_str("\n\n");
-            }
-        }
+    fn reader_body_markdown(item: &Item) -> String {
+        let mut md = String::new();
         if !item.body.is_empty() {
             md.push_str(&item.body);
             md.push_str("\n\n");
@@ -53,19 +43,27 @@ impl App {
 
     /// The reader document: markdown restyled into lam's palette, then the link.
     fn reader_document(item: &Item) -> Text<'static> {
-        let mut doc = adopt_palette(tui_markdown::from_str(&Self::reader_markdown(item)));
-        if item.checks.is_empty() && item.recommendation.is_some() {
-            if let Some(choice) = &item.recommended_choice {
-                let label = format!("Recommended choice: {choice}");
-                if let Some(line) = doc
-                    .lines
-                    .iter_mut()
-                    .find(|line| line.to_string().starts_with("Recommended choice: "))
-                {
-                    *line = Line::from(Span::styled(label, ACCENT));
+        let mut doc = adopt_palette(tui_markdown::from_str(&format!("# {}\n\n", item.title)));
+        doc.lines.push(Line::raw(""));
+        if item.checks.is_empty() {
+            if let Some(recommendation) = &item.recommendation {
+                doc.lines
+                    .extend(adopt_palette(tui_markdown::from_str("## Recommendation\n\n")).lines);
+                doc.lines.push(Line::raw(""));
+                if let Some(choice) = &item.recommended_choice {
+                    doc.lines.push(Line::from(Span::styled(
+                        format!("Recommended choice: {choice}"),
+                        ACCENT,
+                    )));
+                    doc.lines.push(Line::raw(""));
                 }
+                doc.lines
+                    .extend(adopt_palette(tui_markdown::from_str(recommendation)).lines);
+                doc.lines.push(Line::raw(""));
             }
         }
+        doc.lines
+            .extend(adopt_palette(tui_markdown::from_str(&Self::reader_body_markdown(item))).lines);
         if !item.link.is_empty() {
             doc.lines.push(Line::raw(""));
             doc.lines
@@ -683,6 +681,53 @@ mod tests {
     }
 
     #[test]
+    fn reader_recommendation_does_not_replace_matching_user_content() {
+        for title in [
+            "Recommended choice: rollback",
+            "Recommendation",
+            "Release\n\nRecommended choice: rollback",
+        ] {
+            let mut i = recommended();
+            i.title = title.into();
+            i.body = "## Recommendation\n\nRecommended choice: body stays.".into();
+            i.recommendation =
+                Some("## Recommendation\n\nRecommended choice: rationale stays.".into());
+            i.recommended_choice = Some("**ship**".into());
+            let doc = App::reader_document(&i);
+            let lines: Vec<String> = doc.lines.iter().map(|line| line.to_string()).collect();
+            assert_eq!(
+                lines.first().unwrap(),
+                &format!("# {}", title.lines().next().unwrap())
+            );
+            if title.contains('\n') {
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line == "Recommended choice: rollback"),
+                    "{lines:?}"
+                );
+            }
+            for label in [
+                "Recommended choice: **ship**",
+                "Recommended choice: rationale stays.",
+                "Recommended choice: body stays.",
+            ] {
+                assert_eq!(
+                    lines.iter().filter(|line| line.as_str() == label).count(),
+                    1,
+                    "{lines:?}"
+                );
+            }
+            let choice_line = doc
+                .lines
+                .iter()
+                .find(|line| line.to_string() == "Recommended choice: **ship**")
+                .unwrap();
+            assert_eq!(choice_line.spans[0].style.fg, Some(Color::Yellow));
+        }
+    }
+
+    #[test]
     fn recommendation_missing_warning_is_only_for_open_non_checklists() {
         let mut i = item("old01", "open", &[], "");
         for width in [34, 100] {
@@ -812,8 +857,7 @@ mod tests {
                 at: None,
             },
         ];
-        let md = App::reader_markdown(&i);
-        assert!(md.starts_with("# Approve MON-3120?"));
+        let md = App::reader_body_markdown(&i);
         assert!(md.contains("## Summary\n\nTwo files changed."));
         assert!(md.contains("- [x] PR 1"));
         assert!(md.contains("- [ ] PR 2"));
