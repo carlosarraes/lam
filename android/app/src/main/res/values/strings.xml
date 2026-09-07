@@ -27,6 +27,11 @@
     <string name="fyi_detail">FYI detail</string>
     <string name="detail_seen">Seen</string>
     <string name="fyi_seen_failed">Could not mark this FYI as seen. Refresh to try again.</string>
+    <string name="fyi_load_failed">Could not refresh this FYI. Cached content is shown.</string>
+    <string name="fyi_offline">Offline · cached FYI</string>
+    <string name="fyi_reconciling">FYI actions unavailable until synchronization completes.</string>
+    <string name="fyi_dismiss_failed">Could not confirm dismissal. Refresh to check this FYI before trying again.</string>
+    <string name="fyi_dismissing">Dismissing FYI…</string>
     <string name="requests_pending_counts">%1$s · %2$s</string>
     <string name="requests_matching_counts">Matching: %1$s · %2$s</string>
     <string name="priority_low">Low</string>

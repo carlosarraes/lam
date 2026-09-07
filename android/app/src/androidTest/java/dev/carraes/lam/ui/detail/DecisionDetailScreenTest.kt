@@ -31,6 +31,46 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 @OptIn(ExperimentalTestApi::class)
 class DecisionDetailScreenTest {
+    @Test fun cachedFyiLoadFailureKeepsBodyAndShowsRetryWithoutResponseControls() {
+        val repository = DeviceDetailRepository().apply {
+            current.value = example.copy(kind = ItemKindDto.FYI, choices = emptyList(), recommendation = null)
+            refreshSucceeds = false
+        }
+        compose.setContent {
+            val vm = remember { DecisionViewModel("request", repository) }
+            LamTheme { DecisionDetailScreen(vm, {}) }
+        }
+        compose.onNodeWithText("Could not refresh this FYI. Cached content is shown.").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithTag("markdown-body").assertExists()
+        compose.onNodeWithText("Retry sync").assertExists()
+        compose.onNodeWithTag("recommendation").assertDoesNotExist()
+        compose.onNodeWithText("Done").assertDoesNotExist()
+        compose.onNodeWithText("Write another reply").assertDoesNotExist()
+        compose.runOnIdle { assertEquals(0, repository.seen) }
+    }
+
+    @Test fun failedFullDetailFyiDismissShowsErrorAndKeepsReadableBodyWithoutResponseControls() {
+        val repository = DeviceDetailRepository().apply {
+            current.value = example.copy(kind = ItemKindDto.FYI, choices = emptyList(), recommendation = null)
+            seenSucceeds = false
+            answerSucceeds = false
+        }
+        compose.setContent {
+            val vm = remember { DecisionViewModel("request", repository) }
+            LamTheme { DecisionDetailScreen(vm, {}) }
+        }
+        compose.waitUntilAtLeastOneExists(hasText("Could not mark this FYI as seen. Refresh to try again."))
+        compose.onNodeWithContentDescription("More actions").performClick()
+        compose.onNodeWithText("Quick response").assertDoesNotExist()
+        compose.onNodeWithText("Dismiss").performClick()
+        compose.onNodeWithText("Dismiss request").performClick()
+        compose.onNodeWithText("Could not confirm dismissal. Refresh to check this FYI before trying again.").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithTag("markdown-body").assertExists()
+        compose.onNodeWithTag("recommendation").assertDoesNotExist()
+        compose.onNodeWithText("Done").assertDoesNotExist()
+        compose.onNodeWithText("Write another reply").assertDoesNotExist()
+        compose.runOnIdle { assertEquals(listOf(FinalAnswer.Dismiss), repository.answers) }
+    }
     @Test fun openingFyiMarksSeenKeepsBodyAndOffersNoReplyControls() {
         val repository = DeviceDetailRepository().apply {
             current.value = example.copy(title = "Production rollout update", kind = ItemKindDto.FYI, choices = emptyList(), recommendation = null, recommendedChoice = null)
@@ -229,15 +269,22 @@ private val example = Item("request", "Release agent", "Approve production rollo
     null, null, null, "2026-09-04T11:55:00Z", null, null, 1)
 
 private class DeviceDetailRepository : ItemRepository {
+    var refreshSucceeds = true
+    var answerSucceeds = true
+    var seenSucceeds = true
     val current = MutableStateFlow<Item?>(example)
     override val openItems = current.map { listOfNotNull(it) }
     override val syncState = MutableStateFlow<SyncState>(SyncState.Current(now))
     override val errors = emptyFlow<Exception>()
     val answers = mutableListOf<FinalAnswer>()
     override fun item(id: String) = current
-    override suspend fun refreshItem(id: String) = true
+    override suspend fun refreshItem(id: String): Boolean {
+        if (!refreshSucceeds) syncState.value = SyncState.Stale(now, ApiError.Transport("offline"))
+        return refreshSucceeds
+    }
     override suspend fun answer(id: String, answer: FinalAnswer): Boolean {
         answers += answer
+        if (!answerSucceeds) return false
         current.value = current.value!!.copy(status = StatusDto.RESOLVED, responseText = (answer as? FinalAnswer.Text)?.value,
             responseChoice = (answer as? FinalAnswer.Choice)?.value, responseBy = ResponseByDto.PHONE, version = 2)
         return true
@@ -251,6 +298,7 @@ private class DeviceDetailRepository : ItemRepository {
     var seen = 0
     override suspend fun markSeen(id: String, version: Long): Boolean {
         seen++
+        if (!seenSucceeds) return false
         current.value = current.value!!.copy(status = StatusDto.DISMISSED, seenAt = now.toString(), resolvedAt = now.toString(), version = version + 1)
         return true
     }

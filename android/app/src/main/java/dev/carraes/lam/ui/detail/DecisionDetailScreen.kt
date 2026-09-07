@@ -120,19 +120,27 @@ fun DecisionDetailScreen(
                         Text(stringResource(R.string.fyi_seen_failed), color = Amber)
                         TextButton(onRefresh, enabled = !state.refreshing && !state.markingSeen) { Text(stringResource(R.string.pairing_retry_sync)) }
                     }
-                    if (item.status != StatusDto.OPEN) {
-                        CanonicalOutcome(item)
-                    } else if (!item.isFyi) {
+                    if (item.status == StatusDto.OPEN) {
                         if (!state.sync.mutationsEnabled || state.loadFailed) {
                             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text(stringResource(if (state.sync is SyncState.Stale) R.string.requests_offline else R.string.detail_reconciling), color = Amber)
+                                Text(stringResource(when {
+                                    item.isFyi && state.loadFailed -> R.string.fyi_load_failed
+                                    item.isFyi && state.sync is SyncState.Stale -> R.string.fyi_offline
+                                    item.isFyi -> R.string.fyi_reconciling
+                                    state.sync is SyncState.Stale -> R.string.requests_offline
+                                    else -> R.string.detail_reconciling
+                                }), color = Amber)
                                 val lastSuccess = (state.sync as? SyncState.Stale)?.lastSuccess
                                 if (lastSuccess != null) Text(stringResource(R.string.requests_last_success, formatTime(lastSuccess.toString())), style = MaterialTheme.typography.bodySmall)
                                 TextButton(onRefresh, enabled = !state.refreshing) { Text(stringResource(R.string.pairing_retry_sync)) }
                             }
                         }
-                        if (state.answerFailed) Text(stringResource(R.string.detail_answer_failed), color = Amber)
-                        if (state.submitting) Text(stringResource(R.string.detail_sending), modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+                        if (state.answerFailed) Text(stringResource(if (item.isFyi) R.string.fyi_dismiss_failed else R.string.detail_answer_failed), color = Amber)
+                        if (state.submitting) Text(stringResource(if (item.isFyi) R.string.fyi_dismissing else R.string.detail_sending), modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+                    }
+                    if (item.status != StatusDto.OPEN) {
+                        CanonicalOutcome(item)
+                    } else if (!item.isFyi) {
                         if (item.checks.isNotEmpty()) {
                             ChecklistDetailScreen(item.checks, state.actionsEnabled && checklist?.actionsEnabled == true, onCheck, onWriteReply)
                         } else {
