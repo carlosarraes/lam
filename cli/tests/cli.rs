@@ -476,6 +476,8 @@ async fn push_requires_a_recommendation_before_loading_config() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr)
         .contains("--recommendation is required for every non-checklist request"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--kind fyi"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("without --wait or decision fields"));
 }
 
 #[tokio::test]

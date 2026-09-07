@@ -927,6 +927,79 @@ describe("POST /items", () => {
   });
 });
 
+describe("FYI phone delivery", () => {
+  const create = async () => {
+    const response = await SELF.fetch("http://lam/v2/items", json({ kind: "fyi", name: "test:delivery", title: `Build finished #${++seq}`, body: "Already-authorized work is complete.", link: "https://example.com/result" }));
+    expect(response.status).toBe(201);
+    return response.json<any>();
+  };
+  const get = async (id: string) => (await SELF.fetch(`http://lam/items/${id}`, { headers: AUTH })).json<any>();
+  const seen = (id: string, token: string, version: string) => SELF.fetch(`http://lam/r/${id}/seen?t=${token}`, {
+    method: "POST", body: new URLSearchParams({ version }),
+  });
+
+  it("publishes Read and Dismiss only, keeps prefetch inert, and records explicit reading in history", async () => {
+    const item = await create();
+    const message = await lastMessage();
+    expect(message.actions.some((a: { label: string }) => a.label === "Reply")).toBe(false);
+    expect(message.actions.map((a: { label: string }) => a.label)).toEqual(["Read", "Dismiss"]);
+    const read = message.actions[0];
+    expect(read.action).toBe("view");
+    const page = await SELF.fetch(read.url, { headers: { Purpose: "prefetch", "Sec-Purpose": "prefetch" } });
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    expect(html).not.toContain("textarea");
+    expect(html).toContain("Mark seen");
+    expect(html).toContain("https://example.com/result");
+    expect(await get(item.id)).toMatchObject({ status: "open", seen_at: null, version: 0 });
+    const action = html.match(/<form[^>]*action="([^"]+\/seen\?t=[^"]+)"/)!;
+    const version = html.match(/name=version value="(\d+)"/)!;
+    expect(action).not.toBeNull();
+    expect(version).not.toBeNull();
+    const response = await SELF.fetch(`http://lam${action[1]}`, { method: "POST", body: new URLSearchParams({ version: version[1] }) });
+    expect(response.status).toBe(200);
+    const canonical = await get(item.id);
+    expect(canonical).toMatchObject({ status: "dismissed", version: 1, response_choice: null, response_text: null, response_by: null });
+    expect(canonical.seen_at).toBeTruthy();
+    expect(canonical.seen_at).toBe(canonical.resolved_at);
+    const history = await (await SELF.fetch(`http://lam/history?q=${encodeURIComponent(item.title)}`, { headers: AUTH })).json<any>();
+    expect(history.items).toContainEqual(expect.objectContaining({ id: item.id, seen_at: canonical.seen_at }));
+    expect((await SELF.fetch(read.url)).status).toBe(200);
+    expect((await SELF.fetch(read.url).then((r) => r.text()))).toContain("Already-authorized work is complete.");
+  });
+
+  it("authorizes item-scoped seen, enforces version, and makes repeated reads idempotent", async () => {
+    const item = await create();
+    const t = await itemToken("test-secret", item.id);
+    const other = await create();
+    expect((await seen(item.id, await itemToken("test-secret", other.id), "0")).status).toBe(403);
+    expect((await seen(item.id, t, "1")).status).toBe(409);
+    expect((await seen(item.id, t, "-1")).status).toBe(400);
+    expect((await seen(item.id, t, "nope")).status).toBe(400);
+    expect((await SELF.fetch(`http://lam/r/${item.id}/seen?t=${t}`)).status).toBe(404);
+    expect(await get(item.id)).toMatchObject({ status: "open", seen_at: null, version: 0 });
+    expect((await seen(item.id, t, "0")).status).toBe(200);
+    const canonical = await get(item.id);
+    expect((await seen(item.id, t, "0")).status).toBe(200);
+    expect(await get(item.id)).toEqual(canonical);
+    const request = await push();
+    expect((await seen(request.id, await itemToken("test-secret", request.id), "0")).status).toBe(400);
+  });
+
+  it("dismisses from the notification without seen and refuses a later read acknowledgement", async () => {
+    const item = await create();
+    const message = await lastMessage();
+    const dismiss = message.actions.find((a: { label: string }) => a.label === "Dismiss");
+    expect(dismiss).toMatchObject({ action: "http", clear: true });
+    expect((await SELF.fetch(dismiss.url)).status).toBe(404);
+    expect((await SELF.fetch(dismiss.url.replace(/t=.*/, "t=invalid"), { method: "POST" })).status).toBe(403);
+    expect((await SELF.fetch(dismiss.url, { method: "POST" })).status).toBe(200);
+    expect(await get(item.id)).toMatchObject({ status: "dismissed", seen_at: null, response_by: "phone", version: 1 });
+    expect((await seen(item.id, await itemToken("test-secret", item.id), "0")).status).toBe(409);
+    expect(await get(item.id)).toMatchObject({ seen_at: null, version: 1 });
+  });
+});
+
 describe("duplicate pushes", () => {
   it("migrates a 0005 row with null recommendations and legacy deduplication", async () => {
     try {

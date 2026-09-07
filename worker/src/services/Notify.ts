@@ -22,16 +22,26 @@ export class Notify extends Effect.Service<Notify>()("lam/Notify", {
         Effect.gen(function* () {
           const t = yield* auth.itemToken(item.id);
           const page = `${baseUrl}/r/${item.id}?t=${t}`;
-          const actions: Draft["actions"] = item.checks.length
-            ? []
-            : (item.choices.length ? item.choices : ["Done"]).map((c) => ({
-                action: "http",
-                label: c,
-                url: `${baseUrl}/a/${item.id}/${encodeURIComponent(c)}?t=${t}`,
-                clear: true,
-              }));
-          if (item.link) actions.push({ action: "view", label: "Open", url: item.link, clear: false });
-          actions.push({ action: "view", label: item.checks.length ? "Checks" : "Reply", url: page, clear: !item.checks.length });
+          const actions: Draft["actions"] = [];
+          if (item.kind === "fyi") {
+            actions.push(
+              { action: "view", label: "Read", url: page, clear: true },
+              { action: "http", label: "Dismiss", url: `${baseUrl}/r/${item.id}/dismiss?t=${t}`, clear: true },
+            );
+          } else {
+            if (!item.checks.length) {
+              for (const choice of item.choices.length ? item.choices : ["Done"]) {
+                actions.push({
+                  action: "http",
+                  label: choice,
+                  url: `${baseUrl}/a/${item.id}/${encodeURIComponent(choice)}?t=${t}`,
+                  clear: true,
+                });
+              }
+            }
+            if (item.link) actions.push({ action: "view", label: "Open", url: item.link, clear: false });
+            actions.push({ action: "view", label: item.checks.length ? "Checks" : "Reply", url: page, clear: !item.checks.length });
+          }
           const src = source(item);
           const checklist = item.checks.map((c) => `${c.done ? "☑" : "☐"} ${c.label}`).join("\n");
           yield* publish({

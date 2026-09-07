@@ -1,23 +1,33 @@
 ---
 name: lam
-description: Use when blocked on a decision only Carlos can make (approval, choice between options, destructive action, credentials) and you need to reach him wherever he is — pushes to his phone and desktop via `lam` and waits for his answer.
+description: Use when Carlos needs to make a decision, grant approval, provide credentials, or receive a progress or completion update about already-authorized work while away.
 ---
 
-# lam — Look At Me
+# lam: Look At Me
 
-`lam` is a queue Carlos reads from his phone (ntfy) and PC. You push an item, block on it, and get his answer back as JSON. Replaces `ssh carraes notify-send` and adb pings.
+`lam` is a queue Carlos reads from his phone and PC. Requests collect decisions; FYIs deliver information and close when read.
 
 ## When
 
-Genuine blockers only: a decision, an approval, a secret, a "wave finished while he's away". Never for FYI progress. One item per blocking event, not per agent.
+Choose the kind from what Carlos needs to do:
+
+- If an action needs his decision, approval, credentials, or other input, send a request with your recommendation and wait for his answer. Omitted `--kind` defaults to `request`.
+- If already-authorized work has progressed or finished and only an update is needed, send `--kind fyi` and continue. FYIs never grant approval. Any action still lacking authorization remains a request.
+
+Send one item per useful update or blocking event. For an informational update rejected for a missing recommendation, switch to `--kind fyi` and remove wait/decision flags. Never invent a filler recommendation such as "No action needed" to satisfy request validation.
+
+These commands require the FYI-capable CLI and Worker. Check `lam push --help` for `--kind`. An older CLI or a server-upgrade error means rollout is needed; it does not mean FYI is already live. `lam --llm` prints the guide embedded in the installed CLI.
 
 ## Who you are
 
-Every item carries a **name** so Carlos can tell concurrent agents apart. Inside tmux, zellij or screen it is inferred as `session:window` — you do not have to think about it. Only when `lam push` errors with "who is asking?" do you pass `--name <session:window-ish label>` (or export `LAM_NAME` once at the start of your run).
+Every item carries a name so Carlos can tell concurrent agents apart. Inside tmux, zellij or screen it is inferred as `session:window`. When `lam push` errors with "who is asking?", pass `--name <session:window-ish label>` or export `LAM_NAME` for the run.
 
 ## How
 
 ```bash
+# informational completion of work Carlos already authorized; publish and continue
+lam push "Local verification finished" --kind fyi -b "All checks passed. The change is ready for review." -p low
+
 # ask a question with buttons (max 3 choices) and block until answered
 # Every decision says what you recommend and why; the recommended choice exactly matches a --choice.
 lam push "PR #2529: waive artifact check?" -b "Reply in Claude Code session mp-2529" -p critical -c waive -c require --recommendation "Waive it: the published artifact's checksum and smoke test are green." --recommended-choice waive --wait
@@ -39,17 +49,21 @@ lam wait "$ID"                 # returns on EVERY change: read .checks[].done, a
 lam check add "$ID" "PR #2601" # a new part became ready: append instead of pushing a second item
 ```
 
-Checklist loop: `lam wait` exits 0 both on progress and on resolution — check `status`: `open` means "some check flipped, act on it and call `lam wait` again"; anything else is final. `--check` and `--choice` are exclusive.
+Checklist loop: `lam wait` exits 0 both on progress and on resolution. Check `status`: `open` means "some check flipped, act on it and call `lam wait` again"; anything else is final.
 
-Every non-checklist push requires `--recommendation <action and rationale>`. When using `--choice`, also pass `--recommended-choice <CHOICE>` with an exact value from `--choice`. Checklists are the only exception: do not pass either recommendation flag with `--check`.
+Every non-checklist request requires `--recommendation <action and rationale>`. With `--choice`, also pass `--recommended-choice <CHOICE>` exactly matching a choice. Checklist requests omit both recommendation flags. `--check` and `--choice` are exclusive.
 
-`wait` prints the item as JSON. Read `response_choice` (button pressed) and `response_text` (free text). Exit codes: `0` resolved, `2` dismissed (he doesn't want to deal with it — stop and report), `3` timeout (fall back to `lam list` later; do not re-push the same question), `4` expired (TTL passed — decide whether to re-push), `5` retracted.
+FYIs reject `--wait`, `--choice`, `--check`, `--recommendation`, and `--recommended-choice`. They have no reply or decision fields. Never call `lam wait ID` on an FYI or include one in an explicit multi-ID wait. `lam wait --any` selects requests only and returns immediately if only FYIs exist.
 
-- `-p critical` only for actual blockers; `normal` for "look when convenient".
-- The body may be **markdown** — headings, bullets, tables, fenced code. Carlos reads it rendered in the terminal (`m` opens a reader pane), so send the whole plan or diff summary when the decision needs it rather than a one-line teaser. The phone shows the same text unrendered, so keep the first line meaningful.
-- A push with the same agent name, title, body, priority, ordered choices, ordered checks, link, exact TTL seconds, recommendation, and recommended choice as an item that is still open returns **that item's id** and does not notify again. Source host and project do not affect identity, so retrying from another machine is safe.
+`lam list` and `lam show ID` inspect without marking an FYI seen. In the TUI, `m` or Enter opens the FYI reader and marks it seen; selecting its row does not. A visible phone page also marks it seen after rendering, with a Mark seen button when scripting is unavailable or the automatic request fails. Fetching or prefetching the page alone changes nothing. Seen FYIs leave the open queue and remain readable in history. Explicit Dismiss also closes them, but leaves `seen_at` empty and history says Dismissed, not Seen.
+
+`wait` prints the item as JSON. Read `response_choice` for buttons and `response_text` for free text. Exit codes: `0` resolved or checklist progress; `2` dismissed, stop and report; `3` timeout, inspect later without repeating the question; `4` expired, reconsider whether the request still matters; `5` retracted.
+
+- Requests accept `-p warning`, `normal`, or `critical`; `warning` is an alias for wire `normal`. New requests reject `low`. FYIs accept `low`, `normal`, or `critical`, plus the same warning alias. Use critical only when urgency warrants it. Request normal displays as Warning; FYI normal displays as Normal. Old low-priority requests remain readable.
+- The body may be markdown. Carlos reads it rendered in the terminal reader, so include the context needed to decide. The phone shows the same text unrendered; keep the first line meaningful.
+- Retrying an identical open push returns that item's ID without notifying again. Kind, name, title, body, priority, ordered choices/checks, link, TTL seconds, and recommendation fields determine identity. Source host and project do not.
 - Never invent a name that hides who you are: the inferred `session:window` is what Carlos looks for when several agents are running.
-- Title = the decision. `--recommendation` = the action you recommend and why. Body = where to act ("Reply in Claude Code: …"). Host and project are attached automatically.
-- Always pass `--link` when there is a URL to act on, and `--ttl` when the ask stops mattering after a while — stale items make the queue untrustworthy.
+- Request title = the decision; recommendation = what you recommend and why; body = context and where to act. FYI title/body = the update and its result. Host and project are attached automatically.
+- Pass `--link` when there is a relevant URL, and `--ttl` when the item stops mattering after a while.
 - The phone notification shows at most 3 buttons; with 3 choices the Open/Reply buttons are still available inside the ntfy app.
-- `lam list` shows open items; `lam show <id>` shows one. Never resolve items yourself with `lam done` or tick checks with `lam check tick` — that is Carlos's side. `lam retract` and `lam check add` are the only mutations that are yours.
+- Leave answering, marking seen, dismissing, and ticking checks to Carlos. As the sending agent, use `lam retract` to withdraw an obsolete item and `lam check add` to extend a checklist. Do not use `lam done` or `lam check tick` to answer your own requests.

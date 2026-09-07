@@ -108,7 +108,7 @@ fn validate_request_fields(a: &PushArgs) -> Result<()> {
             .as_deref()
             .is_none_or(|recommendation| recommendation.trim().is_empty())
         {
-            bail!("--recommendation is required for every non-checklist request");
+            bail!("--recommendation is required for every non-checklist request. For informational updates about already-authorized work, use --kind fyi without --wait or decision fields. If approval is still needed, send a request with your recommendation and wait.");
         }
         if !a.choices.is_empty() {
             let recommended = a
