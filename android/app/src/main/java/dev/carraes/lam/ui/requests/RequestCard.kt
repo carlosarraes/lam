@@ -32,15 +32,16 @@ import kotlin.math.roundToInt
 @Composable
 fun RequestCard(item: Item, now: Instant, actionsEnabled: Boolean = false,
     onQuickResponse: () -> Unit = {}, onDismiss: () -> Unit = {}, onOpen: () -> Unit) {
-    val priority = priorityLabel(item.priority)
+    val priority = priorityLabel(item.priority, item.kind)
     val progress = when {
+        item.isFyi -> stringResource(R.string.item_fyi)
         item.checks.isNotEmpty() -> pluralStringResource(R.plurals.request_check_progress, item.checks.size, item.checks.count { it.done }, item.checks.size)
         item.choices.isNotEmpty() -> pluralStringResource(R.plurals.request_choice_count, item.choices.size, item.choices.size)
         else -> stringResource(R.string.request_decision)
     }
-    val type = stringResource(if (item.checks.isNotEmpty()) R.string.type_checklist else R.string.request_decision)
+    val type = stringResource(if (item.isFyi) R.string.item_fyi else if (item.checks.isNotEmpty()) R.string.type_checklist else R.string.request_decision)
     val warning = stringResource(R.string.request_no_recommendation)
-    val open = stringResource(R.string.request_open)
+    val open = stringResource(if (item.isFyi) R.string.fyi_open else R.string.request_open)
     val details = listOf(type, progress).distinct().joinToString(", ") + if (item.missingRecommendation) ", $warning" else ""
     val description = stringResource(R.string.request_accessibility, item.title, item.agentDisplay, priority, details, open)
     val quick = stringResource(R.string.quick_response)
@@ -58,7 +59,7 @@ fun RequestCard(item: Item, now: Instant, actionsEnabled: Boolean = false,
             CompositionLocalProvider(androidx.compose.ui.platform.LocalLayoutDirection provides androidx.compose.ui.unit.LayoutDirection.Ltr) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     Icon(Icons.Default.Close, dismiss)
-                    Icon(Icons.AutoMirrored.Filled.Send, quick)
+                    if (!item.isFyi) Icon(Icons.AutoMirrored.Filled.Send, quick)
                 }
             }
         }
@@ -66,18 +67,18 @@ fun RequestCard(item: Item, now: Instant, actionsEnabled: Boolean = false,
         colors = CardDefaults.cardColors(containerColor = agentColor(item), contentColor = OffWhite),
         modifier = Modifier.fillMaxWidth().absoluteOffset { IntOffset(drag.roundToInt(), 0) }
             .testTag("request-card-${item.id}")
-            .pointerInput(item.id, actionsEnabled, threshold) {
+            .pointerInput(item.id, item.isFyi, actionsEnabled, threshold) {
                 detectHorizontalDragGestures(
                     onHorizontalDrag = { change, amount ->
                         // Consume stale-card swipes too, so releasing in bounds cannot open detail.
                         change.consume()
-                        if (actionsEnabled) drag = (drag + amount).coerceIn(-threshold * 1.5f, threshold * 1.5f)
+                        if (actionsEnabled) drag = (drag + amount).coerceIn(if (item.isFyi) 0f else -threshold * 1.5f, threshold * 1.5f)
                     },
                     onDragEnd = {
                         val completed = drag
                         drag = 0f
                         if (actionsEnabled) {
-                            if (completed >= threshold) currentDismiss() else if (completed <= -threshold) currentQuick()
+                            if (completed >= threshold) currentDismiss() else if (!item.isFyi && completed <= -threshold) currentQuick()
                         }
                     },
                     onDragCancel = { drag = 0f },
@@ -89,8 +90,11 @@ fun RequestCard(item: Item, now: Instant, actionsEnabled: Boolean = false,
             role = Role.Button
             onClick(label = open) { onOpen(); true }
             if (actionsEnabled) {
-                onLongClick(label = quick) { menu = true; true }
-                customActions = listOf(CustomAccessibilityAction(quick) { onQuickResponse(); true }, CustomAccessibilityAction(dismiss) { onDismiss(); true })
+                onLongClick(label = if (item.isFyi) dismiss else quick) { menu = true; true }
+                customActions = buildList {
+                    if (!item.isFyi) add(CustomAccessibilityAction(quick) { onQuickResponse(); true })
+                    add(CustomAccessibilityAction(dismiss) { onDismiss(); true })
+                }
             }
         }) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -111,7 +115,7 @@ fun RequestCard(item: Item, now: Instant, actionsEnabled: Boolean = false,
         }
     }
         DropdownMenu(menu, onDismissRequest = { menu = false }) {
-            DropdownMenuItem(text = { Text(quick) }, onClick = { menu = false; onQuickResponse() })
+            if (!item.isFyi) DropdownMenuItem(text = { Text(quick) }, onClick = { menu = false; onQuickResponse() })
             DropdownMenuItem(text = { Text(dismiss) }, onClick = { menu = false; onDismiss() })
         }
     }

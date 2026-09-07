@@ -21,9 +21,11 @@ data class DecisionState(
     val quickOpen: Boolean = false,
     val reply: String = "",
     val confirmation: AnswerConfirmation? = null,
+    val markingSeen: Boolean = false,
+    val seenFailed: Boolean = false,
 ) {
     val missing: Boolean get() = item == null && !loading && !loadFailed
-    val actionsEnabled: Boolean get() = item?.status == StatusDto.OPEN && sync.mutationsEnabled && !submitting && !loadFailed
+    val actionsEnabled: Boolean get() = item?.status == StatusDto.OPEN && sync.mutationsEnabled && !submitting && !markingSeen && !loadFailed
     val replyBytes: Int get() = reply.toByteArray(Charsets.UTF_8).size
     val replyValid: Boolean get() = reply.isNotBlank() && replyBytes <= 8 * 1024
 }
@@ -36,6 +38,8 @@ class DecisionViewModel(
     private val mutableState = MutableStateFlow(DecisionState())
     val state: StateFlow<DecisionState> = mutableState.asStateFlow()
     private var confirmationToken = 0L
+    private var detailOpened = false
+    private var loadedSuccessfully = false
 
     init {
         viewModelScope.launch {
@@ -54,7 +58,7 @@ class DecisionViewModel(
     }
 
     fun refresh() {
-        if (state.value.refreshing || state.value.submitting) return
+        if (state.value.refreshing || state.value.submitting || state.value.markingSeen) return
         mutableState.update { it.copy(refreshing = true, loading = it.item == null, confirmation = null) }
         viewModelScope.launch {
             var succeeded = false
@@ -68,7 +72,35 @@ class DecisionViewModel(
             } finally {
                 val missing = (repository.syncState.value as? SyncState.Stale)?.error.let { it is ApiError && it.statusCode == 404 }
                 mutableState.update { it.copy(loading = false, refreshing = false, loadFailed = !succeeded && !missing) }
+                loadedSuccessfully = succeeded
             }
+            if (succeeded && detailOpened) markLoadedFyiSeen()
+        }
+    }
+
+    fun openDetail() {
+        if (detailOpened) return
+        detailOpened = true
+        if (loadedSuccessfully && !state.value.refreshing) viewModelScope.launch { markLoadedFyiSeen() }
+    }
+
+    private suspend fun markLoadedFyiSeen() {
+        if (state.value.markingSeen) return
+        // Cover the local read too: refresh must not start a second seen operation while Room is loading.
+        mutableState.update { it.copy(markingSeen = true, seenFailed = false) }
+        var succeeded = true
+        try {
+            // A fresh repository read avoids using a Compose emission with an older version.
+            val item = repository.item(id).first() ?: return
+            if (!item.isFyi || item.status != StatusDto.OPEN || item.seenAt != null) return
+            succeeded = repository.markSeen(id, item.version)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // The loaded article remains readable when marking it seen fails.
+            succeeded = false
+        } finally {
+            mutableState.update { it.copy(markingSeen = false, seenFailed = !succeeded) }
         }
     }
 
@@ -96,7 +128,7 @@ class DecisionViewModel(
     }
 
     fun dismissRequest() {
-        if (canAnswer()) requestConfirmation(FinalAnswer.Dismiss, state.value.item!!.version)
+        if (state.value.actionsEnabled && repository.syncState.value.mutationsEnabled) requestConfirmation(FinalAnswer.Dismiss, state.value.item!!.version)
     }
 
     fun writeReply() {
@@ -123,7 +155,9 @@ class DecisionViewModel(
 
     fun confirm(confirmation: AnswerConfirmation) {
         val current = state.value
-        if (!canAnswer() || current.confirmation != confirmation || current.item?.version != confirmation.version) return
+        if (!current.actionsEnabled || !repository.syncState.value.mutationsEnabled ||
+            (current.item?.isFyi == true && confirmation.answer != FinalAnswer.Dismiss) ||
+            current.confirmation != confirmation || current.item?.version != confirmation.version) return
         // Consume synchronously, before launching, so two taps cannot start two repository operations.
         mutableState.update { it.copy(confirmation = null, replyOpen = false, quickOpen = false, submitting = true, answerFailed = false) }
         viewModelScope.launch {
@@ -140,7 +174,7 @@ class DecisionViewModel(
         }
     }
 
-    private fun canAnswer() = state.value.actionsEnabled && repository.syncState.value.mutationsEnabled
+    private fun canAnswer() = state.value.actionsEnabled && state.value.item?.isFyi == false && repository.syncState.value.mutationsEnabled
 
     private fun requestConfirmation(answer: FinalAnswer, version: Long) {
         mutableState.update { it.copy(confirmation = AnswerConfirmation(answer, version, ++confirmationToken), answerFailed = false) }

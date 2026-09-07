@@ -194,6 +194,7 @@ internal class DefaultItemRepository(
 
     override suspend fun answer(id: String, answer: FinalAnswer): Boolean = operation(mutation = true) { session ->
         val canonical = session.api.getItem(id)
+        if (canonical.kind == ItemKindDto.FYI && answer != FinalAnswer.Dismiss) return@operation false
         var open = false
         if (!commit(session) {
             storage.upsert(listOf(ItemMapper.toEntity(canonical)))
@@ -226,7 +227,7 @@ internal class DefaultItemRepository(
         val snapshot = stateLock.withLock {
             if (session.generation != generation) null else storage.get(id)
         } ?: return@operation false
-        if (snapshot.canonical.status != StatusDto.OPEN || index !in snapshot.canonical.checks.indices) return@operation false
+        if (snapshot.canonical.kind == ItemKindDto.FYI || snapshot.canonical.status != StatusDto.OPEN || index !in snapshot.canonical.checks.indices) return@operation false
         val tag = UUID.randomUUID().toString()
         val checks = snapshot.canonical.checks.mapIndexed { i, check ->
             if (i == index) check.copy(done = done, at = if (done) clock.instant().toString() else null) else check
@@ -261,6 +262,28 @@ internal class DefaultItemRepository(
                 errorEvents.trySend(error)
                 throw error
             }
+        }
+    }
+
+    override suspend fun markSeen(id: String, version: Long): Boolean = operation(mutation = true) { session ->
+        val snapshot = stateLock.withLock {
+            if (session.generation != generation) null else storage.get(id)?.canonical
+        } ?: return@operation false
+        if (snapshot.kind != ItemKindDto.FYI) return@operation false
+        if (snapshot.seenAt != null) return@operation true
+        if (snapshot.status != StatusDto.OPEN || !prepareSubmission(session, id)) return@operation false
+        try {
+            val canonical = session.api.markSeen(id, version)
+            val committed = commit(session) {
+                storage.upsert(listOf(ItemMapper.toEntity(canonical)))
+                unresolvedFinalAnswer = null
+            }
+            committed && canonical.kind == ItemKindDto.FYI && canonical.seenAt != null
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            mutationFailed(session, id, error, finalAnswer = true)
+            false
         }
     }
 

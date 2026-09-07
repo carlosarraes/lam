@@ -12,6 +12,82 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class DecisionViewModelTest {
+    @Test fun refreshCannotDuplicateSeenWhileCanonicalRowReadIsPending() = runTest {
+        val repo = DetailFakeRepository().apply { current.value = detailItem.copy(kind = ItemKindDto.FYI) }
+        val vm = DecisionViewModel("request", repo)
+        runCurrent()
+        repo.itemReadGate = CompletableDeferred()
+        repo.seenGate = CompletableDeferred()
+        vm.openDetail(); runCurrent()
+        vm.refresh(); runCurrent()
+        repo.itemReadGate!!.complete(Unit); runCurrent()
+        assertEquals(listOf(1L), repo.seen)
+        repo.seenGate!!.complete(Unit); runCurrent()
+    }
+    @Test fun duplicateOpenDuringLoadingWaitsForSuccessfulReadAndLegacyOpenNeverMarksSeen() = runTest {
+        val repo = DetailFakeRepository().apply {
+            current.value = detailItem.copy(kind = ItemKindDto.FYI)
+            refreshGate = CompletableDeferred()
+        }
+        val vm = DecisionViewModel("request", repo)
+        vm.openDetail(); vm.openDetail(); runCurrent()
+        assertTrue(repo.seen.isEmpty())
+        repo.refreshGate!!.complete(Unit); runCurrent()
+        assertEquals(listOf(1L), repo.seen)
+        val legacy = DetailFakeRepository().apply { current.value = detailItem.copy(priority = PriorityDto.LOW) }
+        val legacyVm = DecisionViewModel("request", legacy)
+        legacyVm.openDetail(); runCurrent()
+        assertTrue(legacy.seen.isEmpty())
+        legacyVm.choose("Approve")
+        assertNotNull(legacyVm.state.value.confirmation)
+    }
+    @Test fun fyiIsSeenOnlyAfterExplicitSuccessfulOpenAndDuplicateCallbacksAreHarmless() = runTest {
+        val repo = DetailFakeRepository().apply { current.value = detailItem.copy(kind = ItemKindDto.FYI, recommendation = null) }
+        val vm = DecisionViewModel("request", repo)
+        runCurrent()
+        assertTrue(repo.seen.isEmpty())
+        vm.openDetail(); vm.openDetail(); runCurrent()
+        assertEquals(listOf(1L), repo.seen)
+        assertEquals("Choose rollout", vm.state.value.item?.title)
+        assertNotNull(vm.state.value.item?.seenAt)
+        vm.openDetail(); vm.refresh(); runCurrent()
+        assertEquals(1, repo.seen.size)
+    }
+
+    @Test fun failedLoadNeverMarksSeenAndExplicitRefreshRetriesFailedSeenWithoutErasingContent() = runTest {
+        val repo = DetailFakeRepository().apply {
+            current.value = detailItem.copy(kind = ItemKindDto.FYI)
+            refreshSucceeds = false
+        }
+        val vm = DecisionViewModel("request", repo)
+        vm.openDetail(); runCurrent()
+        assertTrue(repo.seen.isEmpty())
+        repo.refreshSucceeds = true; repo.seenSucceeds = false
+        vm.refresh(); runCurrent()
+        assertEquals(listOf(1L), repo.seen)
+        assertTrue(vm.state.value.seenFailed)
+        assertFalse(vm.state.value.loadFailed)
+        assertEquals("Choose rollout", vm.state.value.item?.title)
+        vm.openDetail(); runCurrent()
+        assertEquals(1, repo.seen.size)
+        repo.seenSucceeds = true
+        vm.refresh(); runCurrent()
+        assertEquals(listOf(1L, 1L), repo.seen)
+        assertFalse(vm.state.value.seenFailed)
+    }
+
+    @Test fun fyiRejectsReplyChoiceCompletionAndQuickResponseButAllowsExplicitDismiss() = runTest {
+        val repo = DetailFakeRepository().apply { current.value = detailItem.copy(kind = ItemKindDto.FYI) }
+        val vm = DecisionViewModel("request", repo)
+        runCurrent()
+        vm.choose("Approve"); vm.complete(); vm.quickResponse(); vm.writeReply()
+        assertNull(vm.state.value.confirmation)
+        assertFalse(vm.state.value.quickOpen)
+        assertFalse(vm.state.value.replyOpen)
+        vm.dismissRequest()
+        assertEquals(FinalAnswer.Dismiss, vm.state.value.confirmation?.answer)
+        assertTrue(repo.seen.isEmpty())
+    }
     @Before fun setup() { Dispatchers.setMain(StandardTestDispatcher()) }
     @After fun teardown() { Dispatchers.resetMain() }
 
@@ -177,6 +253,17 @@ internal val detailItem = Item("request", "Release agent", "Choose rollout", "##
     null, null, null, "2026-09-04T11:55:00Z", null, null, 1)
 
 internal class DetailFakeRepository : ItemRepository {
+    var itemReadGate: CompletableDeferred<Unit>? = null
+    var seenGate: CompletableDeferred<Unit>? = null
+    val seen = mutableListOf<Long>()
+    var seenSucceeds = true
+    override suspend fun markSeen(id: String, version: Long): Boolean {
+        seen += version
+        seenGate?.await()
+        if (seenSucceeds) current.value = current.value!!.copy(status = StatusDto.DISMISSED,
+            seenAt = detailNow.toString(), resolvedAt = detailNow.toString(), version = version + 1)
+        return seenSucceeds
+    }
     val current = MutableStateFlow<Item?>(detailItem)
     override val openItems = current.map { listOfNotNull(it) }
     override val syncState = MutableStateFlow<SyncState>(SyncState.Current(detailNow))
@@ -187,7 +274,7 @@ internal class DetailFakeRepository : ItemRepository {
     var refreshSucceeds = true
     var answerSucceeds = true
     var closeOnAnswer = true
-    override fun item(id: String) = current
+    override fun item(id: String) = flow { itemReadGate?.await(); emitAll(current) }
     override suspend fun refreshItem(id: String): Boolean {
         refreshGate?.await()
         if (!refreshSucceeds) syncState.value = SyncState.Stale(detailNow, Exception("offline"))

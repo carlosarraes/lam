@@ -21,7 +21,10 @@ data class RequestsState(
     val lastSuccess: Instant? = null,
     val actionsEnabled: Boolean = false,
     val now: Instant = Instant.now(),
-)
+) {
+    val actionableCount: Int get() = items.count { !it.isFyi }
+    val informationalCount: Int get() = items.count { it.isFyi }
+}
 
 class RequestsViewModel(repository: ItemRepository, private val reconcile: suspend () -> Boolean, clock: Clock = Clock.systemUTC()) : ViewModel() {
     private data class Filters(val query: String = "", val type: ItemTypeDto? = null, val priority: PriorityDto? = null)
@@ -62,7 +65,7 @@ val Item.requestType: ItemTypeDto get() = when {
     choices.isNotEmpty() -> ItemTypeDto.CHOICE
     else -> ItemTypeDto.PLAIN
 }
-val Item.missingRecommendation: Boolean get() = checks.isEmpty() && recommendation.isNullOrBlank()
+val Item.missingRecommendation: Boolean get() = !isFyi && checks.isEmpty() && recommendation.isNullOrBlank()
 fun requestAge(item: Item, now: Instant): String {
     val created = runCatching { Instant.parse(item.createdAt) }.getOrNull() ?: return "Unknown age"
     val minutes = Duration.between(created, now).toMinutes().coerceAtLeast(0)

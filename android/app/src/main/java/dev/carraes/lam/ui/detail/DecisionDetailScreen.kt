@@ -21,6 +21,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.carraes.lam.R
 import dev.carraes.lam.items.*
+import dev.carraes.lam.ui.components.priorityLabel
 import dev.carraes.lam.ui.markdown.*
 import dev.carraes.lam.ui.requests.*
 import dev.carraes.lam.ui.theme.*
@@ -32,6 +33,7 @@ import kotlinx.coroutines.launch
 
 @Composable
 fun DecisionDetailScreen(viewModel: DecisionViewModel, onBack: () -> Unit, checklist: ChecklistViewModel? = null) {
+    LaunchedEffect(viewModel) { viewModel.openDetail() }
     val state by viewModel.state.collectAsStateWithLifecycle()
     val checks = checklist?.state?.collectAsStateWithLifecycle()?.value
     DecisionDetailScreen(state, onBack, viewModel::refresh, viewModel::choose, viewModel::writeReply,
@@ -81,14 +83,14 @@ fun DecisionDetailScreen(
         Column(Modifier.safeDrawingPadding()) {
             Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 IconButton(onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.back)) }
-                Text(stringResource(R.string.request_detail), style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                Text(stringResource(if (state.item?.isFyi == true) R.string.fyi_detail else R.string.request_detail), style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
                 TextButton(onRefresh, enabled = !state.refreshing && !state.submitting) { Text(stringResource(R.string.detail_refresh)) }
                 Box {
                     IconButton({ menu = true }, enabled = state.actionsEnabled && checklist?.saving != true) {
                         Icon(Icons.Default.MoreVert, stringResource(R.string.more_actions))
                     }
                     DropdownMenu(menu, { menu = false }) {
-                        DropdownMenuItem(text = { Text(stringResource(R.string.quick_response)) }, onClick = { menu = false; onQuickResponse() })
+                        if (state.item?.isFyi == false) DropdownMenuItem(text = { Text(stringResource(R.string.quick_response)) }, onClick = { menu = false; onQuickResponse() })
                         DropdownMenuItem(text = { Text(stringResource(R.string.dismiss)) }, onClick = { menu = false; onDismissRequest() })
                     }
                 }
@@ -106,21 +108,21 @@ fun DecisionDetailScreen(
                 } else {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(item.title, style = MaterialTheme.typography.headlineMedium, modifier = Modifier.semantics { heading() })
-                        Text(stringResource(when (item.priority) {
-                            PriorityDto.CRITICAL -> R.string.priority_critical
-                            PriorityDto.NORMAL -> R.string.priority_normal
-                            PriorityDto.LOW -> R.string.priority_low
-                        }), color = if (item.priority == PriorityDto.CRITICAL) Amber else MutedText, style = MaterialTheme.typography.labelLarge)
+                        Text(priorityLabel(item.priority, item.kind), color = if (item.priority == PriorityDto.CRITICAL) Amber else MutedText, style = MaterialTheme.typography.labelLarge)
                         Text(item.agentDisplay, style = MaterialTheme.typography.titleSmall)
                         Text("${item.sourceHost}:${item.sourceProject}", color = MutedText, style = MaterialTheme.typography.bodySmall)
                         Text(formatTime(item.createdAt), color = MutedText, style = MaterialTheme.typography.bodySmall)
                     }
-                    RecommendationCard(item)
+                    if (!item.isFyi) RecommendationCard(item)
                     LamMarkdown(item.body, onLink = { destination = it }, modifier = Modifier.testTag("markdown-body"))
                     if (item.link.isNotBlank()) TextButton(onClick = { destination = item.link }) { Text(stringResource(R.string.detail_related_link)) }
+                    if (item.isFyi && state.seenFailed && item.seenAt == null) {
+                        Text(stringResource(R.string.fyi_seen_failed), color = Amber)
+                        TextButton(onRefresh, enabled = !state.refreshing && !state.markingSeen) { Text(stringResource(R.string.pairing_retry_sync)) }
+                    }
                     if (item.status != StatusDto.OPEN) {
                         CanonicalOutcome(item)
-                    } else {
+                    } else if (!item.isFyi) {
                         if (!state.sync.mutationsEnabled || state.loadFailed) {
                             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                 Text(stringResource(if (state.sync is SyncState.Stale) R.string.requests_offline else R.string.detail_reconciling), color = Amber)
@@ -175,9 +177,9 @@ fun DecisionActionSheets(state: DecisionState, checklist: ChecklistState?, onCho
     if (confirmation != null) {
         if (confirmation.answer == FinalAnswer.Dismiss) {
             DismissConfirmation(state.actionsEnabled, { onConfirm(confirmation) }, onDismissConfirmation)
-        } else AnswerConfirmationSheet(confirmation, state.actionsEnabled, { onConfirm(confirmation) }, onDismissConfirmation)
-    } else if (state.replyOpen) ReplySheet(state, onEditReply, onReviewReply, onDismissReply)
-    else if (state.quickOpen) QuickResponseSheet(state, checklist?.actionsEnabled == true, onChoice, onCheck, onWriteReply, onCloseQuick, snackbar)
+        } else if (state.item?.isFyi == false) AnswerConfirmationSheet(confirmation, state.actionsEnabled, { onConfirm(confirmation) }, onDismissConfirmation)
+    } else if (state.item?.isFyi == false && state.replyOpen) ReplySheet(state, onEditReply, onReviewReply, onDismissReply)
+    else if (state.item?.isFyi == false && state.quickOpen) QuickResponseSheet(state, checklist?.actionsEnabled == true, onChoice, onCheck, onWriteReply, onCloseQuick, snackbar)
 }
 
 @Composable
@@ -186,7 +188,7 @@ private fun CanonicalOutcome(item: Item) {
         verticalArrangement = Arrangement.spacedBy(8.dp)) {
         val status = stringResource(when (item.status) {
             StatusDto.RESOLVED -> R.string.detail_resolved
-            StatusDto.DISMISSED -> R.string.detail_dismissed
+            StatusDto.DISMISSED -> if (item.seenAt != null) R.string.detail_seen else R.string.detail_dismissed
             StatusDto.RETRACTED -> R.string.detail_retracted
             StatusDto.EXPIRED -> R.string.detail_expired
             StatusDto.OPEN -> R.string.request_open

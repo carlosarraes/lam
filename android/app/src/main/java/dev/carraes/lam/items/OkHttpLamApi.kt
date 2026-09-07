@@ -91,6 +91,12 @@ class OkHttpLamApi(
         serializer = ItemDto.serializer(),
     )
 
+    override suspend fun markSeen(id: String, version: Long): ItemDto = postJson(
+        segments = arrayOf("v2", "items", id, "seen"),
+        body = buildJsonObject { put("version", version) }.toString(),
+        serializer = ItemDto.serializer(),
+    )
+
     override suspend fun replyText(id: String, text: String): ItemDto = postJson(
         segments = arrayOf("items", id, "resolve"),
         body = json.encodeToString(TextResolution(text)),

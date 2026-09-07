@@ -19,6 +19,32 @@ import org.junit.Before
 import org.junit.Test
 
 class OkHttpLamApiTest {
+    @Test fun `seen conflict is surfaced without automatic replay`() = runTest {
+        server.enqueue(jsonResponse(409, "{\"error\":\"concurrent update, retry\"}"))
+        val error = expectError<ApiError.Server> { api.markSeen("notice", 1L) }
+        assertEquals(ApiConflictCode.CONCURRENT_UPDATE, error.conflictCode)
+        assertEquals(1, server.requestCount)
+    }
+    @Test fun `seen posts long version to typed endpoint and decodes canonical FYI`() = runTest {
+        server.enqueue(jsonResponse(body = ITEM_JSON.replace("\"id\":", "\"kind\":\"fyi\",\"seen_at\":\"2026-09-04T12:00:00Z\",\"id\":")))
+        val result = api.markSeen("notice", 4294967296L)
+        assertEquals(ItemKindDto.FYI, result.kind)
+        assertEquals("2026-09-04T12:00:00Z", result.seenAt)
+        server.takeRequest().apply {
+            assertEquals("POST", method)
+            assertEquals("/api/v2/items/notice/seen", target)
+            assertEquals("{\"version\":4294967296}", body!!.utf8())
+            assertEquals("Bearer device-credential", headers["Authorization"])
+        }
+        assertEquals(1, server.requestCount)
+    }
+
+    @Test fun `legacy response defaults to request without seen timestamp`() = runTest {
+        server.enqueue(jsonResponse(body = ITEM_JSON))
+        val item = api.getItem("legacy")
+        assertEquals(ItemKindDto.REQUEST, item.kind)
+        assertNull(item.seenAt)
+    }
     private lateinit var server: MockWebServer
     private lateinit var api: LamApi
 

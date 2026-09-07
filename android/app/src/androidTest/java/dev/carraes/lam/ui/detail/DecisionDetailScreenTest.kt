@@ -31,6 +31,23 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 @OptIn(ExperimentalTestApi::class)
 class DecisionDetailScreenTest {
+    @Test fun openingFyiMarksSeenKeepsBodyAndOffersNoReplyControls() {
+        val repository = DeviceDetailRepository().apply {
+            current.value = example.copy(title = "Production rollout update", kind = ItemKindDto.FYI, choices = emptyList(), recommendation = null, recommendedChoice = null)
+        }
+        compose.setContent {
+            val vm = remember { DecisionViewModel("request", repository) }
+            LamTheme { DecisionDetailScreen(vm, onBack = {}) }
+        }
+        compose.waitUntilAtLeastOneExists(hasText("Seen"))
+        compose.onNodeWithText("Normal").assertExists()
+        compose.onNodeWithTag("markdown-body").assertExists()
+        compose.onNodeWithTag("recommendation").assertDoesNotExist()
+        compose.onNodeWithText("Done").assertDoesNotExist()
+        compose.onNodeWithText("Write another reply").assertDoesNotExist()
+        compose.runOnIdle { assertEquals(1, repository.seen); assertTrue(repository.answers.isEmpty()) }
+        screenshot("task3-fyi-detail.png")
+    }
     @Test fun plainDoneRequiresConfirmationAndCompletesWithoutInventingAReply() {
         val repository = DeviceDetailRepository()
         repository.current.value = example.copy(choices = emptyList(), checks = emptyList())
@@ -231,4 +248,10 @@ private class DeviceDetailRepository : ItemRepository {
     override suspend fun refreshHistory(query: HistoryQuery, cursor: String?) = HistoryResult(false, null)
     override suspend fun setCheck(id: String, index: Int, done: Boolean) = false
     override suspend fun unpair() = Unit
+    var seen = 0
+    override suspend fun markSeen(id: String, version: Long): Boolean {
+        seen++
+        current.value = current.value!!.copy(status = StatusDto.DISMISSED, seenAt = now.toString(), resolvedAt = now.toString(), version = version + 1)
+        return true
+    }
 }

@@ -33,6 +33,80 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ItemRepositoryTest {
+    @Test fun `seen closes queue but preserves canonical readable item and history`() = runTest {
+        val f = fixture()
+        f.api.open = listOf(item().copy(kind = ItemKindDto.FYI))
+        f.api.result = f.api.open.single().copy(status = StatusDto.DISMISSED, version = 2,
+            seenAt = NOW.toString(), resolvedAt = NOW.toString())
+        f.repo.refresh()
+        assertTrue(f.repo.markSeen("a", 1L))
+        assertTrue(f.repo.markSeen("a", 1L))
+        f.api.open = emptyList()
+        f.repo.refresh()
+        assertTrue(f.repo.openItems.first().isEmpty())
+        val canonical = f.repo.item("a").first()!!
+        assertEquals("Body", canonical.body)
+        assertEquals(NOW.toString(), canonical.seenAt)
+        assertNull(canonical.responseBy)
+        assertEquals(listOf("a"), f.repo.cachedHistory.first().map { it.id })
+        assertEquals(listOf("open", "seen:a:1", "open"), f.api.calls)
+    }
+
+    @Test fun `stale seen reconciles newer version without replay then allows explicit retry`() = runTest {
+        val f = fixture()
+        f.api.open = listOf(item().copy(kind = ItemKindDto.FYI))
+        f.repo.refresh()
+        f.api.fetched = f.api.open.single().copy(version = 2)
+        f.api.open = listOf(f.api.fetched)
+        f.api.writeError = ApiError.AlreadyClosed(null)
+        assertFalse(f.repo.markSeen("a", 1))
+        assertEquals(2L, f.repo.item("a").first()!!.version)
+        assertEquals(1, f.api.submissions)
+        f.api.writeError = null
+        f.api.result = f.api.fetched.copy(status = StatusDto.DISMISSED, version = 3,
+            seenAt = NOW.toString(), resolvedAt = NOW.toString())
+        assertTrue(f.repo.markSeen("a", 2))
+        assertEquals(NOW.toString(), f.repo.item("a").first()!!.seenAt)
+    }
+
+    @Test fun `concurrent dismiss is reconciled but never reported as seen success`() = runTest {
+        val f = fixture()
+        f.api.open = listOf(item().copy(kind = ItemKindDto.FYI))
+        f.repo.refresh()
+        f.api.fetched = f.api.open.single().copy(status = StatusDto.DISMISSED, version = 2, resolvedAt = NOW.toString())
+        f.api.open = emptyList()
+        f.api.writeError = ApiError.AlreadyClosed(null)
+        assertFalse(f.repo.markSeen("a", 1))
+        assertEquals(StatusDto.DISMISSED, f.repo.item("a").first()!!.status)
+        assertNull(f.repo.item("a").first()!!.seenAt)
+        assertEquals(1, f.api.submissions)
+    }
+
+    @Test fun `failed seen and failed recovery preserve loaded content until explicit reconciliation`() = runTest {
+        val f = fixture()
+        f.api.open = listOf(item().copy(kind = ItemKindDto.FYI))
+        f.repo.refresh()
+        f.api.writeError = ApiError.Transport("offline")
+        f.api.readError = ApiError.Transport("offline")
+        assertFalse(f.repo.markSeen("a", 1))
+        assertEquals("Body", f.repo.item("a").first()!!.body)
+        assertNull(f.repo.item("a").first()!!.seenAt)
+        assertFalse(f.repo.syncState.value.mutationsEnabled)
+        assertEquals(1, f.api.submissions)
+    }
+
+    @Test fun `FYI answer and check calls are rejected locally while dismiss remains valid`() = runTest {
+        val f = fixture()
+        f.api.fetched = item().copy(kind = ItemKindDto.FYI)
+        f.api.open = listOf(f.api.fetched)
+        f.repo.refresh()
+        assertFalse(f.repo.answer("a", FinalAnswer.Complete))
+        assertFalse(f.repo.answer("a", FinalAnswer.Choice("done")))
+        assertFalse(f.repo.answer("a", FinalAnswer.Text("reply")))
+        assertFalse(f.repo.setCheck("a", 0, true))
+        assertEquals(0, f.api.submissions)
+        assertTrue(f.repo.answer("a", FinalAnswer.Dismiss))
+    }
     @Test fun `VPN startup waits for observed physical membership then permits fresh reconciliation`() = runTest {
         val network = ConnectivityTracker(null, false)
         network.seedDefault("vpn", true, true)
@@ -669,6 +743,7 @@ internal class FakeCredentials : CredentialStore {
 }
 
 internal class FakeApi : LamApi {
+    override suspend fun markSeen(id: String, version: Long) = write("seen:$id:$version")
     var beforeRevoke: suspend () -> Unit = {}
     var revokeError: ApiError? = null
     var revocations = 0

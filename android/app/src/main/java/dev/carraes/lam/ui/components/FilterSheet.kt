@@ -54,9 +54,9 @@ private fun FilterOption(label: String, selected: Boolean, onClick: () -> Unit) 
 }
 
 @Composable
-fun priorityLabel(priority: PriorityDto): String = stringResource(when (priority) {
+fun priorityLabel(priority: PriorityDto, kind: ItemKindDto = ItemKindDto.REQUEST): String = stringResource(when (priority) {
     PriorityDto.CRITICAL -> R.string.priority_critical
-    PriorityDto.NORMAL -> R.string.priority_normal
+    PriorityDto.NORMAL -> if (kind == ItemKindDto.FYI) R.string.priority_fyi_normal else R.string.priority_normal
     PriorityDto.LOW -> R.string.priority_low
 })
 

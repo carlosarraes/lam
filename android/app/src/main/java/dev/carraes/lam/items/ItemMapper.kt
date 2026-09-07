@@ -28,6 +28,8 @@ object ItemMapper {
             resolvedAt = it.resolvedAt,
             expiresAt = it.expiresAt,
             version = it.version,
+            kind = it.kind,
+            seenAt = it.seenAt,
         )
     }
 }

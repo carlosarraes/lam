@@ -67,7 +67,7 @@ fun HistoryScreen(state: HistoryState, onQuery: (String) -> Unit, onType: (ItemT
                                 Text(row.agentDisplay, style = MaterialTheme.typography.labelLarge)
                                 val status = stringResource(when (row.status) {
                                     StatusDto.RESOLVED -> R.string.detail_resolved
-                                    StatusDto.DISMISSED -> R.string.detail_dismissed
+                                    StatusDto.DISMISSED -> if (row.seenAt != null) R.string.detail_seen else R.string.detail_dismissed
                                     StatusDto.RETRACTED -> R.string.detail_retracted
                                     StatusDto.EXPIRED -> R.string.detail_expired
                                     StatusDto.OPEN -> R.string.request_open

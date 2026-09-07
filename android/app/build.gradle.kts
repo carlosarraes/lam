@@ -22,6 +22,7 @@ val releaseSigningConfigured =
     keystorePropertiesFile.isFile && signingPropertyNames.all { !keystoreProperties.getProperty(it).isNullOrBlank() }
 
 android {
+    sourceSets.getByName("androidTest").assets.directories.add("schemas")
     namespace = "dev.carraes.lam"
     compileSdk = 36
 

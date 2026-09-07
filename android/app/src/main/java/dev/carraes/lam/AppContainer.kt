@@ -26,7 +26,8 @@ class AppContainer(
 ) {
     private val credentials: CredentialComposition = createCredentialComposition(applicationContext)
     private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val database = Room.databaseBuilder(applicationContext, LamDatabase::class.java, "lam-items.db").build()
+    private val database = Room.databaseBuilder(applicationContext, LamDatabase::class.java, "lam-items.db")
+        .addMigrations(LamDatabase.MIGRATION_1_2).build()
     private val connectivity = AndroidConnectivityMonitor(applicationContext)
 
     private val items = DefaultItemRepository(

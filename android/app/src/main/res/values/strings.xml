@@ -20,7 +20,15 @@
     <string name="type_choice">Choices</string>
     <string name="type_checklist">Checklist</string>
     <string name="priority_critical">Critical</string>
-    <string name="priority_normal">Normal</string>
+    <string name="priority_normal">Warning</string>
+    <string name="priority_fyi_normal">Normal</string>
+    <string name="item_fyi">FYI</string>
+    <string name="fyi_open">Open FYI</string>
+    <string name="fyi_detail">FYI detail</string>
+    <string name="detail_seen">Seen</string>
+    <string name="fyi_seen_failed">Could not mark this FYI as seen. Refresh to try again.</string>
+    <string name="requests_pending_counts">%1$s · %2$s</string>
+    <string name="requests_matching_counts">Matching: %1$s · %2$s</string>
     <string name="priority_low">Low</string>
     <string name="clear_filters">Clear filters</string>
     <string name="done">Done</string>
@@ -38,12 +46,12 @@
     <string name="requests_never_synced">No successful sync yet</string>
     <string name="requests_refresh">Refresh requests</string>
     <plurals name="requests_count">
-        <item quantity="one">%d open</item>
-        <item quantity="other">%d open</item>
+        <item quantity="one">%d actionable</item>
+        <item quantity="other">%d actionable</item>
     </plurals>
-    <plurals name="requests_match_count">
-        <item quantity="one">%d matching</item>
-        <item quantity="other">%d matching</item>
+    <plurals name="requests_fyi_count">
+        <item quantity="one">%d FYI</item>
+        <item quantity="other">%d FYIs</item>
     </plurals>
     <plurals name="request_choice_count">
         <item quantity="one">%d choice</item>

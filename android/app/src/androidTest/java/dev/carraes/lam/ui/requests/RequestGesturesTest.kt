@@ -27,6 +27,24 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 @OptIn(ExperimentalTestApi::class)
 class RequestGesturesTest {
+    @Test fun fyiHasOnlyDismissAccessibilityAndSwipeAction() {
+        var quick = 0; var dismiss = 0; var opens = 0
+        compose.setContent { LamTheme {
+            RequestCard(gestureItem.copy(kind = ItemKindDto.FYI, recommendation = null), gestureNow,
+                actionsEnabled = true, onQuickResponse = { quick++ }, onDismiss = { dismiss++ }, onOpen = { opens++ })
+        } }
+        val card = compose.onNodeWithTag("request-card-request")
+        card.assert(hasContentDescription("Normal priority", substring = true))
+        val actions = card.fetchSemanticsNode().config[SemanticsActions.CustomActions]
+        assertEquals(listOf("Dismiss"), actions.map { it.label })
+        card.performTouchInput { swipe(Offset(width * .85f, centerY), Offset(width * .15f, centerY)) }
+        compose.runOnIdle { assertEquals(0, quick); assertEquals(0, opens) }
+        card.performTouchInput { swipe(Offset(width * .15f, centerY), Offset(width * .85f, centerY)) }
+        compose.runOnIdle { assertEquals(1, dismiss) }
+        card.performTouchInput { longClick() }
+        compose.onNodeWithText("Quick response").assertDoesNotExist()
+        compose.onNodeWithText("Dismiss").assertExists()
+    }
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
     @Before fun keepAwake() { compose.runOnUiThread { compose.activity.window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) } }
 
@@ -156,4 +174,5 @@ internal class GestureRepository : ItemRepository {
     override val cachedHistory = flowOf(emptyList<Item>())
     override suspend fun refreshHistory(query: HistoryQuery, cursor: String?) = HistoryResult(false, null)
     override suspend fun unpair() = Unit
+    override suspend fun markSeen(id: String, version: Long) = false
 }

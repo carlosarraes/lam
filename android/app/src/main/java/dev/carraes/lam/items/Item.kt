@@ -21,6 +21,9 @@ data class Item(
     val resolvedAt: String?,
     val expiresAt: String?,
     val version: Long,
+    val kind: ItemKindDto = ItemKindDto.REQUEST,
+    val seenAt: String? = null,
 ) {
+    val isFyi: Boolean get() = kind == ItemKindDto.FYI
     val agentDisplay: String get() = name?.takeIf(String::isNotBlank) ?: "$sourceHost:$sourceProject"
 }

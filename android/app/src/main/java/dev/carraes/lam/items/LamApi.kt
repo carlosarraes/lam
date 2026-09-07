@@ -1,6 +1,7 @@
 package dev.carraes.lam.items
 
 interface LamApi {
+    suspend fun markSeen(id: String, version: Long): ItemDto
     suspend fun complete(id: String): ItemDto
     suspend fun listOpenItems(): List<ItemDto>
 

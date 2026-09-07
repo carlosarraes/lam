@@ -24,6 +24,27 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class RequestsScreenTest {
+    @Test fun inboxCountsFyiSeparatelyAndHistoryDistinguishesSeenFromDismissed() {
+        val fyi = item("notice", "Read this", "Builder").copy(kind = ItemKindDto.FYI, choices = emptyList())
+        val legacy = item("legacy", "Legacy request", "Builder", PriorityDto.LOW)
+        var history by mutableStateOf(false)
+        compose.setContent { LamTheme {
+            if (!history) RequestsScreen(RequestsState(items = listOf(fyi, legacy), loading = false, now = now),
+                {}, {}, {}, {}, {}, { history = true }, {}, {})
+            else dev.carraes.lam.ui.history.HistoryScreen(dev.carraes.lam.ui.history.HistoryState(items = listOf(
+                fyi.copy(status = StatusDto.DISMISSED, seenAt = now.toString(), resolvedAt = now.toString()),
+                fyi.copy(id = "dismissed", title = "Dismissed notice", status = StatusDto.DISMISSED))),
+                {}, {}, {}, {}, {}, {}, {}, {})
+        } }
+        compose.onNodeWithText("1 actionable · 1 FYI").assertExists()
+        File(compose.activity.externalCacheDir, "task3-fyi-inbox.png").outputStream().use {
+            compose.onRoot().captureToImage().asAndroidBitmap().compress(Bitmap.CompressFormat.PNG, 100, it)
+        }
+        compose.onNodeWithContentDescription("Switch queue").performClick()
+        compose.onNodeWithText("History").performClick()
+        compose.onNodeWithText("Seen").assertExists()
+        compose.onNodeWithText("Dismissed").assertExists()
+    }
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
     private val now = Instant.parse("2026-09-04T12:00:00Z")
 
@@ -57,7 +78,7 @@ class RequestsScreenTest {
             }) } }
         compose.onNodeWithText("Private body text", useUnmergedTree = true).assertDoesNotExist()
         compose.onNodeWithContentDescription("Approve the release, Builder, Critical priority, Decision, 2 choices, No recommendation, Open request").assertHasClickAction()
-        compose.onNodeWithContentDescription("Release checklist, Reviewer, Normal priority, Checklist, 1 of 2 complete, Open request").assertHasClickAction()
+        compose.onNodeWithContentDescription("Release checklist, Reviewer, Warning priority, Checklist, 1 of 2 complete, Open request").assertHasClickAction()
         compose.onAllNodesWithText("No recommendation", useUnmergedTree = true).assertCountEquals(1)
         compose.onNodeWithContentDescription("Approve the release, Builder, Critical priority, Decision, 2 choices, No recommendation, Open request").performClick()
         compose.onNodeWithText("Request detail").assertExists()

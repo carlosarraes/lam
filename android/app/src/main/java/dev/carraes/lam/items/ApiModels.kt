@@ -2,6 +2,13 @@ package dev.carraes.lam.items
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import androidx.room.ColumnInfo
+
+@Serializable
+enum class ItemKindDto {
+    @SerialName("request") REQUEST,
+    @SerialName("fyi") FYI,
+}
 
 @Serializable
 enum class PriorityDto {
@@ -83,6 +90,8 @@ data class ItemDto(
     @SerialName("resolved_at") val resolvedAt: String?,
     @SerialName("expires_at") val expiresAt: String?,
     val version: Long,
+    @ColumnInfo(defaultValue = "'REQUEST'") val kind: ItemKindDto = ItemKindDto.REQUEST,
+    @SerialName("seen_at") val seenAt: String? = null,
 )
 
 @Serializable

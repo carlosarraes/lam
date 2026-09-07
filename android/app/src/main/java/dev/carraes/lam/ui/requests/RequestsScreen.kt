@@ -49,7 +49,9 @@ fun RequestsScreen(state: RequestsState, onQuery: (String) -> Unit, onType: (Ite
                     } }, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp))
             }
             Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(pluralStringResource(if (filtered) R.plurals.requests_match_count else R.plurals.requests_count, state.items.size, state.items.size),
+                Text(stringResource(if (filtered) R.string.requests_matching_counts else R.string.requests_pending_counts,
+                    pluralStringResource(R.plurals.requests_count, state.actionableCount, state.actionableCount),
+                    pluralStringResource(R.plurals.requests_fyi_count, state.informationalCount, state.informationalCount)),
                     style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.weight(1f))
                 TextButton(onClick = { filters = true }, modifier = Modifier.semantics { contentDescription = filterLabel }) {

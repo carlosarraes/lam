@@ -16,6 +16,25 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class RequestsViewModelTest {
+    @Test fun pendingCountsSeparateFyiFromLegacyLowRequests() = runTest {
+        val repo = RequestsFakeRepository().apply { openItems.value = listOf(
+            request("legacy").copy(priority = PriorityDto.LOW), request("notice").copy(kind = ItemKindDto.FYI),
+            request("seen").copy(kind = ItemKindDto.FYI, status = StatusDto.DISMISSED)) }
+        val vm = RequestsViewModel(repo, { true }, fixedClock)
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { vm.state.collect() }
+        runCurrent()
+        assertEquals(1, vm.state.value.actionableCount)
+        assertEquals(1, vm.state.value.informationalCount)
+    }
+    @Test fun fyiWithoutRecommendationDoesNotWarn() {
+        val dto = kotlinx.serialization.json.Json.decodeFromString<ItemDto>("""
+            {"id":"fyi","kind":"fyi","title":"Update","body":"Read me","source_host":"host",
+            "source_project":"lam","priority":"normal","choices":[],"checks":[],"link":"",
+            "status":"open","response_choice":null,"response_text":null,"response_by":null,
+            "created_at":"2026-09-04T11:55:00Z","resolved_at":null,"expires_at":null,"version":1}
+        """)
+        assertFalse(ItemMapper.toItem(ItemMapper.toEntity(dto)).missingRecommendation)
+    }
     @Before fun setup() { Dispatchers.setMain(StandardTestDispatcher()) }
     @After fun teardown() { Dispatchers.resetMain() }
 
@@ -141,4 +160,5 @@ internal class RequestsFakeRepository : ItemRepository {
     override suspend fun answer(id: String, answer: FinalAnswer) = false
     override suspend fun setCheck(id: String, index: Int, done: Boolean) = false
     override suspend fun unpair() = Unit
+    override suspend fun markSeen(id: String, version: Long) = false
 }
