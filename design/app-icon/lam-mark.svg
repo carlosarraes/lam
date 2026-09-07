@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <title>lam</title>
+  <rect width="128" height="128" rx="29" fill="#D5A64D"/>
+  <path d="M34 28v62c0 8 4 11 12 11" fill="none" stroke="#24272E" stroke-width="10" stroke-linecap="round"/>
+  <path d="M97 67a23 23 0 1 0 -46 0a23 23 0 1 0 46 0" fill="none" stroke="#24272E" stroke-width="10"/>
+  <path d="M80 67a6 6 0 1 0 -12 0a6 6 0 1 0 12 0" fill="#24272E"/>
+</svg>
