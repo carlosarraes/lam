@@ -361,7 +361,15 @@ fn report_pairing_cancellation(status: Result<PairingWait>) {
 pub fn pair() -> Result<i32> {
     let cfg = Config::load()?;
     let c = Client::new(&cfg)?;
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let signal = Arc::clone(&interrupted);
+    ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))?;
+
     let pairing = c.create_pairing()?;
+    if interrupted.load(Ordering::SeqCst) {
+        report_pairing_cancellation(c.cancel_pairing(&pairing.session));
+        return Ok(130);
+    }
     let qr = QrCode::new(pairing.qr.as_bytes()).context("server returned an invalid QR payload")?;
     let rendered = qr.render::<unicode::Dense1x2>().quiet_zone(true).build();
 
@@ -369,10 +377,6 @@ pub fn pair() -> Result<i32> {
     println!("{rendered}");
     println!("Server: {}", cfg.server);
     println!("Expires: {} (five minutes)", pairing.expires_at);
-
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let signal = Arc::clone(&interrupted);
-    ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))?;
 
     loop {
         let wait_client = c.clone();

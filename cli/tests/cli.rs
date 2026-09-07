@@ -131,18 +131,40 @@ fn pairing_device(id: &str, name: &str) -> serde_json::Value {
 }
 
 #[cfg(unix)]
-fn interrupt_pairing(dir: &tempfile::TempDir) -> (std::process::Output, std::time::Duration) {
-    let child = Command::new(env!("CARGO_BIN_EXE_lam"))
+async fn interrupt_pairing(
+    dir: &tempfile::TempDir,
+    server: &MockServer,
+    ready_path: &str,
+) -> (std::process::Output, std::time::Duration) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lam"))
         .env("LAM_CONFIG", dir.path().join("config.toml"))
         .args(["pair"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(250));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|request| request.url.path() == ready_path)
+    {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "pairing exited before {ready_path}"
+        );
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("pairing never reached {ready_path}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     let interrupted_at = std::time::Instant::now();
     unsafe {
-        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+        assert_eq!(libc::kill(child.id() as libc::pid_t, libc::SIGINT), 0);
     }
     let out = child.wait_with_output().unwrap();
     (out, interrupted_at.elapsed())
@@ -952,6 +974,44 @@ async fn pair_repolls_pending_and_reports_expired_or_cancelled() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn pair_ctrl_c_during_creation_cancels_without_showing_a_scannable_code() {
+    let (server, dir) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/pairings"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_delay(std::time::Duration::from_millis(400))
+                .set_body_json(pairing_created(&server, "pair-creating")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/pairings/pair-creating"))
+        .and(header("authorization", "Bearer tok"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": "cancelled" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (out, _) = interrupt_pairing(&dir, &server, "/pairings").await;
+
+    assert_eq!(out.status.code(), Some(130));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Pairing cancelled."), "{stdout}");
+    assert!(!stdout.contains("Scan this code"), "{stdout}");
+    assert!(!server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|request| request.url.path().ends_with("/wait")));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn pair_ctrl_c_reports_confirmed_terminal_outcomes() {
     for (session, response, expected) in [
         (
@@ -999,7 +1059,8 @@ async fn pair_ctrl_c_reports_confirmed_terminal_outcomes() {
             .mount(&server)
             .await;
 
-        let (out, elapsed) = interrupt_pairing(&dir);
+        let (out, elapsed) =
+            interrupt_pairing(&dir, &server, &format!("/pairings/{session}/wait")).await;
 
         assert_eq!(out.status.code(), Some(130));
         assert!(elapsed < std::time::Duration::from_secs(1));
@@ -1042,7 +1103,7 @@ async fn pair_ctrl_c_reports_an_unconfirmed_cancellation_when_delete_times_out()
         .mount(&server)
         .await;
 
-    let (out, elapsed) = interrupt_pairing(&dir);
+    let (out, elapsed) = interrupt_pairing(&dir, &server, "/pairings/pair-signal/wait").await;
 
     assert_eq!(out.status.code(), Some(130));
     assert!(elapsed < std::time::Duration::from_secs(1));
@@ -1084,7 +1145,8 @@ async fn pair_ctrl_c_reports_an_unconfirmed_cancellation_when_delete_fails() {
         .mount(&server)
         .await;
 
-    let (out, elapsed) = interrupt_pairing(&dir);
+    let (out, elapsed) =
+        interrupt_pairing(&dir, &server, "/pairings/pair-failed-delete/wait").await;
 
     assert_eq!(out.status.code(), Some(130));
     assert!(elapsed < std::time::Duration::from_secs(1));
