@@ -70,6 +70,12 @@ export interface ListQuery {
   before?: string;
 }
 
+export interface DuplicateLookup {
+  kind?: ItemKind;
+  /** Compatibility-only name/title/body matching for rows created before dedupe keys existed. */
+  legacyFallback?: boolean;
+}
+
 export type HistoryType = "plain" | "choice" | "checklist";
 
 export interface HistoryQuery {
@@ -215,7 +221,7 @@ export class Items extends Effect.Service<Items>()("lam/Items", {
       }),
 
     /** An open, unexpired item with identical content — a retry of a push whose response was lost. */
-    findDuplicate: (input: NewItem, kind: ItemKind = "request") =>
+    findDuplicate: (input: NewItem, { kind = "request", legacyFallback = true }: DuplicateLookup = {}) =>
       Effect.gen(function* () {
         const now = new Date().toISOString();
         const key = yield* Effect.promise(() => dedupeKey(input, kind));
@@ -230,7 +236,7 @@ export class Items extends Effect.Service<Items>()("lam/Items", {
         );
         if (keyed) return Option.some(yield* decodeRow(keyed));
 
-        if (kind === "fyi") return Option.none<Item>();
+        if (kind === "fyi" || !legacyFallback) return Option.none<Item>();
 
         const legacy = yield* db((d) =>
           d
@@ -391,9 +397,10 @@ export class Items extends Effect.Service<Items>()("lam/Items", {
               `UPDATE items
                SET status = 'dismissed', seen_at = ?, resolved_at = ?, response_choice = NULL,
                    response_text = NULL, response_by = NULL, version = version + 1
-               WHERE id = ? AND kind = 'fyi' AND status = 'open' AND seen_at IS NULL AND version = ?`,
+               WHERE id = ? AND kind = 'fyi' AND status = 'open' AND seen_at IS NULL AND version = ?
+                 AND (expires_at IS NULL OR expires_at > ?)`,
             )
-            .bind(now, now, id, version)
+            .bind(now, now, id, version, now)
             .run(),
         );
         const updated = yield* Items.get(id);

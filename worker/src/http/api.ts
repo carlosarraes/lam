@@ -75,7 +75,7 @@ export const api = HttpRouter.empty.pipe(
         input = { ...fields, recommendation: fields.recommendation ?? null, recommended_choice: fields.recommended_choice ?? null };
       }
       const items = yield* Items;
-      const existing = yield* items.findDuplicate(input, kind);
+      const existing = yield* items.findDuplicate(input, { kind, legacyFallback: false });
       if (Option.isSome(existing)) return yield* HttpServerResponse.json(existing.value, { status: 200 });
       const item = yield* items.create(input, kind);
       const baseUrl = yield* origin;

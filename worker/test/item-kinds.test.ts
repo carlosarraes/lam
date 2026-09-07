@@ -1,6 +1,9 @@
 import type { D1Migration } from "@cloudflare/vitest-pool-workers";
 import { applyD1Migrations, env, SELF } from "cloudflare:test";
+import { Effect } from "effect";
 import { describe, expect, it } from "vitest";
+import { Env } from "../src/Env";
+import { Items } from "../src/services/Items";
 
 const AUTH = { Authorization: "Bearer test-token" };
 const typedJson = (body: unknown) => ({
@@ -43,16 +46,19 @@ async function itemToken(id: string): Promise<string> {
   return btoa(String.fromCharCode(...signature)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-async function connectEvents(): Promise<WebSocket> {
+async function registerDevice() {
   const credential = `fyi-device-${++sequence}`;
   const credentialHash = await itemToken(credential);
   await env.DB.prepare(
     `INSERT INTO devices (id, name, credential_hash, fcm_token, app_version, android_version, created_at)
      VALUES (?, ?, ?, NULL, ?, ?, ?)`,
   ).bind(`fyi-device-id-${sequence}`, "FYI test device", credentialHash, "test", "test", new Date().toISOString()).run();
-  const response = await SELF.fetch("http://lam/events", {
-    headers: { Authorization: `Bearer ${credential}`, Upgrade: "websocket" },
-  });
+  return { Authorization: `Bearer ${credential}` };
+}
+
+async function connectEvents(): Promise<WebSocket> {
+  const authorization = await registerDevice();
+  const response = await SELF.fetch("http://lam/events", { headers: { ...authorization, Upgrade: "websocket" } });
   expect(response.status).toBe(101);
   const socket = response.webSocket!;
   socket.accept();
@@ -80,6 +86,27 @@ function eventWithin(socket: WebSocket, milliseconds: number): Promise<Record<st
       resolve(null);
     }, milliseconds);
     socket.addEventListener("message", onMessage, { once: true });
+  });
+}
+
+function expireAfterFirstRead(statement: D1PreparedStatement, id: string): D1PreparedStatement {
+  return new Proxy(statement, {
+    get(target, property) {
+      if (property === "bind") {
+        return (...values: unknown[]) => expireAfterFirstRead(target.bind(...values), id);
+      }
+      if (property === "first") {
+        return async <T>() => {
+          const row = await target.first<T>();
+          await env.DB.prepare("UPDATE items SET expires_at = ? WHERE id = ?")
+            .bind("2000-01-01T00:00:00.000Z", id)
+            .run();
+          return row;
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
   });
 }
 
@@ -112,6 +139,7 @@ describe("typed item creation", () => {
 
   it.each([
     ["missing recommendation", { kind: "request", title: "Decide" }],
+    ["blank recommendation", { kind: "request", title: "Decide", recommendation: " \t\n " }],
     ["missing preferred choice", { kind: "request", title: "Decide", choices: ["a", "b"], recommendation: "Pick a." }],
     ["mismatched preferred choice", { kind: "request", title: "Decide", choices: ["a", "b"], recommendation: "Pick a.", recommended_choice: "A" }],
     ["checklist recommendation", { kind: "request", title: "Run checks", checks: ["tests"], recommendation: "Run tests." }],
@@ -165,6 +193,42 @@ describe("typed item creation", () => {
     const stored = await env.DB.prepare("SELECT kind, priority, seen_at FROM items WHERE id = ?").bind(item.id).first();
     expect(stored).toEqual({ kind: "request", priority: "low", seen_at: null });
   });
+
+  it("does not return a weak pre-dedupe match for typed request identity", async () => {
+    const name = `typed-dedupe-${++sequence}`;
+    const title = `Canonical request #${sequence}`;
+    await env.DB.prepare(
+      `INSERT INTO items
+        (id, kind, name, title, body, source_host, source_project, priority, choices, checks, link, status,
+         response_choice, response_text, response_by, created_at, resolved_at, seen_at, expires_at,
+         recommendation, recommended_choice, version, dedupe_key)
+       VALUES (?, 'request', ?, ?, ?, '', '', 'low', '[]', '[]', '', 'open',
+         NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL, NULL, 0, NULL)`,
+    ).bind("weak-legacy-match", name, title, "same body", "2026-01-01T00:00:00.000Z").run();
+
+    const response = await SELF.fetch("http://lam/v2/items", typedJson({
+      kind: "request",
+      name,
+      title,
+      body: "same body",
+      priority: "critical",
+      choices: ["ship", "hold"],
+      recommendation: "Ship after validation.",
+      recommended_choice: "ship",
+    }));
+
+    expect(response.status).toBe(201);
+    const created = await response.json<any>();
+    expect(created).toMatchObject({
+      kind: "request",
+      priority: "critical",
+      choices: ["ship", "hold"],
+      recommendation: "Ship after validation.",
+      recommended_choice: "ship",
+    });
+    expect(created.id).not.toBe("weak-legacy-match");
+    expect((await env.DB.prepare("SELECT COUNT(*) AS count FROM items WHERE name = ?").bind(name).first<{ count: number }>())?.count).toBe(2);
+  });
 });
 
 describe("FYI lifecycle", () => {
@@ -210,6 +274,42 @@ describe("FYI lifecycle", () => {
     expect(stored).toEqual({ status: "open", version: 0, seen_at: null, resolved_at: null });
   });
 
+  it("rejects seen when the FYI expires after its read but before its write", async () => {
+    const fyi = await createFyi({ ttl: 60 });
+    const delayedDb = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "prepare") {
+          return (query: string) => {
+            const statement = target.prepare(query);
+            return query === "SELECT * FROM items WHERE id = ?"
+              ? expireAfterFirstRead(statement, fyi.id)
+              : statement;
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+
+    const result = await Effect.runPromise(
+      Effect.flatMap(Items, (items) => items.seen(fyi.id, 0)).pipe(
+        Effect.provide(Items.Default),
+        Effect.provideService(Env, {
+          ...env,
+          DB: delayedDb,
+          LAM_TOKEN: "test-token",
+          LAM_HMAC_SECRET: "test-secret",
+          NTFY_TOPIC: "test-topic",
+        }),
+        Effect.either,
+      ),
+    );
+
+    expect(result).toMatchObject({ _tag: "Left", left: { _tag: "Conflict", id: fyi.id } });
+    const stored = await env.DB.prepare("SELECT status, version, seen_at, resolved_at FROM items WHERE id = ?").bind(fyi.id).first();
+    expect(stored).toEqual({ status: "open", version: 0, seen_at: null, resolved_at: null });
+  });
+
   it("returns the first seen result idempotently without another version bump", async () => {
     const fyi = await createFyi();
     const first = await SELF.fetch(`http://lam/v2/items/${fyi.id}/seen`, typedJson({ version: fyi.version }));
@@ -232,6 +332,25 @@ describe("FYI lifecycle", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ version: 0 }),
     })).status).toBe(401);
+  });
+
+  it("rejects typed creation from a paired device but permits it to mark an FYI seen", async () => {
+    const deviceAuth = await registerDevice();
+    const creation = await SELF.fetch("http://lam/v2/items", {
+      method: "POST",
+      headers: { ...deviceAuth, "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "fyi", title: "Device cannot create" }),
+    });
+    expect(creation.status).toBe(403);
+
+    const fyi = await createFyi();
+    const seen = await SELF.fetch(`http://lam/v2/items/${fyi.id}/seen`, {
+      method: "POST",
+      headers: { ...deviceAuth, "Content-Type": "application/json" },
+      body: JSON.stringify({ version: 0 }),
+    });
+    expect(seen.status).toBe(200);
+    expect(await seen.json()).toMatchObject({ id: fyi.id, kind: "fyi", status: "dismissed", version: 1 });
   });
 
   it("keeps explicitly dismissed and expired FYIs unseen and at their prior version", async () => {
