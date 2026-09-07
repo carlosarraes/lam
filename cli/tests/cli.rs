@@ -91,6 +91,240 @@ fn lam(dir: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+fn fyi(id: &str) -> serde_json::Value {
+    let mut value = item(id, "open", None);
+    value["kind"] = "fyi".into();
+    value["seen_at"] = serde_json::Value::Null;
+    value
+}
+
+#[tokio::test]
+async fn fyi_push_omits_decision_fields_and_never_waits() {
+    let (server, dir) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/items"))
+        .and(header("authorization", "Bearer tok"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(fyi("news1")))
+        .mount(&server)
+        .await;
+    for priority in ["low", "normal", "critical"] {
+        let out = lam(
+            &dir,
+            &[
+                "push",
+                "Release published",
+                "--kind",
+                "fyi",
+                "--priority",
+                priority,
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "news1");
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    for (request, priority) in requests.iter().zip(["low", "normal", "critical"]) {
+        assert_eq!(request.url.path(), "/v2/items");
+        let body: serde_json::Value = request.body_json().unwrap();
+        assert_eq!(body["kind"], "fyi");
+        assert_eq!(body["priority"], priority);
+        for field in ["choices", "checks", "recommendation", "recommended_choice"] {
+            assert!(body.get(field).is_none(), "FYI sent {field}: {body}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn fyi_rejects_wait_and_decision_flags_before_http() {
+    let (server, dir) = setup().await;
+    for fields in [
+        vec!["--wait"],
+        vec!["--choice", "yes"],
+        vec!["--check", "publish"],
+        vec!["--recommendation", "No action needed"],
+        vec!["--recommended-choice", "yes"],
+    ] {
+        let args: Vec<_> = [vec!["push", "News", "--kind", "fyi"], fields].concat();
+        let out = lam(&dir, &args);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("FYI"));
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn fyi_push_reports_upgrade_without_legacy_fallback() {
+    let (server, dir) = setup().await;
+    let out = lam(&dir, &["push", "News", "--kind", "fyi"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("upgrade"));
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.path(), "/v2/items");
+}
+
+#[tokio::test]
+async fn fyi_explicit_wait_rejects_before_polling() {
+    let (server, dir) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/items/news1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fyi("news1")))
+        .mount(&server)
+        .await;
+    for ids in [vec!["news1"], vec!["abc12", "news1"]] {
+        let args = [vec!["wait"], ids, vec!["--timeout", "0s"]].concat();
+        let out = lam(&dir, &args);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("FYI"));
+    }
+    assert!(server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| !r.url.path().ends_with("/wait")));
+}
+
+#[tokio::test]
+async fn fyi_wait_any_excludes_informational_items() {
+    let (server, dir) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(vec![fyi("news1"), item("abc12", "open", None)]),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/items/abc12/wait"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(item("abc12", "resolved", None)))
+        .mount(&server)
+        .await;
+    let out = lam(&dir, &["wait", "--any", "--timeout", "0s"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| !r.url.as_str().contains("news1")));
+}
+
+#[tokio::test]
+async fn fyi_only_wait_any_stops_without_polling() {
+    let (server, dir) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vec![fyi("news1")]))
+        .mount(&server)
+        .await;
+    let out = lam(&dir, &["wait", "--any", "--timeout", "0s"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no open"));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn typed_request_warning_alias_and_low_rejection() {
+    let (server, dir) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/items"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(item("abc12", "open", None)))
+        .mount(&server)
+        .await;
+    for priority in ["warning", "normal"] {
+        let out = lam(
+            &dir,
+            &[
+                "push",
+                "Approve",
+                "--recommendation",
+                "Ship it",
+                "--priority",
+                priority,
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let out = lam(
+        &dir,
+        &[
+            "push",
+            "Approve",
+            "--recommendation",
+            "Ship it",
+            "--priority",
+            "low",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        let body: serde_json::Value = request.body_json().unwrap();
+        assert_eq!(body["kind"], "request");
+        assert_eq!(body["priority"], "normal");
+    }
+}
+
+#[tokio::test]
+async fn fyi_show_is_read_only_and_list_distinguishes_legacy_requests() {
+    let (server, dir) = setup().await;
+    let mut seen = fyi("news1");
+    seen["status"] = "dismissed".into();
+    seen["seen_at"] = "2026-09-07T12:00:00Z".into();
+    let mut legacy = pre_milestone_item("old01");
+    legacy["priority"] = "low".into();
+    Mock::given(method("GET"))
+        .and(path("/items/news1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&seen))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vec![seen.clone(), legacy]))
+        .mount(&server)
+        .await;
+    let out = lam(&dir, &["show", "news1"]);
+    assert!(out.status.success());
+    let shown: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(shown["kind"], "fyi");
+    assert_eq!(shown["seen_at"], "2026-09-07T12:00:00Z");
+    let out = lam(&dir, &["list", "--all", "--json"]);
+    assert!(out.status.success());
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(rows[1]["kind"], "request");
+    assert!(rows[1]["seen_at"].is_null());
+    let out = lam(&dir, &["list", "--all"]);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("FYI"));
+    assert!(text.contains("Seen"));
+    assert!(text.contains("Low"));
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests.iter().all(|r| r.method == "GET"));
+}
+
 fn pairing_created(server: &MockServer, session: &str) -> serde_json::Value {
     serde_json::json!({
         "session": session,
@@ -174,7 +408,7 @@ async fn interrupt_pairing(
 async fn push_accepts_an_exact_recommended_choice_and_sends_it() {
     let (server, dir) = setup().await;
     Mock::given(method("POST"))
-        .and(path("/items"))
+        .and(path("/v2/items"))
         .and(header("authorization", "Bearer tok"))
         .respond_with(ResponseTemplate::new(201).set_body_json(item("abc12", "open", None)))
         .expect(1)
@@ -308,7 +542,7 @@ async fn push_rejects_a_recommended_choice_outside_the_choices_before_loading_co
 async fn push_accepts_a_checklist_without_recommendation_fields() {
     let (server, dir) = setup().await;
     Mock::given(method("POST"))
-        .and(path("/items"))
+        .and(path("/v2/items"))
         .respond_with(ResponseTemplate::new(201).set_body_json(item("abc12", "open", None)))
         .expect(1)
         .mount(&server)
@@ -842,7 +1076,7 @@ async fn push_without_any_name_source_fails_with_guidance() {
 async fn explicit_name_flag_wins_over_env() {
     let (server, dir) = setup().await;
     Mock::given(method("POST"))
-        .and(path("/items"))
+        .and(path("/v2/items"))
         .respond_with(ResponseTemplate::new(201).set_body_json(item("abc12", "open", None)))
         .expect(1)
         .mount(&server)

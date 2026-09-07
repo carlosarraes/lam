@@ -45,7 +45,7 @@ impl App {
     fn reader_document(item: &Item) -> Text<'static> {
         let mut doc = adopt_palette(tui_markdown::from_str(&format!("# {}\n\n", item.title)));
         doc.lines.push(Line::raw(""));
-        if item.checks.is_empty() {
+        if item.has_recommendation_section() {
             if let Some(recommendation) = &item.recommendation {
                 doc.lines
                     .extend(adopt_palette(tui_markdown::from_str("## Recommendation\n\n")).lines);
@@ -147,7 +147,18 @@ impl App {
             (l, d)
         };
         // Counts the queue, not what is on screen: `0 open` while browsing history would lie.
-        let open = self.visible_of(Tab::Requests).len();
+        let requests = self
+            .requests
+            .items
+            .iter()
+            .filter(|item| item.is_actionable())
+            .count();
+        let fyis = self
+            .requests
+            .items
+            .iter()
+            .filter(|item| item.is_fyi() && item.status == "open")
+            .count();
         let live = self.status == "live";
         let tabs = self.tab_spans(header.width);
         let tabs_w: u16 = tabs.iter().map(|s| s.width() as u16).sum();
@@ -161,7 +172,7 @@ impl App {
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("lam", BOLD),
-                Span::styled(format!("  {open} open"), META),
+                Span::styled(format!("  {requests} requests · {fyis} FYI"), META),
                 Span::styled(if self.busy { "  working…" } else { "" }, ACCENT),
                 Span::styled(
                     if self.filter.is_empty() {
@@ -218,11 +229,23 @@ impl App {
                 // Once an item is closed, when it closed is the fact you want, not when it was
                 // raised — "created 90d ago" says nothing in a history view.
                 let (when, stamp) = match i.resolved_at.as_deref() {
-                    Some(at) if i.status != "open" => ("closed", age(at)),
+                    Some(at) if i.status != "open" => (
+                        if i.status_label() == "Seen" {
+                            "Seen"
+                        } else {
+                            "closed"
+                        },
+                        age(at),
+                    ),
                     _ => ("raised", age(&i.created_at)),
                 };
                 let mut lines = vec![Line::from(Span::styled(
-                    format!("{} · {} · {when} {stamp} ago", source(i), i.priority),
+                    format!(
+                        "{} · {}{} · {when} {stamp} ago",
+                        source(i),
+                        if i.is_fyi() { "FYI · " } else { "" },
+                        i.priority_label()
+                    ),
                     META,
                 ))];
                 // Keep the canonical answer visible in history's fixed-height detail pane.
@@ -236,7 +259,7 @@ impl App {
                         outcome(i).1,
                     )));
                 }
-                if i.checks.is_empty() {
+                if i.has_recommendation_section() {
                     if let Some(recommendation) = &i.recommendation {
                         lines.push(Line::from(Span::styled("Recommendation", BOLD)));
                         if let Some(choice) = &i.recommended_choice {
@@ -318,7 +341,15 @@ impl App {
                 ]),
                 Line::from([key("Enter", "send"), key("Esc", "cancel")].concat()),
             ],
-            (_, Some(i)) if i.status == "open" => {
+            (_, Some(i)) if i.is_fyi() && i.status == "open" => {
+                let mut spans = key("Enter", "read");
+                if !i.link.is_empty() {
+                    spans.extend(key("o", "open"));
+                }
+                spans.extend(key("d", "dismiss"));
+                vec![Line::from(spans), self.nav_line()]
+            }
+            (_, Some(i)) if i.is_actionable() => {
                 let mut spans: Vec<Span> = i
                     .choices
                     .iter()
@@ -439,6 +470,9 @@ fn ellipsis(s: &str, max: usize) -> String {
 
 /// What became of it: the answer given, otherwise the outcome itself.
 pub(super) fn outcome(i: &Item) -> (&'static str, Style, String) {
+    if i.status_label() == "Seen" {
+        return ("✓", META, "Seen".into());
+    }
     let answer = i
         .response_choice
         .as_deref()
@@ -527,7 +561,9 @@ fn row(i: &Item, tab: Tab, width: u16) -> Line<'_> {
         (false, _) => RULE,
     };
     let text = if open { Style::default() } else { DIM };
-    let signal = if i.checks.is_empty() {
+    let signal = if i.is_fyi() {
+        "FYI".into()
+    } else if i.has_recommendation_section() {
         if open && i.recommendation.is_none() {
             "! recommendation missing".into()
         } else {
@@ -616,6 +652,55 @@ mod tests {
         i.recommendation = Some("Tests passed. Ship this version.".into());
         i.recommended_choice = Some("ship".into());
         i
+    }
+
+    #[test]
+    fn fyi_renders_information_without_recommendation_or_answer_controls() {
+        let mut a = App::new("host".into());
+        a.set_items(vec![super::super::tests::fyi()]);
+        let text = screen_text(&render(&a, 120, 24));
+        assert!(text.contains("FYI"), "{text}");
+        assert!(!text.contains("recommendation missing"), "{text}");
+        assert!(!text.contains("Recommendation"), "{text}");
+        assert!(!text.contains("reply"), "{text}");
+        assert!(!text.contains("done"), "{text}");
+        assert!(text.contains("dismiss"), "{text}");
+        assert!(text.contains("0 requests"), "{text}");
+        assert!(text.contains("1 FYI"), "{text}");
+        a.handle(super::super::tests::key('m'));
+        a.set_items(vec![]);
+        let text = screen_text(&render(&a, 120, 24));
+        assert!(
+            text.contains("The deployment completed successfully."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn fyi_history_says_seen_only_with_seen_timestamp() {
+        let mut i = super::super::tests::fyi();
+        i.status = "dismissed".into();
+        assert_eq!(outcome(&i).2, "dismissed");
+        i.seen_at = Some("2026-09-07T12:00:00Z".into());
+        assert_eq!(outcome(&i).2, "Seen");
+        assert!(row_text(&i, Tab::History, 120).contains("Seen"));
+    }
+
+    #[test]
+    fn request_priority_displays_warning_and_preserves_legacy_low() {
+        let mut a = App::new("host".into());
+        for (priority, label) in [
+            ("normal", "Warning"),
+            ("critical", "Critical"),
+            ("low", "Low"),
+        ] {
+            let mut i = item("req01", "open", &[], "");
+            i.priority = priority.into();
+            a.set_items(vec![i]);
+            let text = screen_text(&render(&a, 120, 24));
+            assert!(text.contains(label), "{text}");
+            assert!(text.contains("recommendation missing"), "{text}");
+        }
     }
 
     #[test]
@@ -1023,12 +1108,16 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let head: String = (0..71).map(|x| buf[(x, 0)].symbol()).collect();
 
-        assert!(head.starts_with("lam  1 open"), "{head:?}");
+        assert!(head.starts_with("lam  1 requests · 0 FYI"), "{head:?}");
         assert!(
             head.trim_end().ends_with("archlinux  ● connecting"),
             "{head:?}"
         );
         // 71 columns less the 19-column bar leaves 26 on each side
-        assert_eq!(&head[26..45], "[requests]  history", "{head:?}");
+        assert_eq!(
+            head.chars().skip(26).take(19).collect::<String>(),
+            "[requests]  history",
+            "{head:?}"
+        );
     }
 }

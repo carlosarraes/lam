@@ -8,6 +8,14 @@ use crate::config::Config;
 
 const PAIRING_CANCEL_TIMEOUT: Duration = Duration::from_millis(500);
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ItemKind {
+    #[default]
+    Request,
+    Fyi,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Check {
     pub label: String,
@@ -18,6 +26,10 @@ pub struct Check {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Item {
     pub id: String,
+    #[serde(default)]
+    pub kind: ItemKind,
+    #[serde(default)]
+    pub seen_at: Option<String>,
     #[serde(default)]
     pub name: String,
     pub title: String,
@@ -47,6 +59,36 @@ pub struct Item {
 }
 
 impl Item {
+    pub fn is_fyi(&self) -> bool {
+        self.kind == ItemKind::Fyi
+    }
+
+    pub fn is_actionable(&self) -> bool {
+        !self.is_fyi() && self.status == "open"
+    }
+
+    pub fn has_recommendation_section(&self) -> bool {
+        !self.is_fyi() && self.checks.is_empty()
+    }
+
+    pub fn priority_label(&self) -> &str {
+        match self.priority.as_str() {
+            "normal" if !self.is_fyi() => "Warning",
+            "normal" => "Normal",
+            "critical" => "Critical",
+            "low" => "Low",
+            other => other,
+        }
+    }
+
+    pub fn status_label(&self) -> &str {
+        if self.is_fyi() && self.seen_at.is_some() {
+            "Seen"
+        } else {
+            &self.status
+        }
+    }
+
     pub fn checks_done(&self) -> usize {
         self.checks.iter().filter(|c| c.done).count()
     }
@@ -54,13 +96,16 @@ impl Item {
 
 #[derive(Debug, Serialize)]
 pub struct NewItem {
+    pub kind: ItemKind,
     pub name: String,
     pub title: String,
     pub body: String,
     pub source_host: String,
     pub source_project: String,
     pub priority: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub choices: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recommendation: Option<String>,
@@ -169,7 +214,11 @@ impl Client {
     }
 
     pub fn push(&self, item: &NewItem) -> Result<Item> {
-        Ok(Self::ok(self.post("/items").json(item).send()?)?.json()?)
+        let response = self.post("/v2/items").json(item).send()?;
+        if response.status() == StatusCode::NOT_FOUND {
+            bail!("server upgrade required: typed creation needs POST /v2/items");
+        }
+        Ok(Self::ok(response)?.json()?)
     }
 
     pub fn list(&self, status: Option<&str>) -> Result<Vec<Item>> {
@@ -194,6 +243,15 @@ impl Client {
 
     pub fn show(&self, id: &str) -> Result<Item> {
         Ok(Self::ok(self.get(&format!("/items/{id}")).send()?)?.json()?)
+    }
+
+    pub fn mark_seen(&self, id: &str, version: u64) -> Result<Item> {
+        Ok(Self::ok(
+            self.post(&format!("/v2/items/{id}/seen"))
+                .json(&serde_json::json!({ "version": version }))
+                .send()?,
+        )?
+        .json()?)
     }
 
     /// One long-poll round trip; returns Closed when the item closed or, with `since`, when its version moved past it.

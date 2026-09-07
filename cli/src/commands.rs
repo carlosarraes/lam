@@ -6,7 +6,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use crate::client::{Client, DeviceSummary, Item, NewItem, PairingWait, Resolution, Wait};
+use crate::client::{
+    Client, DeviceSummary, Item, ItemKind, NewItem, PairingWait, Resolution, Wait,
+};
 use crate::config::Config;
 
 pub const EXIT_RESOLVED: i32 = 0;
@@ -38,6 +40,7 @@ pub fn init(server: String, token: String, topic: String) -> Result<i32> {
 
 pub struct PushArgs {
     pub title: String,
+    pub kind: ItemKind,
     pub name: Option<String>,
     pub body: String,
     pub priority: String,
@@ -66,7 +69,24 @@ fn validate_max_characters(flag: &str, value: &str, max: usize) -> Result<()> {
     Ok(())
 }
 
-fn validate_push(a: &PushArgs) -> Result<()> {
+fn validate_fyi_fields(a: &PushArgs) -> Result<()> {
+    if a.wait {
+        bail!("FYIs cannot wait for a decision");
+    }
+    if !a.choices.is_empty()
+        || !a.checks.is_empty()
+        || a.recommendation.is_some()
+        || a.recommended_choice.is_some()
+    {
+        bail!("FYIs cannot have choices, checks, recommendations, or recommended choices");
+    }
+    Ok(())
+}
+
+fn validate_request_fields(a: &PushArgs) -> Result<()> {
+    if a.priority == "low" {
+        bail!("requests require --priority warning, normal, or critical");
+    }
     if a.choices.len() > MAX_CHOICES {
         bail!("at most {MAX_CHOICES} choices");
     }
@@ -103,6 +123,14 @@ fn validate_push(a: &PushArgs) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn validate_push(a: &PushArgs) -> Result<()> {
+    match a.kind {
+        ItemKind::Fyi => validate_fyi_fields(a)?,
+        ItemKind::Request => validate_request_fields(a)?,
+    }
     validate_max_characters("--title", &a.title, MAX_TITLE_CHARACTERS)?;
     if a.body.len() > MAX_BODY_BYTES {
         bail!("--body must be at most {MAX_BODY_BYTES} UTF-8 bytes");
@@ -138,12 +166,17 @@ pub fn push(a: PushArgs) -> Result<i32> {
         .transpose()?
         .map(|d| d.as_secs());
     let item = client()?.push(&NewItem {
+        kind: a.kind,
         name,
         title: a.title,
         body: a.body,
         source_host: hostname::get()?.to_string_lossy().into_owned(),
         source_project: project_name(),
-        priority: a.priority,
+        priority: if a.priority == "warning" {
+            "normal".into()
+        } else {
+            a.priority
+        },
         choices: a.choices,
         checks: a.checks,
         recommendation: a.recommendation,
@@ -197,7 +230,7 @@ fn exit_for(item: &Item) -> i32 {
 fn my_open_ids(c: &Client, name: &str) -> Result<Vec<String>> {
     Ok(c.list(Some("open"))?
         .into_iter()
-        .filter(|i| i.name == name)
+        .filter(|i| i.name == name && i.is_actionable())
         .map(|i| i.id)
         .collect())
 }
@@ -216,7 +249,13 @@ pub fn wait(ids: &[String], any: bool, name: Option<String>, timeout: &str) -> R
     // Snapshot versions first so a check ticked from now on counts as a change.
     let since: Vec<u64> = ids
         .iter()
-        .map(|id| c.show(id).map(|i| i.version))
+        .map(|id| {
+            let item = c.show(id)?;
+            if item.is_fyi() {
+                bail!("FYIs cannot wait for a decision: {id}");
+            }
+            Ok(item.version)
+        })
         .collect::<Result<_>>()?;
     loop {
         let round = if ids.len() == 1 {
@@ -256,7 +295,11 @@ pub fn list(all: bool, json: bool) -> Result<i32> {
         } else {
             format!(" [{}/{}]", i.checks_done(), i.checks.len())
         };
-        let title = format!("{}{progress}", i.title);
+        let title = format!(
+            "{}{}{progress}",
+            if i.is_fyi() { "FYI · " } else { "" },
+            i.title
+        );
         let answer = i
             .response_choice
             .as_deref()
@@ -265,8 +308,8 @@ pub fn list(all: bool, json: bool) -> Result<i32> {
         println!(
             "{:<6} {:<9} {:<8} {:<24} {}{}",
             i.id,
-            i.status,
-            i.priority,
+            i.status_label(),
+            i.priority_label(),
             src,
             title,
             if answer.is_empty() {

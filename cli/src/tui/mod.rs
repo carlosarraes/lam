@@ -33,6 +33,10 @@ pub enum Action {
         text: Option<String>,
     },
     Dismiss(String),
+    Seen {
+        id: String,
+        version: u64,
+    },
     OpenLink(String),
     SetCheck {
         id: String,
@@ -91,6 +95,9 @@ pub struct App {
     busy: bool,
     /// Side-by-side markdown reader for long bodies (`m`).
     reader: bool,
+    /// An explicitly opened FYI stays readable after it leaves the queue.
+    reader_item: Option<Item>,
+    seen_error: Option<String>,
     scroll: u16,
     /// Rendered length of the reader document, recorded while drawing so scrolling can clamp.
     doc_lines: Cell<u16>,
@@ -114,6 +121,8 @@ impl App {
             focus: Focus::List,
             busy: false,
             reader: false,
+            reader_item: None,
+            seen_error: None,
             scroll: 0,
             doc_lines: Cell::new(0),
             mode: Mode::Normal,
@@ -215,7 +224,7 @@ impl App {
             Tab::History => &mut self.history,
         };
         pane.selected = pane.selected.min(n.saturating_sub(1));
-        if self.tab == tab {
+        if self.tab == tab && self.reader_item.is_none() {
             self.check_sel = 0;
             self.scroll = 0;
             self.focus = Focus::List;
@@ -246,7 +255,8 @@ impl App {
     }
 
     fn has_checks(&self) -> bool {
-        self.open_current().is_some_and(|i| !i.checks.is_empty())
+        self.actionable_current()
+            .is_some_and(|i| !i.checks.is_empty())
     }
 
     fn nav_hint(&self) -> &'static str {
@@ -292,7 +302,53 @@ impl App {
     }
 
     fn current(&self) -> Option<&Item> {
-        self.visible().get(self.pane().selected).copied()
+        self.reader_item
+            .as_ref()
+            .or_else(|| self.visible().get(self.pane().selected).copied())
+    }
+
+    fn leave_fyi_reader(&mut self) {
+        if self.reader_item.take().is_some() {
+            self.reader = false;
+        }
+    }
+
+    fn open_reader(&mut self) -> Option<Action> {
+        let item = self.current()?.clone();
+        self.reader = true;
+        self.scroll = 0;
+        if !item.is_fyi() {
+            return None;
+        }
+        let action = (item.status == "open").then(|| Action::Seen {
+            id: item.id.clone(),
+            version: item.version,
+        });
+        self.reader_item = Some(item);
+        self.seen_error = None;
+        action
+    }
+
+    fn seen_result(&mut self, item: Option<Item>, error: Option<String>) {
+        if let Some(item) = item {
+            if self
+                .reader_item
+                .as_ref()
+                .is_some_and(|reader| reader.id == item.id)
+            {
+                self.reader_item = Some(item.clone());
+            }
+            if let Some(row) = self.requests.items.iter_mut().find(|row| row.id == item.id) {
+                *row = item.clone();
+            }
+            if item.status != "open" {
+                self.requests.items.retain(|row| row.id != item.id);
+                self.clamp_of(Tab::Requests);
+            }
+        }
+        self.set_busy(false);
+        self.seen_error = error;
+        self.status = self.seen_error.clone().unwrap_or_else(|| "live".into());
     }
 
     /// Switching keeps each tab's cursor. The reader, check cursor and focus follow the newly
@@ -301,6 +357,7 @@ impl App {
         if self.tab == tab {
             return None;
         }
+        self.leave_fyi_reader();
         self.tab = tab;
         self.check_sel = 0;
         self.scroll = 0;
@@ -393,6 +450,7 @@ impl App {
                 None
             }
             KeyCode::Char('j') | KeyCode::Down => {
+                self.leave_fyi_reader();
                 if self.pane().selected + 1 < self.visible().len() {
                     self.pane_mut().selected += 1;
                     self.check_sel = 0;
@@ -401,6 +459,7 @@ impl App {
                 self.load_more()
             }
             KeyCode::Char('k') | KeyCode::Up => {
+                self.leave_fyi_reader();
                 let up = self.pane().selected.saturating_sub(1);
                 self.pane_mut().selected = up;
                 self.check_sel = 0;
@@ -437,9 +496,14 @@ impl App {
             KeyCode::Char('h') => self.set_tab(Tab::Requests),
             KeyCode::Char('l') => self.set_tab(Tab::History),
             KeyCode::Char('m') => {
-                self.reader = !self.reader;
-                self.scroll = 0;
-                None
+                if self.reader {
+                    self.reader = false;
+                    self.reader_item = None;
+                    self.scroll = 0;
+                    None
+                } else {
+                    self.open_reader()
+                }
             }
             KeyCode::Char('J') | KeyCode::PageDown => {
                 self.scroll_by(if key.code == KeyCode::PageDown { 10 } else { 1 });
@@ -458,6 +522,7 @@ impl App {
                 None
             }
             KeyCode::Char('/') => {
+                self.leave_fyi_reader();
                 self.mode = Mode::Filter;
                 None
             }
@@ -473,13 +538,20 @@ impl App {
                 .filter(|i| !i.link.is_empty())
                 .map(|i| Action::OpenLink(i.link.clone())),
             KeyCode::Char('r') => {
-                if self.open_current().is_some() {
+                if self.actionable_current().is_some() {
                     self.mode = Mode::Reply(String::new());
                 }
                 None
             }
+            KeyCode::Enter if self.current().is_some_and(Item::is_fyi) => {
+                if self.reader_item.is_some() {
+                    None
+                } else {
+                    self.open_reader()
+                }
+            }
             KeyCode::Enter => self
-                .open_current()
+                .actionable_current()
                 .filter(|i| i.choices.is_empty() && i.checks.is_empty())
                 .map(|i| Action::Resolve {
                     id: i.id.clone(),
@@ -487,7 +559,7 @@ impl App {
                     text: None,
                 }),
             KeyCode::Char(c @ '1'..='3') => {
-                let item = self.open_current()?;
+                let item = self.actionable_current()?;
                 let choice = item.choices.get(c as usize - '1' as usize)?.clone();
                 Some(Action::Resolve {
                     id: item.id.clone(),
@@ -501,6 +573,10 @@ impl App {
 
     fn open_current(&self) -> Option<&Item> {
         self.current().filter(|i| i.status == "open")
+    }
+
+    fn actionable_current(&self) -> Option<&Item> {
+        self.current().filter(|i| i.is_actionable())
     }
 }
 
@@ -518,6 +594,10 @@ enum Job {
         text: Option<String>,
     },
     Dismiss(String),
+    Seen {
+        id: String,
+        version: u64,
+    },
     SetCheck {
         id: String,
         index: usize,
@@ -527,6 +607,10 @@ enum Job {
 
 enum Msg {
     Items(Vec<Item>),
+    Seen {
+        item: Option<Box<Item>>,
+        error: Option<String>,
+    },
     /// A page of items newest-first; `end` when the server returned fewer rows than we asked for.
     History {
         items: Vec<Item>,
@@ -541,6 +625,17 @@ enum Msg {
         critical: bool,
     },
     Status(String),
+}
+
+fn mark_seen(client: &Client, id: &str, version: u64, tx: &mpsc::Sender<Msg>) {
+    let (item, error) = match client.mark_seen(id, version) {
+        Ok(item) => (Some(item), None),
+        Err(error) => (client.show(id).ok(), Some(format!("seen failed: {error}"))),
+    };
+    let _ = tx.send(Msg::Seen {
+        item: item.map(Box::new),
+        error,
+    });
 }
 
 pub fn run(silent: bool) -> Result<i32> {
@@ -572,6 +667,10 @@ pub fn run(silent: bool) -> Result<i32> {
                     .resolve(&id, &Resolution { choice, text })
                     .map(|_| ()),
                 Job::Dismiss(id) => client.dismiss(&id).map(|_| ()),
+                Job::Seen { id, version } => {
+                    mark_seen(&client, &id, version, &net_tx);
+                    Ok(())
+                }
                 Job::SetCheck { id, index, done } => client.set_check(&id, index, done).map(|_| ()),
                 Job::History { .. } => unreachable!("handled above"),
             };
@@ -651,8 +750,9 @@ fn event_loop(
                 Msg::Items(items) => {
                     app.set_items(items);
                     app.set_busy(false);
-                    app.set_status("live");
+                    app.set_status(app.seen_error.clone().unwrap_or_else(|| "live".into()));
                 }
+                Msg::Seen { item, error } => app.seen_result(item.map(|item| *item), error),
                 Msg::History { items, end } => {
                     app.add_history(items, end);
                     app.set_busy(false);
@@ -704,6 +804,7 @@ fn event_loop(
             Action::LoadHistory { before } => Job::History { before },
             Action::Resolve { id, choice, text } => Job::Resolve { id, choice, text },
             Action::Dismiss(id) => Job::Dismiss(id),
+            Action::Seen { id, version } => Job::Seen { id, version },
             Action::SetCheck { id, index, done } => Job::SetCheck { id, index, done },
             Action::OpenLink(url) => {
                 if let Err(e) = open_link(&url) {
@@ -746,6 +847,8 @@ mod tests {
     pub(super) fn item(id: &str, status: &str, choices: &[&str], link: &str) -> Item {
         Item {
             id: id.into(),
+            kind: crate::client::ItemKind::Request,
+            seen_at: None,
             name: "0:lam".into(),
             title: "t".into(),
             body: String::new(),
@@ -780,6 +883,164 @@ mod tests {
             item("ccc", "open", &[], ""),
         ]);
         a
+    }
+
+    pub(super) fn fyi() -> Item {
+        let mut i = item("news1", "open", &[], "");
+        i.kind = crate::client::ItemKind::Fyi;
+        i.title = "Release published".into();
+        i.body = "The deployment completed successfully.".into();
+        i.version = 7;
+        i
+    }
+
+    #[test]
+    fn fyi_selection_is_inert_and_explicit_reader_open_marks_seen() {
+        for open in [key('m'), KeyEvent::from(KeyCode::Enter)] {
+            let mut a = App::new("host".into());
+            a.set_items(vec![item("first", "open", &[], ""), fyi()]);
+            assert_eq!(a.handle(key('j')), None);
+            for c in ['1', '2', '3', 'r', ' '] {
+                assert_eq!(a.handle(key(c)), None);
+                assert_eq!(a.mode, Mode::Normal);
+            }
+            assert_eq!(a.handle(key('d')), Some(Action::Dismiss("news1".into())));
+            assert_eq!(
+                a.handle(open),
+                Some(Action::Seen {
+                    id: "news1".into(),
+                    version: 7
+                })
+            );
+            assert!(a.reader);
+            assert_eq!(
+                a.current().unwrap().body,
+                "The deployment completed successfully."
+            );
+        }
+    }
+
+    #[test]
+    fn fyi_reader_survives_queue_removal_until_closed() {
+        let mut a = App::new("host".into());
+        a.set_items(vec![fyi(), item("next1", "open", &[], "")]);
+        a.handle(key('m'));
+        a.doc_lines.set(40);
+        a.handle(key('J'));
+        a.set_items(vec![item("next1", "open", &[], "")]);
+        assert!(a.reader);
+        assert_eq!(a.current().unwrap().id, "news1");
+        assert_eq!(a.scroll, 1);
+        a.handle(key('m'));
+        assert!(!a.reader);
+        assert_eq!(a.current().unwrap().id, "next1");
+    }
+
+    #[test]
+    fn fyi_seen_failure_keeps_item_open_and_reader_available() {
+        let mut a = App::new("host".into());
+        a.set_items(vec![fyi()]);
+        a.handle(key('m'));
+        a.seen_result(None, Some("seen failed: conflict".into()));
+        a.set_items(vec![fyi()]);
+        assert_eq!(a.requests.items[0].status, "open");
+        assert!(a.requests.items[0].seen_at.is_none());
+        assert!(a.reader);
+        assert_eq!(a.current().unwrap().id, "news1");
+        a.handle(key('m'));
+        assert_eq!(
+            a.handle(key('m')),
+            Some(Action::Seen {
+                id: "news1".into(),
+                version: 7
+            })
+        );
+    }
+
+    #[test]
+    fn fyi_enter_opens_after_navigating_from_a_request_reader() {
+        let mut a = App::new("host".into());
+        a.set_items(vec![item("req01", "open", &[], ""), fyi()]);
+        a.handle(key('m'));
+        assert_eq!(a.handle(key('j')), None);
+        assert_eq!(
+            a.handle(KeyEvent::from(KeyCode::Enter)),
+            Some(Action::Seen {
+                id: "news1".into(),
+                version: 7
+            })
+        );
+        assert_eq!(
+            a.handle(KeyEvent::from(KeyCode::Enter)),
+            None,
+            "already opened"
+        );
+    }
+
+    #[tokio::test]
+    async fn fyi_seen_job_uses_canonical_response_and_refreshes_conflicts() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for conflict in [false, true] {
+            let server = MockServer::start().await;
+            let mut canonical = fyi();
+            canonical.version = 8;
+            if !conflict {
+                canonical.status = "dismissed".into();
+                canonical.seen_at = Some("2026-09-07T12:00:00Z".into());
+            }
+            let response = if conflict {
+                ResponseTemplate::new(409)
+            } else {
+                ResponseTemplate::new(200).set_body_json(&canonical)
+            };
+            Mock::given(method("POST"))
+                .and(path("/v2/items/news1/seen"))
+                .and(header("authorization", "Bearer tok"))
+                .and(body_json(serde_json::json!({"version": 7})))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/items/news1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&canonical))
+                .expect(if conflict { 1 } else { 0 })
+                .mount(&server)
+                .await;
+            let cfg = Config {
+                server: server.uri(),
+                token: "tok".into(),
+                topic: "top".into(),
+                ntfy: None,
+            };
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let client = Client::new(&cfg).unwrap();
+                mark_seen(&client, "news1", 7, &tx);
+            })
+            .join()
+            .unwrap();
+            let mut a = App::new("host".into());
+            a.set_items(vec![fyi()]);
+            a.handle(key('m'));
+            let Msg::Seen { item, error } = rx.recv().unwrap() else {
+                panic!("expected seen result")
+            };
+            a.seen_result(item.map(|item| *item), error);
+            assert_eq!(a.current().unwrap().version, 8);
+            if conflict {
+                assert_eq!(a.requests.items[0].status, "open");
+                assert!(a.current().unwrap().seen_at.is_none());
+                assert!(a.status.contains("409"));
+            } else {
+                assert!(a.requests.items.is_empty());
+                assert_eq!(a.current().unwrap().status, "dismissed");
+                assert!(a.current().unwrap().seen_at.is_some());
+                assert!(a.current().unwrap().response_choice.is_none());
+                assert!(a.current().unwrap().response_text.is_none());
+            }
+        }
     }
 
     #[test]

@@ -48,12 +48,15 @@ enum Cmd {
     /// Queue an item; prints its id
     Push {
         title: String,
+        /// Request an answer or publish an informational update
+        #[arg(long, value_enum, default_value = "request")]
+        kind: client::ItemKind,
         /// Who is asking; inferred from tmux/zellij/screen as session:window, or $LAM_NAME
         #[arg(short = 'n', long)]
         name: Option<String>,
         #[arg(short, long, default_value = "")]
         body: String,
-        #[arg(short, long, default_value = "normal", value_parser = ["low", "normal", "critical"])]
+        #[arg(short, long, default_value = "normal", value_parser = ["low", "normal", "warning", "critical"])]
         priority: String,
         /// Up to 3 choices shown as buttons
         #[arg(short, long = "choice")]
@@ -176,6 +179,7 @@ fn run(cmd: Cmd) -> Result<i32> {
         } => commands::init(server, token, topic),
         Cmd::Push {
             title,
+            kind,
             name,
             body,
             priority,
@@ -188,6 +192,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             wait,
         } => commands::push(commands::PushArgs {
             title,
+            kind,
             name,
             body,
             priority,
