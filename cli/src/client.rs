@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use reqwest::blocking::{Client as Http, RequestBuilder, Response};
 use reqwest::StatusCode;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::time::Duration;
@@ -181,6 +182,21 @@ pub struct ArticleViewSession {
     pub expires_at: String,
 }
 
+pub enum ArticlePublishError {
+    Rejected(anyhow::Error),
+    OutcomeUnknown,
+}
+
+pub enum ArticleReadResult {
+    Updated(Box<Article>),
+    Conflict,
+}
+
+enum ArticleJsonError {
+    Rejected(anyhow::Error),
+    OutcomeUnknown,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct Resolution {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -302,9 +318,53 @@ impl Client {
                 Err(_) if attempt + 1 < ATTEMPTS => {}
                 Err(error) => return Err(error.into()),
             }
-            std::thread::sleep(Duration::from_millis(25 * (attempt as u64 + 1)));
+            Self::article_retry_delay(attempt);
         }
         unreachable!("article retry loop returns on its final attempt")
+    }
+
+    fn send_article_json_with_retry<T: DeserializeOwned>(
+        &self,
+        mut request: impl FnMut() -> RequestBuilder,
+        not_found: Option<&str>,
+    ) -> std::result::Result<T, ArticleJsonError> {
+        const ATTEMPTS: usize = 3;
+        for attempt in 0..ATTEMPTS {
+            let response = match request().send() {
+                Ok(response) => response,
+                Err(_) if attempt + 1 < ATTEMPTS => {
+                    Self::article_retry_delay(attempt);
+                    continue;
+                }
+                Err(_) => return Err(ArticleJsonError::OutcomeUnknown),
+            };
+            if Self::transient(response.status()) && attempt + 1 < ATTEMPTS {
+                Self::article_retry_delay(attempt);
+                continue;
+            }
+            if response.status() == StatusCode::NOT_FOUND {
+                if let Some(message) = not_found {
+                    return Err(ArticleJsonError::Rejected(anyhow::anyhow!(
+                        message.to_owned()
+                    )));
+                }
+            }
+            if !response.status().is_success() {
+                return Err(ArticleJsonError::Rejected(
+                    self.article_ok(response).unwrap_err(),
+                ));
+            }
+            match response.json() {
+                Ok(value) => return Ok(value),
+                Err(_) if attempt + 1 < ATTEMPTS => Self::article_retry_delay(attempt),
+                Err(_) => return Err(ArticleJsonError::OutcomeUnknown),
+            }
+        }
+        unreachable!("article JSON retry loop returns on its final attempt")
+    }
+
+    fn article_retry_delay(attempt: usize) {
+        std::thread::sleep(Duration::from_millis(25 * (attempt as u64 + 1)));
     }
 
     fn article_ok(&self, response: Response) -> Result<Response> {
@@ -329,8 +389,9 @@ impl Client {
         let mut rest = message;
         let mut redacted = String::with_capacity(message.len());
         loop {
-            let http = rest.find("http://");
-            let https = rest.find("https://");
+            let lowercase = rest.to_ascii_lowercase();
+            let http = lowercase.find("http://");
+            let https = lowercase.find("https://");
             let Some(start) = http.into_iter().chain(https).min() else {
                 redacted.push_str(rest);
                 return redacted;
@@ -367,18 +428,23 @@ impl Client {
         draft: &ArticleDraft,
         idempotency_key: &str,
     ) -> Result<String> {
-        let response = self.send_article_with_retry(|| {
-            self.post("/v2/articles/uploads")
-                .header("Idempotency-Key", idempotency_key)
-                .json(draft)
-        })?;
-        if response.status() == StatusCode::NOT_FOUND {
-            bail!("server upgrade required: article publishing needs POST /v2/articles/uploads");
-        }
-        let id = self
-            .article_ok(response)?
-            .json::<ArticleUploadCreated>()?
-            .id;
+        let created: ArticleUploadCreated = match self.send_article_json_with_retry(
+            || {
+                self.post("/v2/articles/uploads")
+                    .header("Idempotency-Key", idempotency_key)
+                    .json(draft)
+            },
+            Some("server upgrade required: article publishing needs POST /v2/articles/uploads"),
+        ) {
+            Ok(created) => created,
+            Err(ArticleJsonError::Rejected(error)) => return Err(error),
+            Err(ArticleJsonError::OutcomeUnknown) => {
+                bail!(
+                    "article draft creation outcome is unknown; retrying may create another draft"
+                )
+            }
+        };
+        let id = created.id;
         Self::validate_article_id(&id, "draft")?;
         Ok(id)
     }
@@ -391,11 +457,14 @@ impl Client {
         Ok(())
     }
 
-    pub fn publish_article(&self, id: &str) -> Result<Article> {
-        Self::validate_article_id(id, "")?;
+    pub fn publish_article(&self, id: &str) -> std::result::Result<Article, ArticlePublishError> {
+        Self::validate_article_id(id, "").map_err(ArticlePublishError::Rejected)?;
         let path = format!("/v2/articles/{id}/publish");
-        let response = self.send_article_with_retry(|| self.post(&path))?;
-        Ok(self.article_ok(response)?.json()?)
+        match self.send_article_json_with_retry(|| self.post(&path), None) {
+            Ok(article) => Ok(article),
+            Err(ArticleJsonError::Rejected(error)) => Err(ArticlePublishError::Rejected(error)),
+            Err(ArticleJsonError::OutcomeUnknown) => Err(ArticlePublishError::OutcomeUnknown),
+        }
     }
 
     pub fn article_page(
@@ -425,15 +494,23 @@ impl Client {
             .json()?)
     }
 
-    pub fn set_article_read(&self, id: &str, read: bool, version: u64) -> Result<Article> {
+    pub fn set_article_read(
+        &self,
+        id: &str,
+        read: bool,
+        version: u64,
+    ) -> Result<ArticleReadResult> {
         Self::validate_article_id(id, "")?;
-        Ok(self
-            .article_ok(
-                self.put(&format!("/v2/articles/{id}/read"))
-                    .json(&serde_json::json!({ "read": read, "version": version }))
-                    .send()?,
-            )?
-            .json()?)
+        let response = self
+            .put(&format!("/v2/articles/{id}/read"))
+            .json(&serde_json::json!({ "read": read, "version": version }))
+            .send()?;
+        if response.status() == StatusCode::CONFLICT {
+            return Ok(ArticleReadResult::Conflict);
+        }
+        Ok(ArticleReadResult::Updated(Box::new(
+            self.article_ok(response)?.json()?,
+        )))
     }
 
     pub fn create_article_view_session(&self, id: &str) -> Result<ArticleViewSession> {

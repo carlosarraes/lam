@@ -9,7 +9,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::client::{ArticleAsset, ArticleAssetDisposition, ArticleDraft, Client};
+use crate::client::{
+    ArticleAsset, ArticleAssetDisposition, ArticleDraft, ArticlePublishError, ArticleReadResult,
+    Client,
+};
 use crate::config::Config;
 
 const MAX_ENTRY_BYTES: u64 = 2 * 1024 * 1024;
@@ -373,24 +376,29 @@ pub fn publish(args: PublishArgs) -> Result<i32> {
     let client = client()?;
     let idempotency_key = uuid::Uuid::new_v4().to_string();
     let id = client.create_article_upload(&draft, &idempotency_key)?;
-    let result = (|| {
-        for (index, asset) in uploads.iter().enumerate() {
-            client
-                .upload_article_asset(&id, index, &asset.bytes)
-                .with_context(|| format!("asset upload {index} failed"))?;
+    for (index, asset) in uploads.iter().enumerate() {
+        if let Err(error) = client
+            .upload_article_asset(&id, index, &asset.bytes)
+            .with_context(|| format!("asset upload {index} failed"))
+        {
+            return Err(unpublished_error(&id, error));
         }
-        client.publish_article(&id)
-    })();
-    match result {
+    }
+    match client.publish_article(&id) {
         Ok(article) => {
             println!("{}", article.id);
             Ok(0)
         }
-        Err(error) => {
-            let detail = format!("{error:#}").replace(&id, "[draft]");
-            Err(anyhow!("article draft {id} was not published: {detail}"))
-        }
+        Err(ArticlePublishError::Rejected(error)) => Err(unpublished_error(&id, error)),
+        Err(ArticlePublishError::OutcomeUnknown) => Err(anyhow!(
+            "article draft {id} publication outcome is unknown; the server may have published it; check `lam article list` before starting another publication"
+        )),
     }
+}
+
+fn unpublished_error(id: &str, error: anyhow::Error) -> anyhow::Error {
+    let detail = format!("{error:#}").replace(id, "[draft]");
+    anyhow!("article draft {id} was not published: {detail}")
 }
 
 pub fn list(read: ReadFilter, query: Option<&str>) -> Result<i32> {
@@ -421,33 +429,54 @@ pub fn list(read: ReadFilter, query: Option<&str>) -> Result<i32> {
 pub fn set_read(id: &str, read: bool) -> Result<i32> {
     let client = client()?;
     let current = client.article(id)?;
-    let article = client.set_article_read(id, read, current.version)?;
-    println!("{}", serde_json::to_string_pretty(&article)?);
-    Ok(0)
+    match client.set_article_read(id, read, current.version)? {
+        ArticleReadResult::Updated(article) => {
+            println!("{}", serde_json::to_string_pretty(&article)?);
+            Ok(0)
+        }
+        ArticleReadResult::Conflict => {
+            let canonical = client.article(id).context(
+                "article read update conflicted and canonical state could not be fetched",
+            )?;
+            bail!(
+                "article read update conflicted; canonical state:\n{}",
+                serde_json::to_string_pretty(&canonical)?
+            )
+        }
+    }
 }
 
-fn valid_viewer_url(raw: &str) -> bool {
-    reqwest::Url::parse(raw).is_ok_and(|url| {
-        matches!(url.scheme(), "http" | "https")
-            && url.host_str().is_some()
-            && url.username().is_empty()
-            && url.password().is_none()
-    })
+fn validated_viewer_url(raw: &str) -> Result<String> {
+    if raw.contains('\\')
+        || raw
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        bail!("server returned an invalid article viewer URL");
+    }
+    let url = reqwest::Url::parse(raw)
+        .map_err(|_| anyhow!("server returned an invalid article viewer URL"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        bail!("server returned an invalid article viewer URL");
+    }
+    Ok(url.to_string())
 }
 
 pub fn open(id: &str) -> Result<i32> {
     let session = client()?.create_article_view_session(id)?;
     let _ = &session.expires_at;
-    if !valid_viewer_url(&session.url) {
-        bail!("server returned an invalid article viewer URL");
-    }
+    let viewer_url = validated_viewer_url(&session.url)?;
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else {
         "xdg-open"
     };
     Command::new(opener)
-        .arg(&session.url)
+        .arg(viewer_url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -64,6 +64,125 @@ fn lam(dir: &tempfile::TempDir, args: &[&str]) -> Output {
     lam_command(dir).args(args).output().unwrap()
 }
 
+#[cfg(unix)]
+#[derive(Debug)]
+struct ScriptedRequest {
+    target: String,
+    headers: String,
+    body: Vec<u8>,
+}
+
+#[cfg(unix)]
+enum ScriptedReply {
+    Full(&'static str, String),
+    Truncated(&'static str, String),
+}
+
+#[cfg(unix)]
+fn spawn_scripted_server(
+    replies: Vec<ScriptedReply>,
+) -> (
+    std::net::SocketAddr,
+    Arc<Mutex<Vec<ScriptedRequest>>>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    fn read_request(stream: &mut TcpStream) -> ScriptedRequest {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut header_bytes = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !header_bytes.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            header_bytes.push(byte[0]);
+        }
+        let headers = String::from_utf8(header_bytes).unwrap();
+        let target = headers
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_owned();
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body).unwrap();
+        ScriptedRequest {
+            target,
+            headers,
+            body,
+        }
+    }
+
+    fn write_response(stream: &mut TcpStream, status: &str, body: &str, truncate: bool) {
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        let bytes = body.as_bytes();
+        let sent = if truncate {
+            bytes.len().saturating_sub(1).max(1)
+        } else {
+            bytes.len()
+        };
+        stream.write_all(&bytes[..sent]).unwrap();
+        stream.flush().unwrap();
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let server_captured = Arc::clone(&captured);
+    let server = std::thread::spawn(move || {
+        for reply in replies {
+            let (mut stream, _) = listener.accept().unwrap();
+            server_captured
+                .lock()
+                .unwrap()
+                .push(read_request(&mut stream));
+            match reply {
+                ScriptedReply::Full(status, body) => {
+                    write_response(&mut stream, status, &body, false)
+                }
+                ScriptedReply::Truncated(status, body) => {
+                    write_response(&mut stream, status, &body, true)
+                }
+            }
+        }
+    });
+    (address, captured, server)
+}
+
+#[cfg(unix)]
+fn setup_for_server(address: std::net::SocketAddr) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("config.toml"),
+        format!("server = \"http://{address}\"\ntoken = \"{TOKEN}\"\ntopic = \"top\"\n"),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("entry.html"),
+        "<!doctype html><html><body>Hello</body></html>",
+    )
+    .unwrap();
+    dir
+}
+
 async fn mount_success(server: &MockServer, article_value: &serde_json::Value) {
     Mock::given(method("POST"))
         .and(path("/v2/articles/uploads"))
@@ -467,6 +586,168 @@ async fn publish_retries_transient_stage_and_publish_with_one_attempt_identity()
 }
 
 #[cfg(unix)]
+#[test]
+fn publish_retries_a_truncated_successful_stage_body_with_the_same_key() {
+    let stage = serde_json::json!({ "id": ARTICLE_ID }).to_string();
+    let (address, captured, server) = spawn_scripted_server(vec![
+        ScriptedReply::Truncated("201 Created", stage.clone()),
+        ScriptedReply::Full("201 Created", stage),
+        ScriptedReply::Full("204 No Content", String::new()),
+        ScriptedReply::Full(
+            "200 OK",
+            article(ARTICLE_ID, "Stage retry", false, 0).to_string(),
+        ),
+    ]);
+    let dir = setup_for_server(address);
+
+    let out = lam(
+        &dir,
+        &[
+            "article",
+            "publish",
+            "--file",
+            "entry.html",
+            "--title",
+            "Stage retry",
+            "--summary",
+            "Summary",
+        ],
+    );
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    server.join().unwrap();
+    let requests = captured.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.target.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "/v2/articles/uploads",
+            "/v2/articles/uploads",
+            &format!("/v2/articles/{ARTICLE_ID}/assets/0"),
+            &format!("/v2/articles/{ARTICLE_ID}/publish"),
+        ]
+    );
+    let keys = requests[..2]
+        .iter()
+        .map(|request| {
+            request
+                .headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("idempotency-key")
+                        .then(|| value.trim())
+                })
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(keys[0], keys[1]);
+    assert_eq!(requests[0].body, requests[1].body);
+}
+
+#[cfg(unix)]
+#[test]
+fn publish_retries_a_truncated_successful_publish_body() {
+    let published = article(ARTICLE_ID, "Publish retry", false, 0).to_string();
+    let (address, captured, server) = spawn_scripted_server(vec![
+        ScriptedReply::Full(
+            "201 Created",
+            serde_json::json!({ "id": ARTICLE_ID }).to_string(),
+        ),
+        ScriptedReply::Full("204 No Content", String::new()),
+        ScriptedReply::Truncated("200 OK", published.clone()),
+        ScriptedReply::Full("200 OK", published),
+    ]);
+    let dir = setup_for_server(address);
+
+    let out = lam(
+        &dir,
+        &[
+            "article",
+            "publish",
+            "--file",
+            "entry.html",
+            "--title",
+            "Publish retry",
+            "--summary",
+            "Summary",
+        ],
+    );
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    server.join().unwrap();
+    let requests = captured.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.target.ends_with("/publish"))
+            .count(),
+        2
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), ARTICLE_ID);
+}
+
+#[cfg(unix)]
+#[test]
+fn publish_reports_unknown_outcome_after_exhausted_truncated_successes() {
+    let published = article(ARTICLE_ID, "Unknown", false, 0).to_string();
+    let (address, captured, server) = spawn_scripted_server(vec![
+        ScriptedReply::Full(
+            "201 Created",
+            serde_json::json!({ "id": ARTICLE_ID }).to_string(),
+        ),
+        ScriptedReply::Full("204 No Content", String::new()),
+        ScriptedReply::Truncated("200 OK", published.clone()),
+        ScriptedReply::Truncated("200 OK", published.clone()),
+        ScriptedReply::Truncated("200 OK", published),
+    ]);
+    let dir = setup_for_server(address);
+
+    let out = lam(
+        &dir,
+        &[
+            "article",
+            "publish",
+            "--file",
+            "entry.html",
+            "--title",
+            "Unknown",
+            "--summary",
+            "Summary",
+        ],
+    );
+
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("publication outcome is unknown"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("may have published"), "{stderr}");
+    assert!(!stderr.contains("was not published"), "{stderr}");
+    assert_eq!(stderr.matches(ARTICLE_ID).count(), 1, "{stderr}");
+    server.join().unwrap();
+    let requests = captured.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.target.ends_with("/publish"))
+            .count(),
+        3
+    );
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn publish_retries_an_interrupted_upload_with_the_same_snapshotted_bytes() {
     use std::io::{Read, Write};
@@ -693,6 +974,34 @@ async fn publish_reports_an_actionable_upgrade_error_for_an_older_server() {
 }
 
 #[tokio::test]
+async fn article_errors_redact_http_urls_with_case_insensitive_schemes() {
+    let (server, dir) = setup().await;
+    let capabilities = [
+        "HTTPS://viewer.example/session/uppercase-private-capability",
+        "hTtP://viewer.example/session/mixed-case-private-capability",
+    ];
+    Mock::given(method("GET"))
+        .and(path("/v2/articles"))
+        .respond_with(SequenceResponder::new(capabilities.map(|capability| {
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": format!("temporary={capability}")
+            }))
+        })))
+        .expect(capabilities.len() as u64)
+        .mount(&server)
+        .await;
+
+    for capability in capabilities {
+        let out = lam(&dir, &["article", "list"]);
+        assert_eq!(out.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("[redacted URL]"), "{stderr}");
+        assert!(!stderr.contains(capability), "{stderr}");
+        assert!(!stderr.contains("private-capability"), "{stderr}");
+    }
+}
+
+#[tokio::test]
 async fn publish_rejects_a_malformed_draft_id_before_sending_asset_bytes() {
     let (server, dir) = setup().await;
     Mock::given(method("POST"))
@@ -834,6 +1143,54 @@ async fn article_read_and_unread_send_the_current_version_and_print_canonical_js
 }
 
 #[tokio::test]
+async fn stale_read_conflict_fetches_and_reports_canonical_state_without_retrying_put() {
+    let (server, dir) = setup().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/articles/{ARTICLE_ID}")))
+        .respond_with(SequenceResponder::new([
+            ResponseTemplate::new(200).set_body_json(article(ARTICLE_ID, "R", false, 7)),
+            ResponseTemplate::new(200).set_body_json(article(ARTICLE_ID, "R", false, 9)),
+        ]))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/articles/{ARTICLE_ID}/read")))
+        .and(body_json(serde_json::json!({ "read": true, "version": 7 })))
+        .respond_with(
+            ResponseTemplate::new(409)
+                .set_body_json(serde_json::json!({ "error": "stale article version" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let out = lam(&dir, &["article", "read", ARTICLE_ID]);
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("read update conflicted"), "{stderr}");
+    assert!(stderr.contains("canonical state"), "{stderr}");
+    assert!(stderr.contains("\"read_at\": null"), "{stderr}");
+    assert!(stderr.contains("\"version\": 9"), "{stderr}");
+    let requests = server.received_requests().await.unwrap();
+    let detail_path = format!("/v2/articles/{ARTICLE_ID}");
+    let read_path = format!("/v2/articles/{ARTICLE_ID}/read");
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| (request.method.as_str(), request.url.path()))
+            .collect::<Vec<_>>(),
+        [
+            ("GET", detail_path.as_str()),
+            ("PUT", read_path.as_str()),
+            ("GET", detail_path.as_str()),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn article_open_reports_an_older_server_without_exposing_response_secrets() {
     let (server, dir) = setup().await;
     Mock::given(method("POST"))
@@ -860,7 +1217,8 @@ async fn article_open_launches_valid_session_without_printing_or_marking_read() 
     use std::time::{Duration, Instant};
 
     let (server, dir) = setup().await;
-    let capability = "https://viewer.example/session/opaque-capability";
+    let capability = "HTTPS://Viewer.Example:443/a/../session/opaque-capability";
+    let normalized = "https://viewer.example/session/opaque-capability";
     Mock::given(method("POST"))
         .and(path(format!("/v2/articles/{ARTICLE_ID}/view-session")))
         .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
@@ -901,7 +1259,7 @@ async fn article_open_launches_valid_session_without_printing_or_marking_read() 
     while !opened.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert_eq!(fs::read_to_string(opened).unwrap(), capability);
+    assert_eq!(fs::read_to_string(opened).unwrap(), normalized);
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].method.as_str(), "POST");
@@ -911,25 +1269,36 @@ async fn article_open_launches_valid_session_without_printing_or_marking_read() 
 #[tokio::test]
 async fn article_open_rejects_ambiguous_session_urls_without_exposing_them() {
     let (server, dir) = setup().await;
-    let capability = "https://credential@viewer.example/session";
+    let capabilities = [
+        "https://credential@viewer.example/session",
+        "https://viewer.example/\ncapability",
+        "https://viewer.example/\tcapability",
+        "https://viewer.example\\@attacker.example/session",
+        " https://viewer.example/session",
+    ];
     Mock::given(method("POST"))
         .and(path(format!("/v2/articles/{ARTICLE_ID}/view-session")))
-        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
-            "url": capability,
-            "expires_at": "2026-09-08T12:05:00.000Z"
+        .respond_with(SequenceResponder::new(capabilities.map(|url| {
+            ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "url": url,
+                "expires_at": "2026-09-08T12:05:00.000Z"
+            }))
         })))
+        .expect(capabilities.len() as u64)
         .mount(&server)
         .await;
 
-    let out = lam_command(&dir)
-        .env("PATH", dir.path())
-        .args(["article", "open", ARTICLE_ID])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("invalid article viewer URL"), "{stderr}");
-    assert!(!stderr.contains(capability), "{stderr}");
+    for capability in capabilities {
+        let out = lam_command(&dir)
+            .env("PATH", dir.path())
+            .args(["article", "open", ARTICLE_ID])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("invalid article viewer URL"), "{stderr}");
+        assert!(!stderr.contains(capability), "{stderr}");
+    }
 }
 
 #[test]
