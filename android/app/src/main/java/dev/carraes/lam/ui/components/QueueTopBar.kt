@@ -15,6 +15,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import dev.carraes.lam.R
 
+val LocalArticlesNavigation = staticCompositionLocalOf<(() -> Unit)?> { null }
+
 @Composable
 fun QueueTopBar(title: String, onRequests: () -> Unit, onHistory: () -> Unit, onSettings: () -> Unit, onSearch: (() -> Unit)? = null,
     searchLabel: String = stringResource(R.string.search_requests)) {
@@ -31,6 +33,9 @@ fun QueueTopBar(title: String, onRequests: () -> Unit, onHistory: () -> Unit, on
             DropdownMenu(queueMenu, onDismissRequest = { queueMenu = false }) {
                 DropdownMenuItem(text = { Text(stringResource(R.string.requests_title)) }, onClick = { queueMenu = false; onRequests() })
                 DropdownMenuItem(text = { Text(stringResource(R.string.history_title)) }, onClick = { queueMenu = false; onHistory() })
+                LocalArticlesNavigation.current?.let { onArticles ->
+                    DropdownMenuItem(text = { Text(stringResource(R.string.articles_title)) }, onClick = { queueMenu = false; onArticles() })
+                }
             }
         }
         if (onSearch != null) IconButton(onSearch) { Icon(Icons.Default.Search, searchLabel) }

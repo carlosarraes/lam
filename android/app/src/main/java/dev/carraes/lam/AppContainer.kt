@@ -20,6 +20,9 @@ import dev.carraes.lam.sync.LifecycleReconciler
 import dev.carraes.lam.sync.AndroidConnectivityMonitor
 import dev.carraes.lam.items.DeviceSettings
 import dev.carraes.lam.diagnostics.Diagnostics
+import dev.carraes.lam.articles.*
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 
 class AppContainer(
     val applicationContext: Context,
@@ -27,7 +30,7 @@ class AppContainer(
     private val credentials: CredentialComposition = createCredentialComposition(applicationContext)
     private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val database = Room.databaseBuilder(applicationContext, LamDatabase::class.java, "lam-items.db")
-        .addMigrations(LamDatabase.MIGRATION_1_2).build()
+        .addMigrations(LamDatabase.MIGRATION_1_2, LamDatabase.MIGRATION_2_3).build()
     private val connectivity = AndroidConnectivityMonitor(applicationContext)
 
     private val items = DefaultItemRepository(
@@ -41,6 +44,27 @@ class AppContainer(
         "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} ${android.os.Build.ID}")
 
     val credentialStore: CredentialStore = items.credentialStore
+
+    @Volatile private var articleSession: Pair<Long, ArticleSession>? = null
+    val articleRepository = ArticleRepository(RoomArticleStorage(database), credentials::articleApi) {
+        articleSession?.takeIf { it.first == items.reconciliationSession.value }?.second
+    }
+
+    init {
+        applicationScope.launch {
+            items.reconciliationSession.collect { generation ->
+                articleSession = null
+                articleRepository.reset()
+                if (generation != null) {
+                    val device = credentialStore.observe().first()
+                    if (device != null && items.reconciliationSession.value == generation) {
+                        val account = sha256("${device.serverUrl}\n${device.deviceId}".toByteArray())
+                        articleSession = generation to ArticleSession(account, java.util.UUID.randomUUID().toString())
+                    }
+                }
+            }
+        }
+    }
 
     val lifecycleReconciler = LifecycleReconciler(
         itemRepository, items.reconciliationSession, ProcessLifecycleOwner.get().lifecycle,

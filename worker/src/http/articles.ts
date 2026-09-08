@@ -1,10 +1,11 @@
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import { Effect, Schema } from "effect";
-import { MANIFEST_BYTES, readBoundedBody, validateManifest } from "../articles/manifest";
+import { HTML_BYTES, MANIFEST_BYTES, readBoundedBody, validateManifest } from "../articles/manifest";
 import { ReadUpdate } from "../domain/Article";
 import { BadRequest } from "../domain/Item";
 import { Articles } from "../services/Articles";
 import { Auth, RequestAuthority } from "../services/Auth";
+import { viewerParts } from "./article-viewer";
 
 const Id = Schema.Struct({ id: Schema.String.pipe(Schema.pattern(/^[a-f0-9-]{36}$/)) });
 const AssetId = Schema.Struct({ ...Id.fields, index: Schema.NumberFromString.pipe(Schema.int(), Schema.between(0, 50)) });
@@ -65,6 +66,19 @@ export const articles = HttpRouter.empty.pipe(
       "x-content-type-options": "nosniff",
       "content-security-policy": "default-src 'none'; sandbox",
     } });
+  })),
+  HttpRouter.get("/v2/articles/:id/content", Effect.gen(function* () {
+    yield* RequestAuthority;
+    const { id } = yield* HttpRouter.schemaPathParams(Id);
+    const service = yield* Articles;
+    const article = yield* service.get(id);
+    const { object } = yield* service.asset(id, article.assets.findIndex(asset => asset.path === "index.html"));
+    const source = yield* Effect.tryPromise({
+      try: async () => new TextDecoder("utf-8", { fatal: true }).decode(await readBoundedBody(object.body, HTML_BYTES)),
+      catch: () => new BadRequest({ message: "article content unavailable" }),
+    });
+    const parts = yield* Effect.try({ try: () => viewerParts(source, article.assets, "native"), catch: () => new BadRequest({ message: "article content unavailable" }) });
+    return yield* json({ article, parts });
   })),
   HttpRouter.put("/v2/articles/:id/read", Effect.gen(function* () {
     yield* RequestAuthority;

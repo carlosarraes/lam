@@ -27,6 +27,7 @@ internal class RoomItemStorage(private val database: LamDatabase) : ItemStorage 
     override suspend fun optimistic(snapshot: ItemEntity, changed: ItemEntity) = items.optimistic(snapshot, changed)
     override suspend fun rollback(snapshot: ItemEntity, tag: String) = items.rollback(snapshot, tag)
     override suspend fun clear() = database.withTransaction {
+        database.articleDao().clear()
         items.clearHistory()
         items.clearItems()
         metadata.clear()

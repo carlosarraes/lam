@@ -40,6 +40,34 @@ async function inlineImage(id: string, width = 1, height = 1) {
 }
 
 describe("isolated article viewer", () => {
+  it("delivers native parser slots under a fixed local HTTPS policy without marking read", async () => {
+    const id = await published();
+    expect((await SELF.fetch(`https://example.com/v2/articles/${id}/content`)).status).toBe(401);
+    const response = await api(`/${id}/content`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toContain("no-store");
+    const content = await response.json<{ article: { version: number; read_at: string | null }; parts: string[] }>();
+    expect(content.article).toMatchObject({ version: 0, read_at: null });
+    expect(content.parts.join("")).toContain('href="#report"');
+    expect(content.parts.join("")).toContain("img-src https://articles.lam.invalid");
+    expect(content.parts.join("")).not.toContain("test-token");
+    expect(await (await api(`/${id}`)).json()).toMatchObject({ version: 0, read_at: null });
+    await env.ARTICLE_BUCKET.delete(`articles/${id}/sanitized/index.html`);
+    expect((await api(`/${id}/content`)).status).toBe(404);
+    expect(await (await api(`/${id}`)).json()).toMatchObject({ version: 0, read_at: null });
+  });
+
+  it("native resource slots rewrite CSS and SVG URLs but preserve literal markers and fragments", () => {
+    const assets = [{ path: "pixel.png", media_type: "image/png", disposition: "inline" as const, size: 10, sha256: "a".repeat(64) }];
+    const parts = viewerParts('<style>p{background:url(lam-asset:0)}</style><svg><image href="lam-asset:0"></image></svg><p>lam-asset:0</p><a href="#top">Top</a>', assets, "native");
+    expect(parts.filter(part => typeof part !== "string")).toEqual([{ asset: 0 }, { asset: 0 }]);
+    const html = parts.filter(part => typeof part === "string").join("");
+    expect(html).toContain('>lam-asset:0</p>');
+    expect(html).toContain('href="#top"');
+    expect(html).toContain("script-src 'none'");
+    expect(html).not.toContain("img-src data:");
+  });
+
   it("keeps session authorization failures private and unframeable", async () => {
     const id = await published();
     const response = await SELF.fetch(`https://example.com/v2/articles/${id}/view-session`, { method: "POST" });

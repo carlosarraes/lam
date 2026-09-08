@@ -93,7 +93,7 @@ const authenticate = (id: string, kind: "bootstrap_hash" | "session_hash", token
 });
 
 /** Rewrite only URL-bearing parser fields in the already validated canonical document. */
-export function viewerParts(source: string, assets: readonly Asset[]): (string | { asset: number })[] {
+export function viewerParts(source: string, assets: readonly Asset[], mode: "desktop" | "native" = "desktop"): (string | { asset: number })[] {
   const document = parse(source);
   let marker: string;
   const original = serialize(document);
@@ -116,7 +116,7 @@ export function viewerParts(source: string, assets: readonly Asset[]): (string |
     for (const child of node.childNodes) {
       if (!("tagName" in child)) continue;
       for (const attr of child.attrs) {
-        if (child.tagName === "a" && attr.name === "href" && attr.value.startsWith("#")) attr.value = `about:srcdoc${attr.value}`;
+        if (mode === "desktop" && child.tagName === "a" && attr.name === "href" && attr.value.startsWith("#")) attr.value = `about:srcdoc${attr.value}`;
         if ((child.tagName === "img" && attr.name === "src") || (child.tagName === "image" && attr.name === "href")) attr.value = resource(attr.value);
         else if (attr.name === "style") attr.value = rewriteCss(attr.value, "declarationList");
         else if (["fill", "stroke", "clip-path", "marker-start", "marker-mid", "marker-end"].includes(attr.name)) attr.value = rewriteCss(attr.value, "value");
@@ -128,7 +128,8 @@ export function viewerParts(source: string, assets: readonly Asset[]): (string |
   visit(document);
   const root = document.childNodes.find((node): node is Html.Element => "tagName" in node && node.tagName === "html")!;
   const head = root.childNodes.find((node): node is Html.Element => "tagName" in node && node.tagName === "head")!;
-  const policy = "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'";
+  const images = mode === "native" ? "https://articles.lam.invalid" : "data:";
+  const policy = `default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src ${images}; base-uri 'none'; form-action 'none'`;
   const meta = defaultTreeAdapter.createElement("meta", namespaces.NS.HTML, [{ name: "http-equiv", value: "Content-Security-Policy" }, { name: "content", value: policy }]);
   head.childNodes.unshift(meta);
   meta.parentNode = head;

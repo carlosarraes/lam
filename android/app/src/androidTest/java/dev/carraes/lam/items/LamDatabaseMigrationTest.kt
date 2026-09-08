@@ -37,7 +37,7 @@ class LamDatabaseMigrationTest {
                 old.execSQL("INSERT INTO history_membership VALUES ('saved-query', 'closed')")
                 old.version = 1
             }
-            val database = Room.databaseBuilder(context, LamDatabase::class.java, name).addMigrations(LamDatabase.MIGRATION_1_2).build()
+            val database = Room.databaseBuilder(context, LamDatabase::class.java, name).addMigrations(LamDatabase.MIGRATION_1_2, LamDatabase.MIGRATION_2_3).build()
             try {
                 val store = RoomItemStorage(database)
                 val legacy = store.get("legacy")!!.canonical

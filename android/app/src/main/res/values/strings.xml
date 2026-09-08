@@ -1,5 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="articles_title">Articles</string>
+    <string name="articles_search">Search articles</string>
+    <string name="articles_all">All</string>
+    <string name="articles_read">Read</string>
+    <string name="articles_unread">Unread</string>
+    <string name="articles_mark_unread">Mark unread</string>
+    <string name="articles_empty">No articles match.</string>
+    <string name="articles_failed">Could not load articles. Refresh to try again.</string>
+    <string name="articles_cached_list">Showing saved metadata. Refresh when connected. Some articles may need a connection to open.</string>
+    <string name="article_failed">Could not load this article. Its read state has not changed.</string>
+    <string name="article_cached">Showing saved content. Images may need a connection.</string>
+    <string name="article_read_failed">Article opened, but read state could not be saved.</string>
+    <string name="article_conflict">Read state changed elsewhere. The newer state was kept.</string>
+    <string name="article_read_saved">Read state saved.</string>
+    <string name="article_image_missing">Some images are unavailable.</string>
+    <string name="article_download">Save %1$s</string>
+    <string name="article_download_failed">Could not save this attachment.</string>
+    <string name="article_download_saved">Attachment saved.</string>
+    <string name="article_back">Back to Articles</string>
+    <string name="article_zoom_in">Larger text</string>
+    <string name="article_zoom_out">Smaller text</string>
+    <string name="article_content">Article content</string>
     <string name="app_name">lam</string>
     <string name="requests_title">Requests</string>
     <string name="history_title">History</string>

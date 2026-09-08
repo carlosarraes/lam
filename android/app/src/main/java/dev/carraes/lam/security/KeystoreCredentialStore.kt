@@ -109,6 +109,7 @@ internal interface CredentialComposition {
     val credentialStore: CredentialStore
 
     fun api(): LamApi?
+    fun articleApi(): dev.carraes.lam.articles.ArticleApi?
 }
 
 internal fun createCredentialComposition(
@@ -149,6 +150,12 @@ private class DefaultCredentialComposition(
             },
             baseClient = baseClient,
         )
+    }
+
+    override fun articleApi(): dev.carraes.lam.articles.ArticleApi? {
+        val snapshot = pairedCredential.get() ?: return null
+        return dev.carraes.lam.articles.OkHttpArticleApi(snapshot.server.serverUrl.toHttpUrl(),
+            credential = { pairedCredential.get()?.takeIf { it === snapshot }?.credential }, baseClient = baseClient)
     }
 }
 
