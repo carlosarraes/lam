@@ -13,7 +13,7 @@ const typedJson = (body: unknown) => ({
 });
 let sequence = 0;
 const migrations = (env as unknown as { TEST_MIGRATIONS: D1Migration[] }).TEST_MIGRATIONS;
-const migrationTables = ["pairing_sessions", "devices", "items", "d1_migrations"];
+const migrationTables = ["article_notification_jobs", "article_assets", "articles", "pairing_sessions", "devices", "items", "d1_migrations"];
 
 async function dropMigrationTables(): Promise<void> {
   for (const table of migrationTables) await env.DB.prepare(`DROP TABLE IF EXISTS ${table}`).run();
@@ -440,9 +440,11 @@ describe("FYI lifecycle", () => {
 
 describe("item kind migration", () => {
   it("backfills pre-0009 rows as unseen requests without changing legacy outcomes", async () => {
+    const migrationIndex = migrations.findIndex(migration => migration.name === "0009_item_kinds.sql");
+    expect(migrationIndex).toBeGreaterThanOrEqual(0);
     try {
       await dropMigrationTables();
-      await applyD1Migrations(env.DB, migrations.slice(0, -1));
+      await applyD1Migrations(env.DB, migrations.slice(0, migrationIndex));
       await env.DB.prepare(
         `INSERT INTO items
           (id, name, title, body, source_host, source_project, priority, choices, checks, link, status,
@@ -458,7 +460,7 @@ describe("item kind migration", () => {
         "2026-01-01T00:01:00.000Z",
       ).run();
 
-      await applyD1Migrations(env.DB, migrations.slice(-1));
+      await applyD1Migrations(env.DB, migrations.slice(migrationIndex));
 
       const response = await SELF.fetch("http://lam/items/pre-0009-request", { headers: AUTH });
       expect(response.status).toBe(200);

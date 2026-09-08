@@ -4,6 +4,7 @@ import type { Topic } from "./ntfy/topic";
 
 export interface Bindings {
   DB: D1Database;
+  ARTICLE_BUCKET: R2Bucket;
   LAM_TOKEN: string;
   LAM_HMAC_SECRET: string;
   NTFY_TOPIC: string;

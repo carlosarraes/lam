@@ -4,6 +4,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-08-01",
   "observability": { "enabled": true },
+  "r2_buckets": [{ "binding": "ARTICLE_BUCKET", "bucket_name": "lam-articles", "remote": false }],
   "durable_objects": { "bindings": [
     { "name": "TOPIC", "class_name": "Topic" },
     { "name": "EVENTS", "class_name": "EventStream" }
