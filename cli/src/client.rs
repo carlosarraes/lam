@@ -329,15 +329,20 @@ impl Client {
         not_found: Option<&str>,
     ) -> std::result::Result<T, ArticleJsonError> {
         const ATTEMPTS: usize = 3;
+        let mut outcome_unknown = false;
         for attempt in 0..ATTEMPTS {
             let response = match request().send() {
                 Ok(response) => response,
                 Err(_) if attempt + 1 < ATTEMPTS => {
+                    outcome_unknown = true;
                     Self::article_retry_delay(attempt);
                     continue;
                 }
                 Err(_) => return Err(ArticleJsonError::OutcomeUnknown),
             };
+            if response.status().is_server_error() {
+                outcome_unknown = true;
+            }
             if Self::transient(response.status()) && attempt + 1 < ATTEMPTS {
                 Self::article_retry_delay(attempt);
                 continue;
@@ -350,13 +355,19 @@ impl Client {
                 }
             }
             if !response.status().is_success() {
+                if outcome_unknown {
+                    return Err(ArticleJsonError::OutcomeUnknown);
+                }
                 return Err(ArticleJsonError::Rejected(
                     self.article_ok(response).unwrap_err(),
                 ));
             }
             match response.json() {
                 Ok(value) => return Ok(value),
-                Err(_) if attempt + 1 < ATTEMPTS => Self::article_retry_delay(attempt),
+                Err(_) if attempt + 1 < ATTEMPTS => {
+                    outcome_unknown = true;
+                    Self::article_retry_delay(attempt);
+                }
                 Err(_) => return Err(ArticleJsonError::OutcomeUnknown),
             }
         }

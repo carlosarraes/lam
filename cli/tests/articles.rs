@@ -747,6 +747,181 @@ fn publish_reports_unknown_outcome_after_exhausted_truncated_successes() {
     );
 }
 
+#[tokio::test]
+async fn publish_reports_unknown_outcome_after_exhausted_server_errors() {
+    let (server, dir) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/articles/uploads"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": ARTICLE_ID
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/articles/{ARTICLE_ID}/assets/0")))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v2/articles/{ARTICLE_ID}/publish")))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_json(serde_json::json!({ "error": "database error" })),
+        )
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let out = lam(
+        &dir,
+        &[
+            "article",
+            "publish",
+            "--file",
+            "entry.html",
+            "--title",
+            "Unknown",
+            "--summary",
+            "Summary",
+        ],
+    );
+
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("publication outcome is unknown"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("may have published"), "{stderr}");
+    assert!(!stderr.contains("was not published"), "{stderr}");
+    assert_eq!(stderr.matches(ARTICLE_ID).count(), 1, "{stderr}");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/v2/articles/uploads")
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/publish"))
+            .count(),
+        3
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn publish_keeps_unknown_outcome_after_lost_success_and_failed_recovery() {
+    let published = article(ARTICLE_ID, "Unknown recovery", false, 0).to_string();
+    let (address, captured, server) = spawn_scripted_server(vec![
+        ScriptedReply::Full(
+            "201 Created",
+            serde_json::json!({ "id": ARTICLE_ID }).to_string(),
+        ),
+        ScriptedReply::Full("204 No Content", String::new()),
+        ScriptedReply::Truncated("200 OK", published),
+        ScriptedReply::Full(
+            "400 Bad Request",
+            serde_json::json!({ "error": "recovery rejected" }).to_string(),
+        ),
+    ]);
+    let dir = setup_for_server(address);
+
+    let out = lam(
+        &dir,
+        &[
+            "article",
+            "publish",
+            "--file",
+            "entry.html",
+            "--title",
+            "Unknown recovery",
+            "--summary",
+            "Summary",
+        ],
+    );
+
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("publication outcome is unknown"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("was not published"), "{stderr}");
+    assert_eq!(stderr.matches(ARTICLE_ID).count(), 1, "{stderr}");
+    server.join().unwrap();
+    let requests = captured.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.target.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "/v2/articles/uploads",
+            &format!("/v2/articles/{ARTICLE_ID}/assets/0"),
+            &format!("/v2/articles/{ARTICLE_ID}/publish"),
+            &format!("/v2/articles/{ARTICLE_ID}/publish"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn publish_reports_definite_validation_rejection_as_unpublished() {
+    let (server, dir) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/articles/uploads"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": ARTICLE_ID
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/v2/articles/{ARTICLE_ID}/assets/0")))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v2/articles/{ARTICLE_ID}/publish")))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(serde_json::json!({ "error": "invalid article content" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let out = lam(
+        &dir,
+        &[
+            "article",
+            "publish",
+            "--file",
+            "entry.html",
+            "--title",
+            "Rejected",
+            "--summary",
+            "Summary",
+        ],
+    );
+
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("was not published"), "{stderr}");
+    assert!(
+        stderr.contains("400 Bad Request: invalid article content"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("outcome is unknown"), "{stderr}");
+    assert_eq!(stderr.matches(ARTICLE_ID).count(), 1, "{stderr}");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn publish_retries_an_interrupted_upload_with_the_same_snapshotted_bytes() {
