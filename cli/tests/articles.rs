@@ -1217,8 +1217,8 @@ async fn article_open_launches_valid_session_without_printing_or_marking_read() 
     use std::time::{Duration, Instant};
 
     let (server, dir) = setup().await;
-    let capability = "HTTPS://Viewer.Example:443/a/../session/opaque-capability";
-    let normalized = "https://viewer.example/session/opaque-capability";
+    let capability = "HTTPS://Viewer.Example:443/a/../view/articles/11111111-1111-4111-8111-111111111111#opaque-capability";
+    let normalized = "https://viewer.example/view/articles/11111111-1111-4111-8111-111111111111#opaque-capability";
     Mock::given(method("POST"))
         .and(path(format!("/v2/articles/{ARTICLE_ID}/view-session")))
         .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
@@ -1255,6 +1255,8 @@ async fn article_open_launches_valid_session_without_printing_or_marking_read() 
     );
     assert!(!String::from_utf8_lossy(&out.stdout).contains(capability));
     assert!(!String::from_utf8_lossy(&out.stderr).contains(capability));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("opaque-capability"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("opaque-capability"));
     let deadline = Instant::now() + Duration::from_secs(2);
     while !opened.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));

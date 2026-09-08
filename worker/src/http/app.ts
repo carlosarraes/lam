@@ -2,6 +2,7 @@ import { HttpRouter, HttpServerResponse } from "@effect/platform";
 import { Effect } from "effect";
 import { api, bearer } from "./api";
 import { articles } from "./articles";
+import { articleViewer, articleViewerSessions } from "./article-viewer";
 import { devices } from "./devices";
 import { events } from "./events";
 import { ntfy } from "./ntfy";
@@ -14,6 +15,8 @@ const error = (status: number, message: string) => HttpServerResponse.unsafeJson
 export const app = HttpRouter.empty.pipe(
   HttpRouter.concat(api.pipe(HttpRouter.use(bearer))),
   HttpRouter.concat(articles.pipe(HttpRouter.use(bearer))),
+  HttpRouter.concat(articleViewerSessions),
+  HttpRouter.concat(articleViewer),
   HttpRouter.concat(devices.pipe(HttpRouter.use(bearer))),
   HttpRouter.concat(pairingAdmin.pipe(HttpRouter.use(bearer))),
   HttpRouter.concat(pairingClaims),

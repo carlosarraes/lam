@@ -13,7 +13,7 @@ const typedJson = (body: unknown) => ({
 });
 let sequence = 0;
 const migrations = (env as unknown as { TEST_MIGRATIONS: D1Migration[] }).TEST_MIGRATIONS;
-const migrationTables = ["article_notification_jobs", "article_assets", "articles", "pairing_sessions", "devices", "items", "d1_migrations"];
+const migrationTables = ["article_view_sessions", "article_notification_jobs", "article_assets", "articles", "pairing_sessions", "devices", "items", "d1_migrations"];
 
 async function dropMigrationTables(): Promise<void> {
   for (const table of migrationTables) await env.DB.prepare(`DROP TABLE IF EXISTS ${table}`).run();

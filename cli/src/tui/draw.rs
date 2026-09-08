@@ -9,7 +9,7 @@ use crate::client::Item;
 
 /// Rough width the side blocks need (`lam  12 open` and `hostname  ● live`); below the tab bar
 /// plus this, the bar steps down rather than colliding with them.
-const HEADER_SIDES: u16 = 38;
+const HEADER_SIDES: u16 = 46;
 /// Rows the detail pane keeps on the history tab; the list takes everything else.
 const HISTORY_DETAIL: u16 = 8;
 
@@ -76,21 +76,32 @@ impl App {
     /// centred bar never shifts as you switch. Degrades to the active label alone, then to
     /// nothing, so a narrow terminal loses the bar rather than colliding with the side blocks.
     fn tab_spans(&self, width: u16) -> Vec<Span<'static>> {
-        // The brackets move with the active label, so both states are exactly 19 columns.
-        let (left, right, a, b) = match self.tab {
-            Tab::Requests => ("[requests]", "  history", ACCENT, DIM),
-            Tab::History => ("requests  ", "[history]", DIM, ACCENT),
-        };
-        let full = (left.len() + right.len()) as u16;
+        // Brackets replace the surrounding spaces, keeping all tab states the same width.
+        let labels = [
+            (Tab::Requests, "requests"),
+            (Tab::History, "history"),
+            (Tab::Articles, "articles"),
+        ];
+        let full = 29;
         if width >= full + HEADER_SIDES {
-            return vec![
-                Span::styled(left.to_string(), a),
-                Span::styled(right.to_string(), b),
-            ];
+            return labels
+                .iter()
+                .map(|(tab, label)| {
+                    Span::styled(
+                        if self.tab == *tab {
+                            format!("[{label}]")
+                        } else {
+                            format!(" {label} ")
+                        },
+                        if self.tab == *tab { ACCENT } else { DIM },
+                    )
+                })
+                .collect();
         }
         let active = match self.tab {
-            Tab::Requests => left,
-            Tab::History => right,
+            Tab::Requests => "[requests]",
+            Tab::History => "[history]",
+            Tab::Articles => "[articles]",
         };
         if width >= active.len() as u16 + HEADER_SIDES {
             return vec![Span::styled(active.to_string(), ACCENT)];
@@ -123,6 +134,10 @@ impl App {
     }
 
     pub(super) fn draw(&self, f: &mut Frame) {
+        if self.tab == Tab::Articles {
+            self.draw_articles(f);
+            return;
+        }
         let visible = self.visible();
         let [header, body, footer] = Layout::vertical([
             Constraint::Length(1),
@@ -136,6 +151,7 @@ impl App {
         let list_h = match self.tab {
             Tab::Requests => (visible.len() as u16 + 1).clamp(3, (f.area().height / 3).max(3)),
             Tab::History => body.height.saturating_sub(HISTORY_DETAIL).max(3),
+            Tab::Articles => unreachable!("articles draw separately"),
         };
         let (list, detail) = if self.reader {
             let [l, r] =
@@ -300,6 +316,7 @@ impl App {
                 match self.tab {
                     Tab::Requests => "nothing here — all caught up",
                     Tab::History => "nothing closed yet",
+                    Tab::Articles => "no articles",
                 },
                 META,
             ))],
@@ -1087,15 +1104,14 @@ mod tests {
                 .map(|s| s.content.chars().count())
                 .sum()
         };
-        assert_eq!(width(&a, 80), 19);
+        assert_eq!(width(&a, 80), 29);
         a.handle(super::super::tests::key('l'));
-        assert_eq!(
-            width(&a, 80),
-            19,
-            "both states are the same width, so it never jitters"
-        );
+        assert_eq!(width(&a, 80), 29, "all tab states keep the bar width");
 
-        assert_eq!(width(&a, 50), 9, "squeezed down to the active label");
+        a.handle(super::super::tests::key('a'));
+        assert_eq!(width(&a, 80), 29);
+        a.handle(super::super::tests::key('l'));
+        assert_eq!(width(&a, 60), 9, "squeezed down to the active label");
         assert_eq!(width(&a, 40), 0, "and out entirely rather than colliding");
     }
 
@@ -1103,20 +1119,20 @@ mod tests {
     fn the_header_centres_the_tab_bar() {
         let mut a = App::new("archlinux".into());
         a.set_items(vec![item("aaa", "open", &[], "")]);
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(71, 12)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(81, 12)).unwrap();
         term.draw(|f| a.draw(f)).unwrap();
         let buf = term.backend().buffer().clone();
-        let head: String = (0..71).map(|x| buf[(x, 0)].symbol()).collect();
+        let head: String = (0..81).map(|x| buf[(x, 0)].symbol()).collect();
 
         assert!(head.starts_with("lam  1 requests · 0 FYI"), "{head:?}");
         assert!(
             head.trim_end().ends_with("archlinux  ● connecting"),
             "{head:?}"
         );
-        // 71 columns less the 19-column bar leaves 26 on each side
+        // 81 columns less the 29-column bar leaves 26 on each side.
         assert_eq!(
-            head.chars().skip(26).take(19).collect::<String>(),
-            "[requests]  history",
+            head.chars().skip(26).take(29).collect::<String>(),
+            "[requests] history  articles ",
             "{head:?}"
         );
     }

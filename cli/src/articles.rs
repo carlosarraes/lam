@@ -467,7 +467,12 @@ fn validated_viewer_url(raw: &str) -> Result<String> {
 }
 
 pub fn open(id: &str) -> Result<i32> {
-    let session = client()?.create_article_view_session(id)?;
+    open_with_client(&client()?, id)?;
+    Ok(0)
+}
+
+pub(crate) fn open_with_client(client: &Client, id: &str) -> Result<()> {
+    let session = client.create_article_view_session(id)?;
     let _ = &session.expires_at;
     let viewer_url = validated_viewer_url(&session.url)?;
     let opener = if cfg!(target_os = "macos") {
@@ -482,5 +487,5 @@ pub fn open(id: &str) -> Result<i32> {
         .stderr(Stdio::null())
         .spawn()
         .context("could not launch the article viewer")?;
-    Ok(0)
+    Ok(())
 }

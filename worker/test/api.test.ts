@@ -18,7 +18,7 @@ const json = (body: unknown) => ({ method: "POST", headers: { ...AUTH, "content-
 const publicJson = (body: unknown) => ({ method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 const settle = () => new Promise((r) => setTimeout(r, 50));
 const migrations = (env as unknown as { TEST_MIGRATIONS: D1Migration[] }).TEST_MIGRATIONS;
-const MIGRATION_TABLES = ["article_notification_jobs", "article_assets", "articles", "pairing_sessions", "devices", "items", "d1_migrations"];
+const MIGRATION_TABLES = ["article_view_sessions", "article_notification_jobs", "article_assets", "articles", "pairing_sessions", "devices", "items", "d1_migrations"];
 const MIGRATION_FIXTURE_NAME = "__migration_0005_fixture__";
 
 async function dropMigrationTables(): Promise<void> {
