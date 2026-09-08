@@ -1,11 +1,11 @@
 ---
 name: lam
-description: Use when Carlos needs to make a decision, grant approval, provide credentials, or receive a progress or completion update about already-authorized work while away.
+description: Use when Carlos needs to make a decision, grant approval, provide credentials, receive a progress update while away, or save an HTML report for reading in LAM.
 ---
 
 # lam: Look At Me
 
-`lam` is a queue Carlos reads from his phone and PC. Requests collect decisions; FYIs deliver information and close when read.
+`lam` is a queue Carlos reads from his phone and PC. Requests collect decisions; FYIs deliver updates and close when read; Articles save HTML reports in a separate reading library with read/unread state.
 
 ## When
 
@@ -13,6 +13,7 @@ Choose the kind from what Carlos needs to do:
 
 - If an action needs his decision, approval, credentials, or other input, send a request with your recommendation and wait for his answer. Omitted `--kind` defaults to `request`.
 - If already-authorized work has progressed or finished and only an update is needed, send `--kind fyi` and continue. FYIs never grant approval. Any action still lacking authorization remains a request.
+- If Carlos asks to save an HTML report or show-me artifact for reading in LAM, publish an Article using the recipe below. Publication continues without waiting for acknowledgement.
 
 Send one item per useful update or blocking event. For an informational update rejected for a missing recommendation, switch to `--kind fyi` and remove wait/decision flags. Never invent a filler recommendation such as "No action needed" to satisfy request validation.
 
@@ -67,3 +68,19 @@ FYIs reject `--wait`, `--choice`, `--check`, `--recommendation`, and `--recommen
 - Pass `--link` when there is a relevant URL, and `--ttl` when the item stops mattering after a while.
 - The phone notification shows at most 3 buttons; with 3 choices the Open/Reply buttons are still available inside the ntfy app.
 - Leave answering, marking seen, dismissing, and ticking checks to Carlos. As the sending agent, use `lam retract` to withdraw an obsolete item and `lam check add` to extend a checklist. Do not use `lam done` or `lam check tick` to answer your own requests.
+
+## Saved HTML Articles
+
+Prepare a mobile-friendly, static HTML publication copy with a title and short summary. Use ordinary HTML, flat CSS with literal values and `@media` rules, bundled PNG/JPEG/WebP images, and inline SVG shapes/text. Render Mermaid locally first, use SVG text labels in place of `foreignObject`, and flatten renderer styles to supported literal declarations. Runtime scripts/CDNs, remote images/fonts, CSS custom properties/`var()`, animation and unsupported SVG cause publication rejection. PDF/plain text use native download controls. Check the publication copy with the candidate Worker before claiming renderer compatibility. Repository details and the tested fixture are in `docs/articles.md` and `worker/test/fixtures/articles/show-me.html`.
+
+For `/tmp/report/index.html` referencing `images/chart.png` and `notes.txt`, use:
+
+```bash
+lam article publish --file /tmp/report/index.html --title "Report" --summary "Findings and next steps" --asset images/chart.png --asset notes.txt --silent
+```
+
+This uploads exactly the HTML, that PNG and that text file. Assets resolve relative to the HTML directory; an unrelated `credentials.env` stays local. Choose explicit files and local copies of needed images. The CLI neither scans directories or HTML references nor fetches remote resources. Use a canonical directory path with no symlinked components, including system aliases. Limits are 2 MiB HTML, 20 MiB per asset, 50 MiB total, and 50 additional assets. Publishing currently requires Unix file-handle safety support.
+
+Success prints the Article ID and returns immediately. `--silent` creates no notification job; ordinary publication queues a quiet notification, whose deployed scheduler and Android background delivery need separate acceptance. Inspect with `lam article list --read all --query "Report"`; Carlos opens with `lam article open ID` or the Articles tab. A visible, verified render marks read. `lam article read ID` and `lam article unread ID` explicitly update read state; leave these user actions to Carlos.
+
+Retries inside one publish attempt reuse its identity and snapshotted bytes. A fresh whole-command invocation creates a new identity and can duplicate a published report. On uncertain completion, retain the reported draft ID and inspect the library/server outcome before deciding to publish again. A failure after staging exits nonzero with the draft ID; rejected content remains unpublished. A read/unread conflict preserves the newer canonical state without replaying the write.
