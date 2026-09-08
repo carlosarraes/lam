@@ -4,6 +4,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-08-01",
   "observability": { "enabled": true },
+  "triggers": { "crons": ["* * * * *"] },
   "r2_buckets": [{ "binding": "ARTICLE_BUCKET", "bucket_name": "lam-articles", "remote": false }],
   "durable_objects": { "bindings": [
     { "name": "TOPIC", "class_name": "Topic" },
@@ -14,6 +15,6 @@
     { "tag": "v2", "new_sqlite_classes": ["EventStream"] }
   ],
   "d1_databases": [
-    { "binding": "DB", "database_name": "lam", "migrations_dir": "./migrations" }
+    { "binding": "DB", "database_name": "lam", "database_id": "9e1bdbc9-5ffd-4493-8635-f063d64f3b3c", "migrations_dir": "./migrations" }
   ]
 }
