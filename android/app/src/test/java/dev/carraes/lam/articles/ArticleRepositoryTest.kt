@@ -141,6 +141,28 @@ class ArticleRepositoryTest {
         assertNull(f.repo.asset(f.session.value!!, f.api.article, 1, false))
     }
 
+    @Test fun `mixed page content and explicit download accept an empty text attachment`() = runTest {
+        val emptySha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        val emptyAttachment = articleFixture("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").copy(assets = listOf(
+            ArticleAsset("index.html", "text/html", 20, "0".repeat(64), "inline"),
+            ArticleAsset("notes.txt", "text/plain", 0, emptySha256, "attachment"),
+        ))
+        val f = Fixture()
+        f.api.article = emptyAttachment
+        f.api.page = ArticlePage(listOf(articleFixture(), emptyAttachment), null)
+        f.api.bytes = ByteArray(0)
+
+        f.repo.refresh()
+
+        assertFalse(f.repo.state.value.failed)
+        assertEquals(setOf(articleFixture().id, emptyAttachment.id), f.repo.state.value.items.map { it.id }.toSet())
+        val loaded = f.repo.load(emptyAttachment.id)
+        assertNotNull(loaded)
+        assertEquals(emptySha256, loaded!!.article.assets[1].sha256)
+        assertArrayEquals(ByteArray(0), f.repo.asset(loaded.session, loaded.article, 1, attachment = true))
+        assertEquals(listOf(Triple(emptyAttachment.id, 1, 0L)), f.api.assetRequests)
+    }
+
     private class Fixture {
         val session = MutableStateFlow<ArticleSession?>(ArticleSession("account-a", "epoch-a"))
         val storage = MemoryArticleStorage()
@@ -178,6 +200,7 @@ internal class FakeArticleApi : ArticleApi {
     var listCalls = 0
     val returnedVersions = mutableListOf<Long>()
     val writes = mutableListOf<Pair<Boolean, Long>>()
+    val assetRequests = mutableListOf<Triple<String, Int, Long>>()
     override suspend fun list(query: String, read: String, cursor: String?): ArticlePage {
         val response = page
         listCalls++
@@ -197,5 +220,8 @@ internal class FakeArticleApi : ArticleApi {
         article = articleFixture(version = version + 1, read = read)
         return article
     }
-    override suspend fun asset(id: String, index: Int, limit: Long) = if (index == 2) "note".toByteArray() else bytes
+    override suspend fun asset(id: String, index: Int, limit: Long): ByteArray {
+        assetRequests += Triple(id, index, limit)
+        return if (index == 2) "note".toByteArray() else bytes
+    }
 }

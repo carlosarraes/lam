@@ -145,7 +145,8 @@ class ArticleRepository(private val storage: ArticleStorage, private val api: (A
         if (!isCurrent(captured)) return null
         val asset = article.assets.getOrNull(index) ?: return null
         if (if (attachment) asset.disposition != "attachment" else !asset.inlineImage) return null
-        if (asset.size !in 1..20L * 1024 * 1024) return null
+        val minimumSize = if (attachment) 0L else 1L
+        if (asset.size !in minimumSize..20L * 1024 * 1024) return null
         return try {
             val bytes = requireNotNull(api(captured)).asset(article.id, index, asset.size)
             if (isCurrent(captured) && bytes.size.toLong() == asset.size && sha256(bytes) == asset.sha256) bytes else null
@@ -175,6 +176,7 @@ class ArticleRepository(private val storage: ArticleStorage, private val api: (A
 internal fun validateArticle(article: Article) {
     require(article.id.matches(Regex("[a-f0-9-]{36}")) && article.version >= 0)
     require(article.assets.size in 1..51 && article.assets.count { it.path == "index.html" } == 1)
-    require(article.assets.all { it.size in 1..20L * 1024 * 1024 && it.sha256.matches(Regex("[a-f0-9]{64}")) })
+    require(article.assets.all { it.size in 0..20L * 1024 * 1024 && it.sha256.matches(Regex("[a-f0-9]{64}")) })
+    require(article.assets.none { it.inlineImage && it.size == 0L })
     require(article.assets.sumOf { it.size } <= 50L * 1024 * 1024)
 }
