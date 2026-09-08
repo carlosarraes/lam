@@ -2,6 +2,7 @@ package dev.carraes.lam.articles
 
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.test.*
 import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Assert.*
@@ -9,6 +10,37 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ArticleRepositoryTest {
+    @Test fun `delayed session collector cannot reset a refresh started by synchronous binding`() = runTest {
+        val f = Fixture()
+        f.repo.refresh()
+        f.session.value = ArticleSession("new-account", "new-epoch", 2)
+        val held = CompletableDeferred<Unit>()
+        f.api.beforeList = { held.await() }
+        val refreshing = async { f.repo.refresh() }
+        runCurrent()
+        f.repo.sessionChanged()
+        held.complete(Unit); refreshing.await()
+        assertEquals(listOf(f.api.article.id), f.repo.state.value.items.map { it.id })
+        assertFalse(f.repo.state.value.loading)
+    }
+
+    @Test fun `foreground invalidation during held refresh queues another canonical load`() = runTest {
+        val f = Fixture()
+        val events = kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.CONFLATED)
+        f.api.stream = events.receiveAsFlow()
+        val syncing = backgroundScope.launch { f.repo.reconcileForeground(0) }
+        runCurrent()
+        val held = CompletableDeferred<Unit>()
+        f.api.beforeList = { held.await() }
+        events.send(Unit); runCurrent()
+        f.api.page = ArticlePage(listOf(articleFixture(version = 3, read = true)), null)
+        events.send(Unit)
+        held.complete(Unit); runCurrent()
+        assertEquals(3L, f.repo.state.value.items.single().version)
+        assertNotNull(f.repo.state.value.items.single().readAt)
+        assertTrue(f.api.writes.isEmpty())
+        syncing.cancel()
+    }
     @Test fun `explicit content 401 denies cached HTML without a lifecycle or account transition`() = runTest {
         val f = Fixture()
         val loaded = f.repo.load(f.api.article.id)!!
@@ -130,6 +162,8 @@ internal class MemoryArticleStorage : ArticleStorage {
 }
 
 internal class FakeArticleApi : ArticleApi {
+    var stream: kotlinx.coroutines.flow.Flow<Unit> = kotlinx.coroutines.flow.emptyFlow()
+    override fun events() = stream
     var article = articleFixture()
     var page = ArticlePage(listOf(article), null)
     var conflict = false

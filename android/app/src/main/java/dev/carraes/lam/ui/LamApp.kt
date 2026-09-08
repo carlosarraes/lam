@@ -25,13 +25,13 @@ import kotlinx.coroutines.launch
 import dev.carraes.lam.articles.*
 
 @Composable
-fun LamApp(container: AppContainer, pairing: PairingViewModel) {
+fun LamApp(container: AppContainer, pairing: PairingViewModel, articleRoute: String? = null, onArticleRouteConsumed: (String) -> Unit = {}) {
     val session by container.deviceSettings.reconciliationSession.collectAsStateWithLifecycle()
     val owner = viewModel { PairedViewModels() }
     owner.bind(session)
     PairingScreen(pairing) {
         key(session) {
-            CompositionLocalProvider(LocalViewModelStoreOwner provides owner) { PairedApp(container) }
+            CompositionLocalProvider(LocalViewModelStoreOwner provides owner) { PairedApp(container, articleRoute, onArticleRouteConsumed) }
         }
     }
 }
@@ -47,7 +47,7 @@ internal class PairedViewModels : ViewModel(), ViewModelStoreOwner {
 }
 
 @Composable
-private fun PairedApp(container: AppContainer) {
+private fun PairedApp(container: AppContainer, articleRoute: String?, onArticleRouteConsumed: (String) -> Unit) {
         val requests = viewModel { RequestsViewModel(container.itemRepository, container.lifecycleReconciler::refresh) }
         val history = viewModel { HistoryViewModel(container.itemRepository, container.lifecycleReconciler.completedReconciliations) }
         val articles = viewModel { ArticleViewModel(container.articleRepository) }
@@ -56,6 +56,7 @@ private fun PairedApp(container: AppContainer) {
         val snackbar = remember { SnackbarHostState() }
         val feedbackScope = rememberCoroutineScope()
         LamNav(state, requests::setQuery, requests::setType, requests::setPriority, requests::clearFilters, requests::refresh,
+            articleRoute = articleRoute, onArticleRouteConsumed = onArticleRouteConsumed,
             onRequestAction = { id, dismiss -> action = id to dismiss },
             historyContent = { onRequests, onSettings ->
                 LifecycleStartEffect(history) {

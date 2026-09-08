@@ -3,6 +3,7 @@ package dev.carraes.lam.ui
 import android.net.Uri
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import dev.carraes.lam.ui.components.LocalArticlesNavigation
 import dev.carraes.lam.articles.ArticlesScreen
 import dev.carraes.lam.articles.ArticlesState
@@ -30,10 +31,18 @@ fun LamNav(state: RequestsState, onQuery: (String) -> Unit, onType: (ItemTypeDto
         ArticlesScreen(ArticlesState(), {}, {}, {}, {}, onArticle, {}, onRequests, onHistory, onSettings)
     },
     articleContent: @Composable (String, () -> Unit) -> Unit = { _, onBack -> androidx.compose.material3.TextButton(onBack) { androidx.compose.material3.Text("Back") } },
+    articleRoute: String? = null,
+    onArticleRouteConsumed: (String) -> Unit = {},
     detailContent: @Composable (String, () -> Unit) -> Unit = { _, onBack ->
         DecisionDetailScreen(DecisionState(loading = false, loadFailed = true), onBack)
     }) {
     val nav = rememberNavController()
+    LaunchedEffect(articleRoute) {
+        articleRoute?.let { id ->
+            nav.navigate("article/${Uri.encode(id)}") { launchSingleTop = true }
+            onArticleRouteConsumed(id)
+        }
+    }
     fun queue(route: String) { nav.navigate(route) { popUpTo("requests") { saveState = true }; launchSingleTop = true; restoreState = true } }
     CompositionLocalProvider(LocalArticlesNavigation provides { queue("articles") }) {
     NavHost(navController = nav, startDestination = "requests") {

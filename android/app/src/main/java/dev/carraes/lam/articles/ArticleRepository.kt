@@ -3,6 +3,8 @@ package dev.carraes.lam.articles
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
@@ -19,21 +21,43 @@ class ArticleRepository(private val storage: ArticleStorage, private val api: (A
     val state = mutableState.asStateFlow()
     private val generation = AtomicLong()
     private val rejected = ConcurrentHashMap.newKeySet<ArticleSession>()
+    private var boundSession: ArticleSession? = null
     fun isCurrent(captured: ArticleSession) = session() == captured && captured !in rejected
-    fun reset() { generation.incrementAndGet(); mutableState.value = ArticlesState() }
+    @Synchronized fun reset() { boundSession = session(); generation.incrementAndGet(); mutableState.value = ArticlesState() }
+    @Synchronized fun sessionChanged(): ArticleSession? {
+        val current = session()
+        if (boundSession != current) { boundSession = current; generation.incrementAndGet(); mutableState.value = ArticlesState() }
+        return current?.takeIf(::isCurrent)
+    }
+    suspend fun reconcileForeground(expectedGeneration: Long) {
+        val captured = sessionChanged()?.takeIf { it.generation == expectedGeneration } ?: return
+        refresh()
+        while (isCurrent(captured)) {
+            try {
+                val stream = api(captured) ?: return
+                // Open/reconnect and invalidations both trigger canonical GETs. Conflation retains
+                // one pending invalidation while a GET is running, including a newer read change.
+                stream.events().collect { if (isCurrent(captured)) refresh() }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) { if (rejectUnauthorized(captured, error)) return }
+            delay(5_000)
+        }
+    }
 
-    suspend fun refresh(query: String = state.value.query, read: String = state.value.readFilter) {
-        require(read in setOf("all", "read", "unread"))
-        val captured = session()?.takeIf(::isCurrent) ?: return reset()
+    suspend fun refresh(query: String? = null, read: String? = null) {
+        val captured = sessionChanged() ?: return reset()
+        val requestedQuery = query ?: state.value.query
+        val requestedRead = read ?: state.value.readFilter
+        require(requestedRead in setOf("all", "read", "unread"))
         val ticket = generation.incrementAndGet()
-        val sameQuery = state.value.query == query && state.value.readFilter == read
+        val sameQuery = state.value.query == requestedQuery && state.value.readFilter == requestedRead
         mutableState.value = if (sameQuery) state.value.copy(loading = true, failed = false)
-            else ArticlesState(query = query, readFilter = read, loading = true)
+            else ArticlesState(query = requestedQuery, readFilter = requestedRead, loading = true)
         fetchPage(captured, ticket, null)
     }
 
     suspend fun loadMore() {
-        val captured = session()?.takeIf(::isCurrent) ?: return
+        val captured = sessionChanged() ?: return
         val page = state.value
         if (page.loading || page.nextCursor == null) return
         mutableState.update { it.copy(loading = true, failed = false) }
@@ -63,7 +87,7 @@ class ArticleRepository(private val storage: ArticleStorage, private val api: (A
     }
 
     suspend fun load(id: String): LoadedArticle? {
-        val captured = session()?.takeIf(::isCurrent) ?: return null
+        val captured = sessionChanged() ?: return null
         try {
             val content = requireNotNull(api(captured)).content(id)
             validateArticle(content.article)

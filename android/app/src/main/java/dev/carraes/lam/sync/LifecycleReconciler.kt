@@ -15,6 +15,7 @@ class LifecycleReconciler(
     private val lifecycle: Lifecycle,
     scope: CoroutineScope,
     private val connectivity: StateFlow<ConnectivityStatus> = MutableStateFlow(ConnectivityStatus(true, 0)),
+    private val synchronizeForeground: suspend (Long) -> Unit = { awaitCancellation() },
 ) : AutoCloseable {
     private val owner = SupervisorJob(scope.coroutineContext[Job])
     private val work = CoroutineScope(scope.coroutineContext + owner)
@@ -30,6 +31,14 @@ class LifecycleReconciler(
 
     init {
         lifecycle.addObserver(observer)
+        work.launch {
+            combine(sessions, foreground, connectivity) { session, active, network -> Triple(session, active, network) }
+                .distinctUntilChanged().collectLatest { (session, active, network) ->
+                    if (session != null && session == sessions.value && active && network.available && network == connectivity.value) {
+                        synchronizeForeground(session)
+                    }
+                }
+        }
         work.launch {
             var seenForeground = false
             var observedSession: Long? = null

@@ -686,6 +686,7 @@ enum Job {
 }
 
 enum Msg {
+    ArticleInvalidated,
     Articles {
         page: crate::client::ArticlePage,
         generation: u64,
@@ -756,6 +757,43 @@ fn reload_item(client: &Client, id: &str, tx: &mpsc::Sender<Msg>) {
     });
 }
 
+fn mark_article_unread(
+    client: &Client,
+    id: &str,
+    version: u64,
+) -> (Option<Box<crate::client::Article>>, Option<String>) {
+    match client.set_article_read(id, false, version) {
+        Ok(crate::client::ArticleReadResult::Updated(article)) => (Some(article), None),
+        Ok(crate::client::ArticleReadResult::Conflict) => match client.article(id) {
+            Ok(article) => (Some(Box::new(article)), Some("Read state changed elsewhere; canonical state reloaded. Press u again to mark unread.".into())),
+            Err(error) => (None, Some(format!("Read state changed elsewhere; could not reload canonical state: {error}. Press R to refresh."))),
+        },
+        Err(error) => (None, Some(format!("unread failed: {error}"))),
+    }
+}
+
+fn refresh_articles(app: &mut App, jobs: &mpsc::Sender<Job>) {
+    if app.articles.loading {
+        app.articles.invalidated = true;
+        return;
+    }
+    app.articles.invalidated = false;
+    if let Some(Action::LoadArticles {
+        query,
+        read,
+        cursor,
+        generation,
+    }) = app.articles.reload()
+    {
+        let _ = jobs.send(Job::Articles {
+            query,
+            read,
+            cursor,
+            generation,
+        });
+    }
+}
+
 pub fn run(silent: bool) -> Result<i32> {
     let cfg = Config::load()?;
     let client = Client::new(&cfg)?;
@@ -800,11 +838,7 @@ pub fn run(silent: bool) -> Result<i32> {
                     continue;
                 }
                 Job::ArticleUnread { id, version } => {
-                    let (article, error) = match client.set_article_read(id, false, *version) {
-                        Ok(crate::client::ArticleReadResult::Updated(article)) => (Some(article), None),
-                        Ok(crate::client::ArticleReadResult::Conflict) => (client.article(id).ok().map(Box::new), Some("Read state changed elsewhere; canonical state reloaded. Press u again to mark unread.".into())),
-                        Err(error) => (None, Some(format!("unread failed: {error}"))),
-                    };
+                    let (article, error) = mark_article_unread(&client, id, *version);
                     let _ = net_tx.send(Msg::Article { article, error });
                     continue;
                 }
@@ -854,6 +888,13 @@ pub fn run(silent: bool) -> Result<i32> {
         }
     });
 
+    let article_cfg = cfg.clone();
+    let article_tx = tx.clone();
+    std::thread::spawn(move || {
+        crate::article_events::subscribe(&article_cfg, || {
+            let _ = article_tx.send(Msg::ArticleInvalidated);
+        })
+    });
     let stream_cfg = cfg.clone();
     std::thread::spawn(move || {
         watch::subscribe(
@@ -916,18 +957,25 @@ fn event_loop(
 
         while let Ok(msg) = rx.try_recv() {
             match msg {
+                Msg::ArticleInvalidated => refresh_articles(app, jobs),
                 Msg::Articles {
                     page,
                     generation,
                     first,
                 } => {
                     app.articles.add(page, generation, first);
+                    if generation == app.articles.generation && app.articles.invalidated {
+                        refresh_articles(app, jobs);
+                    }
                     app.set_busy(false);
                 }
                 Msg::ArticlesFailed { error, generation } => {
                     if generation == app.articles.generation {
                         app.articles.loading = false;
                         app.articles.error = Some(error);
+                        if app.articles.invalidated {
+                            refresh_articles(app, jobs);
+                        }
                     }
                     app.set_busy(false);
                 }

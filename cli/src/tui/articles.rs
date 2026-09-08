@@ -15,6 +15,11 @@ pub(super) struct ArticlesPane {
     pub loading: bool,
     pub query: String,
     pub read: usize,
+    applied_query: String,
+    applied_read: usize,
+    requested_query: String,
+    requested_read: usize,
+    pub invalidated: bool,
     pub generation: u64,
     pub error: Option<String>,
 }
@@ -36,6 +41,8 @@ impl ArticlesPane {
         }
         self.loading = true;
         self.error = None;
+        self.requested_query = self.query.clone();
+        self.requested_read = self.read;
         Some(Action::LoadArticles {
             query: self.query.clone(),
             read: self.read_filter().into(),
@@ -44,10 +51,22 @@ impl ArticlesPane {
         })
     }
 
+    pub fn reload(&mut self) -> Option<Action> {
+        // Reconnect must not submit text that is still being edited.
+        let query = std::mem::replace(&mut self.query, self.requested_query.clone());
+        let read = std::mem::replace(&mut self.read, self.requested_read);
+        let action = self.load(true);
+        self.query = query;
+        self.read = read;
+        action
+    }
+
     pub fn add(&mut self, page: ArticlePage, generation: u64, first: bool) {
         if generation != self.generation {
             return;
         }
+        self.applied_query = self.requested_query.clone();
+        self.applied_read = self.requested_read;
         let selected = self.items.get(self.selected).map(|row| row.id.clone());
         if first {
             // A delayed list cannot roll back an explicit read/unread result.
@@ -74,8 +93,9 @@ impl ArticlesPane {
             }
         }
         self.cursor = page.next_cursor;
-        self.items
-            .retain(|row| self.read == 0 || (self.read == 1) == row.read_at.is_none());
+        self.items.retain(|row| {
+            self.applied_read == 0 || (self.applied_read == 1) == row.read_at.is_none()
+        });
         self.loaded = true;
         self.loading = false;
         self.error = None;
@@ -93,8 +113,9 @@ impl ArticlesPane {
         {
             *row = article;
         }
-        self.items
-            .retain(|row| self.read == 0 || (self.read == 1) == row.read_at.is_none());
+        self.items.retain(|row| {
+            self.applied_read == 0 || (self.applied_read == 1) == row.read_at.is_none()
+        });
         self.selected = self.selected.min(self.items.len().saturating_sub(1));
     }
 }
@@ -171,10 +192,22 @@ impl App {
         .areas(frame.area());
         frame.render_widget(
             Paragraph::new(format!(
-                "lam  requests  history  [articles]   {}\nFilter: {}  /{}{}",
+                "lam  requests  history  [articles]   {}\nFilter: {}  /{}{}{}",
                 self.host,
-                self.articles.read_filter(),
-                self.articles.query,
+                ["all", "unread", "read"][self.articles.applied_read],
+                self.articles.applied_query,
+                if self.articles.query != self.articles.applied_query
+                    || self.articles.read != self.articles.applied_read
+                    || matches!(self.mode, Mode::Filter)
+                {
+                    format!(
+                        " · pending: {} /{}",
+                        self.articles.read_filter(),
+                        self.articles.query
+                    )
+                } else {
+                    String::new()
+                },
                 if matches!(self.mode, Mode::Filter) {
                     "█"
                 } else {
@@ -321,6 +354,109 @@ mod tests {
     }
 
     #[test]
+    fn failed_replacement_keeps_the_applied_filter_label_with_selectable_rows() {
+        let mut app = App::new("host".into());
+        app.handle(key('a'));
+        app.articles
+            .add(page(vec![article("one", true, 1)], None), 0, true);
+        app.handle(key('f'));
+        app.articles.loading = false;
+        app.articles.error = Some("offline".into());
+        assert!(render(&app).contains("Filter: all"));
+        assert!(render(&app).contains("pending: unread"));
+        assert_eq!(
+            app.handle(KeyEvent::from(KeyCode::Enter)),
+            Some(Action::OpenArticle("one".into()))
+        );
+    }
+
+    #[test]
+    fn typing_during_a_load_does_not_relabel_its_results_or_submit_search_on_invalidation() {
+        let mut app = App::new("host".into());
+        app.handle(key('a'));
+        app.handle(key('/'));
+        app.handle(key('x'));
+        app.articles
+            .add(page(vec![article("one", false, 0)], None), 0, true);
+        assert!(render(&app).contains("Filter: all  / · pending: all /x"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        super::super::refresh_articles(&mut app, &tx);
+        assert!(
+            matches!(rx.recv().unwrap(), super::super::Job::Articles { query, .. } if query.is_empty())
+        );
+        assert_eq!(app.articles.query, "x");
+    }
+
+    #[test]
+    fn invalidation_during_a_load_retains_a_canonical_refresh_after_that_load() {
+        let mut app = App::new("host".into());
+        let (tx, rx) = std::sync::mpsc::channel();
+        super::super::refresh_articles(&mut app, &tx);
+        let first = rx.recv().unwrap();
+        let super::super::Job::Articles { generation, .. } = first else {
+            panic!("expected article load")
+        };
+        super::super::refresh_articles(&mut app, &tx);
+        assert!(app.articles.invalidated);
+        assert!(rx.try_recv().is_err());
+        app.articles
+            .add(page(vec![article("one", false, 0)], None), generation, true);
+        if app.articles.invalidated {
+            super::super::refresh_articles(&mut app, &tx);
+        }
+        assert!(
+            matches!(rx.recv().unwrap(), super::super::Job::Articles { cursor: None, generation: next, .. } if next > generation)
+        );
+        app.articles.add(
+            page(vec![article("one", true, 1)], None),
+            app.articles.generation,
+            true,
+        );
+        assert_eq!(app.articles.items[0].version, 1);
+        assert!(app.articles.items[0].read_at.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_conflict_reload_reports_failure_and_explicit_refresh_without_retrying_write() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path(
+                "/v2/articles/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/read",
+            ))
+            .respond_with(ResponseTemplate::new(409))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/articles/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cfg = crate::config::Config {
+            server: server.uri(),
+            token: "test-token".into(),
+            topic: "test".into(),
+            ntfy: None,
+        };
+        let (article, error) = tokio::task::spawn_blocking(move || {
+            let client = crate::client::Client::new(&cfg).unwrap();
+            super::super::mark_article_unread(&client, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 2)
+        })
+        .await
+        .unwrap();
+        assert!(article.is_none());
+        let error = error.unwrap();
+        assert!(error.contains("could not reload"));
+        assert!(error.contains("Press R"));
+        assert!(!error.contains("Press u"));
+    }
+
+    #[test]
     fn search_filter_and_paging_keep_query_cursor_and_ignore_stale_generation() {
         let mut app = App::new("host".into());
         app.handle(key('a'));
@@ -386,7 +522,12 @@ mod tests {
         pane.add(page(vec![article("one", true, 1)], None), 0, true);
         assert!(pane.items[0].read_at.is_none());
         pane.read = 1;
-        pane.add(page(vec![article("two", true, 3)], None), 0, false);
+        pane.load(true);
+        pane.add(
+            page(vec![article("two", true, 3)], None),
+            pane.generation,
+            false,
+        );
         assert_eq!(pane.items.len(), 1);
     }
 }

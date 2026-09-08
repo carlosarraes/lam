@@ -14,6 +14,28 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class LifecycleReconcilerTest {
+    @Test fun articleStreamTracksForegroundConnectionAndSessionEvenWhenItemsAreCurrent() = runTest {
+        val owner = Owner(); val repo = RequestsFakeRepository()
+        repo.syncState.value = SyncState.Current(now)
+        val paired = MutableStateFlow<Long?>(1L)
+        val connectivity = MutableStateFlow(ConnectivityStatus(true, 0))
+        val started = mutableListOf<Long>(); var running = 0
+        val reconciler = LifecycleReconciler(repo, paired, owner.lifecycle, backgroundScope, connectivity,
+            synchronizeForeground = { session ->
+                started += session; running++
+                try { awaitCancellation() } finally { running-- }
+            })
+        owner.foreground(); runCurrent(); assertEquals(listOf(1L), started); assertEquals(1, running)
+        owner.background(); runCurrent(); assertEquals(0, running)
+        connectivity.value = ConnectivityStatus(false, 1); runCurrent()
+        connectivity.value = ConnectivityStatus(true, 2); runCurrent()
+        advanceTimeBy(600_000); runCurrent(); assertEquals(listOf(1L), started)
+        owner.foreground(); runCurrent(); assertEquals(listOf(1L, 1L), started)
+        paired.value = 2L; runCurrent(); assertEquals(listOf(1L, 1L, 2L), started); assertEquals(1, running)
+        connectivity.value = ConnectivityStatus(false, 3); runCurrent(); assertEquals(0, running)
+        connectivity.value = ConnectivityStatus(true, 4); runCurrent(); assertEquals(1, running)
+        reconciler.close(); runCurrent(); assertEquals(0, running)
+    }
     @Test fun newlyUsableConnectionAndManualRefreshShareOneFastReconciliation() = runTest {
         val tracker = ConnectivityTracker("vpn", true, initialVpn = true)
         val api = FakeApi()

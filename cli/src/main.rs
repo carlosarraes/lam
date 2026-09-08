@@ -294,3 +294,4 @@ mod tests {
         assert!(g.contains("lam push"));
     }
 }
+mod article_events;

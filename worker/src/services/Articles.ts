@@ -4,6 +4,7 @@ import { ArticleStorageError, ReadUpdate, type Article, type ArticleDraft, type 
 import { BadRequest, Conflict, DbError, NotFound } from "../domain/Item";
 import { readBoundedBody, validateManifest } from "../articles/manifest";
 import { prepareArticleHtml, validateArticleAsset } from "../articles/content";
+import { articleInvalidated } from "./Events";
 
 // LAM has one owner. Master credentials and active paired devices belong to this owner.
 const OWNER = "owner";
@@ -102,7 +103,8 @@ export class Articles extends Effect.Service<Articles>()("lam/Articles", {
       }
     }),
 
-    publish: (id: string) => operation(async ({ DB, ARTICLE_BUCKET }) => {
+    publish: (id: string) => operation(async (env) => {
+      const { DB, ARTICLE_BUCKET } = env;
       const row = await rowFor(DB, id);
       if (row.state === "published") return getArticle(DB, id);
       requireStaging(row);
@@ -134,7 +136,7 @@ export class Articles extends Effect.Service<Articles>()("lam/Articles", {
         if (!existing || existing.size !== canonical.byteLength || await sha256(await readBoundedBody(existing.body, canonical.byteLength)) !== canonicalHash)
           throw new Conflict({ id });
       }
-      await DB.batch([
+      const committed = await DB.batch([
         DB.prepare(`UPDATE articles SET state = 'published' WHERE id = ? AND owner_id = ? AND state = 'staging'
           AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`).bind(id, OWNER),
         DB.prepare(`INSERT INTO article_notification_jobs (article_id, next_attempt_at)
@@ -147,6 +149,7 @@ export class Articles extends Effect.Service<Articles>()("lam/Articles", {
         await storage(() => ARTICLE_BUCKET.delete(row.sanitized_html_key));
         throw new Conflict({ id });
       }
+      if (committed[0].meta.changes > 0) await articleInvalidated(env, { event: "article.published", article_id: id, version: current.version });
       return publicArticle(current, assets);
     }),
 
@@ -181,7 +184,8 @@ export class Articles extends Effect.Service<Articles>()("lam/Articles", {
       return { asset, object };
     }),
 
-    setRead: (id: string, input: ReadUpdate) => operation(async ({ DB }) => {
+    setRead: (id: string, input: ReadUpdate) => operation(async (env) => {
+      const { DB } = env;
       const update = Schema.decodeUnknownSync(ReadUpdate)(input, { onExcessProperty: "error" });
       await rowFor(DB, id, true);
       const row = await DB.prepare(`UPDATE articles SET read_at = ?, version = version + 1
@@ -189,6 +193,7 @@ export class Articles extends Effect.Service<Articles>()("lam/Articles", {
         .bind(update.read ? new Date().toISOString() : null, id, OWNER, update.version, update.read ? 1 : 0).first<ArticleRow>();
       const canonical = row ?? await rowFor(DB, id, true);
       if ((canonical.read_at !== null) !== update.read) throw new Conflict({ id });
+      if (row) await articleInvalidated(env, { event: "article.read_changed", article_id: id, version: row.version });
       return publicArticle(canonical, await assetsFor(DB, id));
     }),
 

@@ -50,7 +50,7 @@ class AppContainer(
 
     init {
         applicationScope.launch {
-            items.pairedSession.collect { articleRepository.reset() }
+            items.pairedSession.collect { articleRepository.sessionChanged() }
         }
     }
 
@@ -58,6 +58,7 @@ class AppContainer(
         itemRepository, items.reconciliationSession, ProcessLifecycleOwner.get().lifecycle,
         CoroutineScope(applicationScope.coroutineContext + Dispatchers.Main.immediate),
         connectivity.state,
+        synchronizeForeground = articleRepository::reconcileForeground,
     )
 
     val pairingRepository = PairingRepository(

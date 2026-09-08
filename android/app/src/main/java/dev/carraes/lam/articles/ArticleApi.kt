@@ -16,6 +16,7 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 interface ArticleApi {
+    fun events(): kotlinx.coroutines.flow.Flow<Unit> = kotlinx.coroutines.flow.emptyFlow()
     suspend fun list(query: String, read: String, cursor: String?): ArticlePage
     suspend fun get(id: String): Article
     suspend fun content(id: String): ArticleContent
@@ -30,6 +31,7 @@ class OkHttpArticleApi(private val baseUrl: HttpUrl, private val credential: () 
         .retryOnConnectionFailure(false).authenticator(Authenticator.NONE).proxyAuthenticator(Authenticator.NONE)
         .connectTimeout(10, TimeUnit.SECONDS).readTimeout(20, TimeUnit.SECONDS).callTimeout(30, TimeUnit.SECONDS).build()
     private fun url(vararg path: String) = baseUrl.newBuilder().apply { addPathSegments("v2/articles"); path.forEach(::addPathSegment) }.build()
+    override fun events() = articleEvents(client, baseUrl, credential)
     override suspend fun list(query: String, read: String, cursor: String?): ArticlePage {
         val url = url().newBuilder().addQueryParameter("q", query).addQueryParameter("read", read).apply {
             cursor?.let { addQueryParameter("cursor", it) }
