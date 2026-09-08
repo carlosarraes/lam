@@ -9,6 +9,17 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ArticleRepositoryTest {
+    @Test fun `explicit content 401 denies cached HTML without a lifecycle or account transition`() = runTest {
+        val f = Fixture()
+        val loaded = f.repo.load(f.api.article.id)!!
+        f.repo.refresh()
+        f.api.beforeContent = { throw ArticleHttpException(401) }
+        assertNull(f.repo.load(f.api.article.id))
+        assertFalse(f.repo.isCurrent(loaded.session))
+        assertTrue(f.repo.state.value.items.isEmpty())
+        assertNull(f.repo.load(f.api.article.id))
+    }
+
     @Test fun `cancelled cache lookup propagates cancellation instead of publishing a failed old load`() = runTest {
         val api = FakeArticleApi().apply { failContent = true }
         val storage = object : ArticleStorage {

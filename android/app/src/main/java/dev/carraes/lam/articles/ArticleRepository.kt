@@ -1,26 +1,30 @@
 package dev.carraes.lam.articles
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.serialization.encodeToString
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.ConcurrentHashMap
 
 data class ArticlesState(val items: List<Article> = emptyList(), val query: String = "", val readFilter: String = "all",
     val nextCursor: String? = null, val loading: Boolean = false, val failed: Boolean = false, val cached: Boolean = false)
 
-class ArticleRepository(private val storage: ArticleStorage, private val api: () -> ArticleApi?,
-    private val session: () -> ArticleSession?) {
+class ArticleRepository(private val storage: ArticleStorage, private val api: (ArticleSession) -> ArticleApi?,
+    private val session: () -> ArticleSession?, private val onUnauthorized: suspend (ArticleSession) -> Unit = {}) {
     private val mutableState = MutableStateFlow(ArticlesState())
     val state = mutableState.asStateFlow()
     private val generation = AtomicLong()
-    fun isCurrent(captured: ArticleSession) = session() == captured
+    private val rejected = ConcurrentHashMap.newKeySet<ArticleSession>()
+    fun isCurrent(captured: ArticleSession) = session() == captured && captured !in rejected
     fun reset() { generation.incrementAndGet(); mutableState.value = ArticlesState() }
 
     suspend fun refresh(query: String = state.value.query, read: String = state.value.readFilter) {
         require(read in setOf("all", "read", "unread"))
-        val captured = session() ?: return reset()
+        val captured = session()?.takeIf(::isCurrent) ?: return reset()
         val ticket = generation.incrementAndGet()
         val sameQuery = state.value.query == query && state.value.readFilter == read
         mutableState.value = if (sameQuery) state.value.copy(loading = true, failed = false)
@@ -29,7 +33,7 @@ class ArticleRepository(private val storage: ArticleStorage, private val api: ()
     }
 
     suspend fun loadMore() {
-        val captured = session() ?: return
+        val captured = session()?.takeIf(::isCurrent) ?: return
         val page = state.value
         if (page.loading || page.nextCursor == null) return
         mutableState.update { it.copy(loading = true, failed = false) }
@@ -40,7 +44,7 @@ class ArticleRepository(private val storage: ArticleStorage, private val api: ()
         val requested = state.value
         fun current() = isCurrent(captured) && generation.get() == ticket
         try {
-            val page = requireNotNull(api()).list(requested.query, requested.readFilter, cursor)
+            val page = requireNotNull(api(captured)).list(requested.query, requested.readFilter, cursor)
             require(page.items.size <= 25)
             val rows = page.items.map { validateArticle(it); ArticleEntity.from(captured.account, it) }
             if (!storage.save(rows, ::current) || !current()) return
@@ -49,7 +53,8 @@ class ArticleRepository(private val storage: ArticleStorage, private val api: ()
             mutableState.update { old -> old.copy(items = filter((if (cursor == null) canonical else old.items + canonical)
                 .associateBy { it.id }.values.toList(), old), nextCursor = page.nextCursor, loading = false, failed = false, cached = false) }
         } catch (cancelled: CancellationException) { throw cancelled }
-        catch (_: Exception) {
+        catch (error: Exception) {
+            if (rejectUnauthorized(captured, error)) return
             if (!current()) return
             val saved = runCatching { storage.list(captured.account).map { it.article() } }.getOrDefault(emptyList())
             if (current()) mutableState.update { it.copy(items = if (it.items.isEmpty()) filter(saved, it) else it.items,
@@ -58,9 +63,9 @@ class ArticleRepository(private val storage: ArticleStorage, private val api: ()
     }
 
     suspend fun load(id: String): LoadedArticle? {
-        val captured = session() ?: return null
+        val captured = session()?.takeIf(::isCurrent) ?: return null
         try {
-            val content = requireNotNull(api()).content(id)
+            val content = requireNotNull(api(captured)).content(id)
             validateArticle(content.article)
             require(content.article.id == id)
             val html = ArticleResourcePolicy(captured.epoch, content.article).assemble(content.parts)
@@ -69,7 +74,8 @@ class ArticleRepository(private val storage: ArticleStorage, private val api: ()
             if (!storage.save(listOf(ArticleEntity.from(captured.account, content.article, serialized)), { isCurrent(captured) })) return null
             return if (isCurrent(captured)) LoadedArticle(content.article, html, captured) else null
         } catch (cancelled: CancellationException) { throw cancelled }
-        catch (_: Exception) {
+        catch (error: Exception) {
+            if (rejectUnauthorized(captured, error)) return null
             if (!isCurrent(captured)) return null
             return try {
                 val row = storage.get(captured.account, id) ?: return null
@@ -86,14 +92,17 @@ class ArticleRepository(private val storage: ArticleStorage, private val api: ()
 
     suspend fun setRead(id: String, read: Boolean, version: Long, captured: ArticleSession? = session()): ReadResult {
         if (captured == null || !isCurrent(captured)) return ReadResult.FAILED
-        val client = api() ?: return ReadResult.FAILED
+        val client = api(captured) ?: return ReadResult.FAILED
         return try {
             val canonical = client.setRead(id, read, version)
             if (accept(captured, id, canonical)) ReadResult.SAVED else ReadResult.FAILED
         } catch (cancelled: CancellationException) { throw cancelled }
         catch (error: Exception) {
+            if (rejectUnauthorized(captured, error)) return ReadResult.FAILED
             if (error is ArticleHttpException && error.status == 409) {
-                try { accept(captured, id, client.get(id)) } catch (cancelled: CancellationException) { throw cancelled } catch (_: Exception) { /* Keep the visible version. */ }
+                try { accept(captured, id, client.get(id)) } catch (cancelled: CancellationException) { throw cancelled } catch (recoveryError: Exception) {
+                    if (rejectUnauthorized(captured, recoveryError)) return ReadResult.FAILED
+                }
                 ReadResult.CONFLICT
             } else ReadResult.FAILED
         }
@@ -114,9 +123,23 @@ class ArticleRepository(private val storage: ArticleStorage, private val api: ()
         if (if (attachment) asset.disposition != "attachment" else !asset.inlineImage) return null
         if (asset.size !in 1..20L * 1024 * 1024) return null
         return try {
-            val bytes = requireNotNull(api()).asset(article.id, index, asset.size)
+            val bytes = requireNotNull(api(captured)).asset(article.id, index, asset.size)
             if (isCurrent(captured) && bytes.size.toLong() == asset.size && sha256(bytes) == asset.sha256) bytes else null
-        } catch (cancelled: CancellationException) { throw cancelled } catch (_: Exception) { null }
+        } catch (cancelled: CancellationException) { throw cancelled } catch (error: Exception) {
+            rejectUnauthorized(captured, error)
+            null
+        }
+    }
+
+    private suspend fun rejectUnauthorized(captured: ArticleSession, error: Exception): Boolean {
+        if (error !is ArticleHttpException || error.status != 401) return false
+        if (session() == captured) {
+            // Deny cached content/resources before shared cleanup can suspend or fail.
+            rejected.add(captured)
+            if (session() == captured) reset()
+            withContext(NonCancellable) { onUnauthorized(captured) }
+        }
+        return true
     }
 
     private fun filter(articles: List<Article>, state: ArticlesState) = articles.filter {

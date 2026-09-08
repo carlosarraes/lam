@@ -33,6 +33,56 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ItemRepositoryTest {
+    @Test fun `new generation exposes coherent account while null pairing replay is held`() = runTest {
+        assertCoherentSnapshot(null)
+    }
+
+    @Test fun `new generation exposes coherent account while previous pairing replay is held`() = runTest {
+        assertCoherentSnapshot(PairedServer("https://old.example/", "old", "Old"))
+    }
+
+    private suspend fun TestScope.assertCoherentSnapshot(initial: PairedServer?) {
+            val credentials = FakeCredentials()
+            credentials.state.value = initial
+            credentials.publishCurrent()
+            val repo = DefaultItemRepository(MemoryStorage(), { FakeApi() }, credentials, backgroundScope)
+            runCurrent()
+            val replacement = PairedServer("https://new.example/", "new", "New")
+            val observed = mutableListOf<Pair<PairedServer?, PairedSession?>>()
+            val collector = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+                repo.reconciliationSession.collect { generation ->
+                    if (generation != null) observed += repo.credentialStore.observe().first() to repo.pairedSession.value
+                }
+            }
+            observed.clear()
+            credentials.publishChanges = false
+            repo.credentialStore.save(replacement, "replacement")
+            val (heldReplay, snapshot) = observed.single()
+            assertEquals(initial, heldReplay)
+            assertEquals(replacement, snapshot!!.server)
+            assertEquals(repo.reconciliationSession.value, snapshot.generation)
+            assertEquals(replacement, repo.pairedSession.value!!.server)
+            collector.cancel()
+    }
+
+    @Test fun `conditional rejection clears current credentials and cached items but not replacement`() = runTest {
+        val f = fixture()
+        f.repo.refresh()
+        val old = f.repo.pairedSession.value!!
+        val replacement = PairedServer("https://other.example/", "other", "Phone")
+        f.repo.credentialStore.save(replacement, "replacement")
+        f.repo.refresh()
+        f.repo.rejectCredential(old.generation)
+        assertEquals(replacement, f.credentials.state.value)
+        assertFalse(f.repo.openItems.first().isEmpty())
+        f.repo.rejectCredential(f.repo.pairedSession.value!!.generation)
+        assertNull(f.credentials.state.value)
+        assertNull(f.repo.pairedSession.value)
+        assertNull(f.repo.reconciliationSession.value)
+        assertTrue(f.repo.openItems.first().isEmpty())
+        assertEquals(SyncState.Revoked, f.repo.syncState.value)
+    }
+
     @Test fun `seen closes queue but preserves canonical readable item and history`() = runTest {
         val f = fixture()
         f.api.open = listOf(item().copy(kind = ItemKindDto.FYI))

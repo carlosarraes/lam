@@ -29,6 +29,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
+internal data class PairedSession(val generation: Long, val server: PairedServer)
+
 internal class DefaultItemRepository(
     private val storage: ItemStorage,
     private val apiProvider: () -> LamApi?,
@@ -72,7 +74,7 @@ internal class DefaultItemRepository(
                 if (generation != expectedSession || paired == null) null
                 else apiProvider()?.let { Session(generation, it, connectivity.value.epoch) }
             } ?: return@withLock false
-            clearSession(revoked = false, expected = current)
+            clearSession(revoked = false, expectedGeneration = current.generation)
             true
         }
     }
@@ -85,6 +87,8 @@ internal class DefaultItemRepository(
     // Opaque process-local identity, published only after canonical session setup completes.
     private val session = MutableStateFlow<Long?>(null)
     override val reconciliationSession = session.asStateFlow()
+    private val pairedSnapshot = MutableStateFlow<PairedSession?>(null)
+    val pairedSession = pairedSnapshot.asStateFlow()
     private var paired: PairedServer? = null
     private var lastSuccess: Instant? = null
     private var reconciledConnectionEpoch: Long? = null
@@ -159,6 +163,7 @@ internal class DefaultItemRepository(
                         } catch (error: Exception) {
                             failures += error
                         } finally {
+                            pairedSnapshot.value = paired?.let { PairedSession(generation, it) }
                             session.value = paired?.let { generation }
                             pairing.tryEmit(paired)
                             initialized.complete(Unit)
@@ -298,6 +303,7 @@ internal class DefaultItemRepository(
                     credentials.save(server, credential)
                     stateLock.withLock {
                         paired = server
+                        pairedSnapshot.value = PairedSession(generation, server)
                         session.value = generation
                         pairing.tryEmit(server)
                     }
@@ -404,23 +410,28 @@ internal class DefaultItemRepository(
             if (recentErrors.size > 20) recentErrors.removeFirst()
         }
         if (error is ApiError.Unauthorized) {
-            withContext(NonCancellable) {
-                credentialChanges.withLock {
-                    try {
-                        clearSession(revoked = true, expected = session)
-                    } catch (cleanupError: SessionCleanupException) {
-                        errorEvents.trySend(cleanupError)
-                    }
-                }
-            }
+            rejectCredential(session.generation)
         } else {
             commit(session) { state.value = SyncState.Stale(lastSuccess, error) }
         }
         if (emit && isCurrent(session)) errorEvents.trySend(error)
     }
 
+    /** A known bearer rejection is local teardown, never a second remote revoke request. */
+    suspend fun rejectCredential(expectedGeneration: Long) = withContext(NonCancellable) {
+        initialized.await()
+        credentialChanges.withLock {
+            try {
+                clearSession(revoked = true, expectedGeneration = expectedGeneration)
+            } catch (cleanupError: SessionCleanupException) {
+                errorEvents.trySend(cleanupError)
+            }
+        }
+    }
+
     private fun invalidateSessionLocked(revoked: Boolean) {
         generation++
+        pairedSnapshot.value = null
         session.value = null
         paired = null
         lastSuccess = null
@@ -432,10 +443,10 @@ internal class DefaultItemRepository(
     }
 
     // The caller holds credentialChanges, so teardown cannot erase a concurrent replacement.
-    private suspend fun clearSession(revoked: Boolean, expected: Session? = null) {
+    private suspend fun clearSession(revoked: Boolean, expectedGeneration: Long? = null) {
         val failures = mutableListOf<Exception>()
         val invalidated = stateLock.withLock {
-            if (expected != null && expected.generation != generation) false else {
+            if (expectedGeneration != null && expectedGeneration != generation) false else {
                 invalidateSessionLocked(revoked)
                 pairing.tryEmit(null)
                 try {

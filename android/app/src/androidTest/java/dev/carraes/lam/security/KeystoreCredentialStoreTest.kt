@@ -31,6 +31,14 @@ import org.junit.Before
 import org.junit.Test
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import androidx.room.Room
+import dev.carraes.lam.articles.*
+import dev.carraes.lam.items.DefaultItemRepository
+import dev.carraes.lam.items.LamDatabase
+import dev.carraes.lam.items.RoomItemStorage
+import dev.carraes.lam.items.SyncState
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.JsonPrimitive
 
 class KeystoreCredentialStoreTest {
     private lateinit var context: Context
@@ -44,6 +52,52 @@ class KeystoreCredentialStoreTest {
     @After
     fun tearDown() = runBlocking {
         eraseTestState()
+    }
+
+    @Test
+    fun article401ClearsRoomAndKeystoreButOldSnapshotCannotEraseReplacement() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val database = Room.inMemoryDatabaseBuilder(context, LamDatabase::class.java).build()
+        val composition = createCredentialComposition(context, scope = scope)
+        try {
+            MockWebServer().use { server ->
+                val items = DefaultItemRepository(RoomItemStorage(database), composition::api, composition.credentialStore, scope)
+                val paired = pairedServer().copy(serverUrl = server.url("/").toString())
+                items.credentialStore.save(paired, CREDENTIAL)
+                val binding = ArticleSessionBinding(items.pairedSession, composition::articleApi)
+                val cache = RoomArticleStorage(database)
+                val repository = ArticleRepository(cache, binding::api, binding::current) { items.rejectCredential(it.generation) }
+                val article = Article("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "Private", "Summary", "Agent", "host", "lam",
+                    "2026-09-08T00:00:00Z", null, 0, listOf(ArticleAsset("index.html", "text/html", 1, "0".repeat(64), "inline")))
+                val body = articleJson.encodeToString(ArticleContent(article, listOf(JsonPrimitive("<p>Private content</p>"))))
+                server.enqueue(MockResponse().setBody(body))
+                val loaded = requireNotNull(repository.load(article.id))
+                val oldApi = requireNotNull(binding.api(loaded.session))
+                assertEquals("Bearer $CREDENTIAL", server.takeRequest().getHeader("Authorization"))
+                server.enqueue(MockResponse().setResponseCode(401))
+                assertNull(repository.load(article.id))
+                assertEquals(2, server.requestCount)
+                assertTrue(cache.list(loaded.session.account).isEmpty())
+                assertNull(binding.current())
+                assertNull(composition.credentialStore.observe().first())
+                assertEquals(SyncState.Revoked, items.syncState.value)
+
+                items.credentialStore.save(paired, "synthetic-article-replacement")
+                server.enqueue(MockResponse().setBody(body))
+                val replacement = requireNotNull(repository.load(article.id))
+                items.rejectCredential(loaded.session.generation)
+                assertTrue(repository.isCurrent(replacement.session))
+                assertFalse(cache.list(replacement.session.account).isEmpty())
+                assertEquals(paired, composition.credentialStore.observe().first())
+                val failure = runCatching { oldApi.content(article.id) }.exceptionOrNull()
+                assertTrue(failure is ArticleHttpException && failure.status == 401)
+                assertEquals("Old client cannot send the replacement credential", 3, server.requestCount)
+            }
+        } finally {
+            composition.credentialStore.clear()
+            scope.cancel()
+            database.close()
+        }
     }
 
     @Test

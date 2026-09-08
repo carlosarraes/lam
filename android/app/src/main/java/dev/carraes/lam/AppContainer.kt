@@ -21,7 +21,6 @@ import dev.carraes.lam.sync.AndroidConnectivityMonitor
 import dev.carraes.lam.items.DeviceSettings
 import dev.carraes.lam.diagnostics.Diagnostics
 import dev.carraes.lam.articles.*
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 class AppContainer(
@@ -45,24 +44,13 @@ class AppContainer(
 
     val credentialStore: CredentialStore = items.credentialStore
 
-    @Volatile private var articleSession: Pair<Long, ArticleSession>? = null
-    val articleRepository = ArticleRepository(RoomArticleStorage(database), credentials::articleApi) {
-        articleSession?.takeIf { it.first == items.reconciliationSession.value }?.second
-    }
+    private val articleSessions = ArticleSessionBinding(items.pairedSession, credentials::articleApi)
+    val articleRepository = ArticleRepository(RoomArticleStorage(database), articleSessions::api, articleSessions::current,
+        onUnauthorized = { items.rejectCredential(it.generation) })
 
     init {
         applicationScope.launch {
-            items.reconciliationSession.collect { generation ->
-                articleSession = null
-                articleRepository.reset()
-                if (generation != null) {
-                    val device = credentialStore.observe().first()
-                    if (device != null && items.reconciliationSession.value == generation) {
-                        val account = sha256("${device.serverUrl}\n${device.deviceId}".toByteArray())
-                        articleSession = generation to ArticleSession(account, java.util.UUID.randomUUID().toString())
-                    }
-                }
-            }
+            items.pairedSession.collect { articleRepository.reset() }
         }
     }
 

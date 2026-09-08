@@ -26,7 +26,7 @@ data class ArticlePage(val items: List<Article>, @SerialName("next_cursor") val 
 @Serializable
 data class ArticleContent(val article: Article, val parts: List<JsonElement>)
 
-data class ArticleSession(val account: String, val epoch: String)
+data class ArticleSession(val account: String, val epoch: String, val generation: Long = 0)
 data class LoadedArticle(val article: Article, val html: String, val session: ArticleSession, val cached: Boolean = false)
 enum class ReadResult { SAVED, CONFLICT, FAILED }
 
