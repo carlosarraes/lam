@@ -126,7 +126,10 @@ export class Articles extends Effect.Service<Articles>()("lam/Articles", {
       const conditions = ["owner_id = ?", "state = 'published'"];
       const values: (string | number)[] = [OWNER];
       if (read !== "all") conditions.push(`read_at IS ${read === "read" ? "NOT " : ""}NULL`);
-      if (q) { conditions.push("(instr(lower(title), lower(?)) > 0 OR instr(lower(summary), lower(?)) > 0)"); values.push(q, q); }
+      if (q) {
+        conditions.push("(instr(lower(title), lower(?)) > 0 OR instr(lower(summary), lower(?)) > 0 OR instr(lower(name), lower(?)) > 0)");
+        values.push(q, q, q);
+      }
       if (cursor) { conditions.push("(created_at < ? OR (created_at = ? AND id < ?))"); values.push(cursor.created_at, cursor.created_at, cursor.id); }
       const rows = (await DB.prepare(`SELECT * FROM articles WHERE ${conditions.join(" AND ")} ORDER BY created_at DESC, id DESC LIMIT ?`).bind(...values, PAGE_SIZE + 1).all<ArticleRow>()).results;
       const page = rows.slice(0, PAGE_SIZE);

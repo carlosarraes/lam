@@ -31,8 +31,8 @@ async function device() {
 }
 
 // Published fixtures bypass no production route. They represent Task 2's persisted result.
-async function published(title = "Report", created = "2026-09-01T12:00:00.000Z") {
-  const { id } = await stage({ ...await draft(), title });
+async function published(title = "Report", created = "2026-09-01T12:00:00.000Z", name = "") {
+  const { id } = await stage({ ...await draft(), title, name });
   expect((await request(`/${id}/assets/0`, "PUT", html)).status).toBe(204);
   const row = await env.DB.prepare("SELECT sanitized_html_key FROM articles WHERE id = ?").bind(id).first<{ sanitized_html_key: string }>();
   await env.ARTICLE_BUCKET.put(row!.sanitized_html_key, "<!doctype html><html><body>Sanitized report</body></html>");
@@ -285,5 +285,13 @@ describe("private article staging", () => {
     await expect(statement()).rejects.toThrow();
     const job = await env.DB.prepare("SELECT state, attempts, delivered_at FROM article_notification_jobs WHERE article_id = ?").bind(id).first();
     expect(job).toEqual({ state: "pending", attempts: 0, delivered_at: null });
+  });
+
+  it("finds a published article by agent name when title and summary do not match", async () => {
+    const name = `agent-${crypto.randomUUID()}`;
+    const id = await published("Unrelated title", "2026-09-01T12:00:00.000Z", name);
+    await stage({ ...await draft(), name });
+    const page = await (await request(`?q=${name}`)).json<{ items: { id: string }[] }>();
+    expect(page.items.map(item => item.id)).toEqual([id]);
   });
 });
