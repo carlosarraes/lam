@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
-import { describe, expect, it } from "vitest";
-import { parse, type DefaultTreeAdapterMap } from "parse5";
+import { describe, expect, it, vi } from "vitest";
+import { parse, Token, type DefaultTreeAdapterMap } from "parse5";
 import { prepareArticleHtml, validateArticleAsset } from "../src/articles/content";
 import type { Asset } from "../src/domain/Article";
 import staticHtml from "./fixtures/articles/static.html?raw";
@@ -89,6 +89,22 @@ describe("static article content", () => {
   it("bounds HTML bytes, tree depth, node count and CSS nesting before recursive parsing", () => {
     for (const html of ["a".repeat(2 * 1024 * 1024 + 1), "<div>".repeat(100) + "x" + "</div>".repeat(100), "<br>".repeat(25000), `<p style="width:${"calc(".repeat(1000)}1px${")".repeat(1000)}">x</p>`])
       expect(() => prepareArticleHtml(html, assets)).toThrow(/limit|depth|nesting/i);
+  });
+
+  it("rejects oversized attribute lists before more than 64 duplicate-name lookups", () => {
+    const source = '<!doctype html><div ' + Array.from({ length: 80000 }, (_, index) => `a${index}=""`).join(" ") + '>x</div>';
+    // Call through to the real parser lookup. Counting its work avoids a timing-only assertion.
+    const lookup = vi.spyOn(Token, "getTokenAttr");
+    try {
+      expect(() => prepareArticleHtml(source, assets)).toThrow(/attribute limit/);
+      expect(lookup.mock.calls.length).toBe(64);
+    } finally { lookup.mockRestore(); }
+  }, 30000);
+
+  it("preserves long quoted attribute values containing whitespace and tag-like text", () => {
+    const title = "quoted > data < words = value ".repeat(2000);
+    const output = prepareArticleHtml(`<p title="${title}">Readable text</p>`, assets);
+    expect(attr(elements(output).find(node => node.tagName === "p")!, "title")).toBe(title);
   });
 
   it("screens real JPEG and WebP frames and rejects truncated or animated containers", () => {

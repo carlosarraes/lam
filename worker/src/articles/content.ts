@@ -1,4 +1,4 @@
-import { defaultTreeAdapter, html as namespaces, parse, serialize, type DefaultTreeAdapterTypes as Html, type TreeAdapter } from "parse5";
+import { defaultTreeAdapter, html as namespaces, Parser, serialize, Tokenizer, type DefaultTreeAdapterTypes as Html, type TreeAdapter } from "parse5";
 import * as css from "css-tree";
 import type { Asset } from "../domain/Article";
 import { BadRequest } from "../domain/Item";
@@ -34,6 +34,17 @@ const functions = words("rgb rgba hsl hsla hwb lab lch oklab oklch calc min max 
 const cssNodes = words("StyleSheet Atrule AtrulePrelude MediaQueryList MediaQuery Condition Feature MediaFeature Ratio Block Rule SelectorList Selector TypeSelector ClassSelector IdSelector Combinator PseudoClassSelector Declaration DeclarationList Value Identifier Dimension Number Percentage Hash String Operator Function Url WhiteSpace Parentheses");
 const fragment = (value: string) => /^#[A-Za-z_][A-Za-z0-9_.:-]*$/.test(value);
 const raster = new Set(["image/png", "image/jpeg", "image/webp"]);
+
+// parse5 checks each attribute name against the existing list before creating an element.
+// Bound that quadratic work at tokenization, not in the later tree adapter. This protected
+// hook is covered by a real lookup-count regression and must be checked on parser upgrades.
+class ArticleTokenizer extends Tokenizer {
+  protected override _createAttr(firstCharacter: string): void {
+    if (this.currentToken && "attrs" in this.currentToken && this.currentToken.attrs.length >= 64)
+      unsupported("HTML attribute limit exceeded; at most 64 attributes per tag");
+    super._createAttr(firstCharacter);
+  }
+}
 
 /** Format screening, not a media decoder or PDF sanitizer. Downloads stay opaque. */
 export function validateArticleAsset(bytes: Uint8Array<ArrayBuffer>, asset: Asset): void {
@@ -183,9 +194,12 @@ export function prepareArticleHtml(source: string, assets: readonly Asset[]): st
     appendChild(parent, child) { checkDepth(parent); defaultTreeAdapter.appendChild(parent, child); },
     insertBefore(parent, child, reference) { checkDepth(parent); defaultTreeAdapter.insertBefore(parent, child, reference); },
   };
-  const document = parse(source, { treeAdapter: adapter, onParseError(error) {
+  const parser = new Parser({ treeAdapter: adapter, onParseError(error) {
     if (error.code !== "missing-doctype") unsupported(`malformed HTML (${error.code})`);
   } });
+  parser.tokenizer = new ArticleTokenizer(parser.options, parser);
+  parser.tokenizer.write(source, true);
+  const document = parser.document;
   const visit = (parent: Html.ParentNode) => {
     parent.childNodes = parent.childNodes.filter(node => node.nodeName !== "#comment" && node.nodeName !== "#documentType");
     for (const node of parent.childNodes) {
