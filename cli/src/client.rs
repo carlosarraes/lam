@@ -1,7 +1,8 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use reqwest::blocking::{Client as Http, RequestBuilder, Response};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::time::Duration;
 
 use crate::config::Config;
@@ -117,6 +118,69 @@ pub struct NewItem {
     pub ttl: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArticleAsset {
+    pub path: String,
+    pub media_type: String,
+    pub size: u64,
+    pub sha256: String,
+    pub disposition: ArticleAssetDisposition,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArticleAssetDisposition {
+    Inline,
+    Attachment,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ArticleDraft {
+    pub title: String,
+    pub summary: String,
+    pub name: String,
+    pub source_host: String,
+    pub source_project: String,
+    pub silent: bool,
+    pub assets: Vec<ArticleAsset>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Article {
+    pub id: String,
+    pub title: String,
+    pub summary: String,
+    pub name: String,
+    pub source_host: String,
+    pub source_project: String,
+    pub created_at: String,
+    pub read_at: Option<String>,
+    pub version: u64,
+    pub assets: Vec<ArticleAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ArticlePage {
+    pub items: Vec<Article>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArticleUploadCreated {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArticleError {
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ArticleViewSession {
+    pub url: String,
+    pub expires_at: String,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct Resolution {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -198,6 +262,12 @@ impl Client {
             .bearer_auth(&self.token)
     }
 
+    fn put(&self, path: &str) -> RequestBuilder {
+        self.http
+            .put(format!("{}{}", self.base, path))
+            .bearer_auth(&self.token)
+    }
+
     fn delete(&self, path: &str) -> RequestBuilder {
         self.http
             .delete(format!("{}{}", self.base, path))
@@ -211,6 +281,178 @@ impl Client {
         }
         let msg = res.text().unwrap_or_default();
         bail!("server returned {status}: {msg}");
+    }
+
+    fn transient(status: StatusCode) -> bool {
+        status == StatusCode::REQUEST_TIMEOUT
+            || status == StatusCode::TOO_EARLY
+            || status == StatusCode::TOO_MANY_REQUESTS
+            || status.is_server_error()
+    }
+
+    fn send_article_with_retry(
+        &self,
+        mut request: impl FnMut() -> RequestBuilder,
+    ) -> Result<Response> {
+        const ATTEMPTS: usize = 3;
+        for attempt in 0..ATTEMPTS {
+            match request().send() {
+                Ok(response) if Self::transient(response.status()) && attempt + 1 < ATTEMPTS => {}
+                Ok(response) => return Ok(response),
+                Err(_) if attempt + 1 < ATTEMPTS => {}
+                Err(error) => return Err(error.into()),
+            }
+            std::thread::sleep(Duration::from_millis(25 * (attempt as u64 + 1)));
+        }
+        unreachable!("article retry loop returns on its final attempt")
+    }
+
+    fn article_ok(&self, response: Response) -> Result<Response> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let mut bytes = Vec::new();
+        response
+            .take(16 * 1024)
+            .read_to_end(&mut bytes)
+            .context("cannot read article error response")?;
+        let body = String::from_utf8_lossy(&bytes);
+        let message = serde_json::from_str::<ArticleError>(&body)
+            .map(|error| error.error)
+            .unwrap_or_else(|_| body.into_owned());
+        let message = Self::redact_article_diagnostics(&message.replace(&self.token, "[redacted]"));
+        bail!("server returned {status}: {message}")
+    }
+
+    fn redact_article_diagnostics(message: &str) -> String {
+        let mut rest = message;
+        let mut redacted = String::with_capacity(message.len());
+        loop {
+            let http = rest.find("http://");
+            let https = rest.find("https://");
+            let Some(start) = http.into_iter().chain(https).min() else {
+                redacted.push_str(rest);
+                return redacted;
+            };
+            redacted.push_str(&rest[..start]);
+            redacted.push_str("[redacted URL]");
+            let url = &rest[start..];
+            let end = url
+                .char_indices()
+                .find_map(|(index, character)| {
+                    (character.is_whitespace()
+                        || matches!(character, '\"' | '\'' | '<' | '>' | ')' | ']'))
+                    .then_some(index)
+                })
+                .unwrap_or(url.len());
+            rest = &url[end..];
+        }
+    }
+
+    fn validate_article_id(id: &str, source: &str) -> Result<()> {
+        let valid =
+            uuid::Uuid::parse_str(id).is_ok_and(|parsed| parsed.hyphenated().to_string() == id);
+        if !valid {
+            if source.is_empty() {
+                bail!("invalid article ID");
+            }
+            bail!("invalid article {source} ID");
+        }
+        Ok(())
+    }
+
+    pub fn create_article_upload(
+        &self,
+        draft: &ArticleDraft,
+        idempotency_key: &str,
+    ) -> Result<String> {
+        let response = self.send_article_with_retry(|| {
+            self.post("/v2/articles/uploads")
+                .header("Idempotency-Key", idempotency_key)
+                .json(draft)
+        })?;
+        if response.status() == StatusCode::NOT_FOUND {
+            bail!("server upgrade required: article publishing needs POST /v2/articles/uploads");
+        }
+        let id = self
+            .article_ok(response)?
+            .json::<ArticleUploadCreated>()?
+            .id;
+        Self::validate_article_id(&id, "draft")?;
+        Ok(id)
+    }
+
+    pub fn upload_article_asset(&self, id: &str, index: usize, bytes: &[u8]) -> Result<()> {
+        Self::validate_article_id(id, "")?;
+        let path = format!("/v2/articles/{id}/assets/{index}");
+        let response = self.send_article_with_retry(|| self.put(&path).body(bytes.to_vec()))?;
+        self.article_ok(response)?;
+        Ok(())
+    }
+
+    pub fn publish_article(&self, id: &str) -> Result<Article> {
+        Self::validate_article_id(id, "")?;
+        let path = format!("/v2/articles/{id}/publish");
+        let response = self.send_article_with_retry(|| self.post(&path))?;
+        Ok(self.article_ok(response)?.json()?)
+    }
+
+    pub fn article_page(
+        &self,
+        read: &str,
+        query: Option<&str>,
+        cursor: Option<&str>,
+    ) -> Result<ArticlePage> {
+        let mut request = self.get("/v2/articles").query(&[("read", read)]);
+        if let Some(query) = query {
+            request = request.query(&[("q", query)]);
+        }
+        if let Some(cursor) = cursor {
+            request = request.query(&[("cursor", cursor)]);
+        }
+        let response = request.send()?;
+        if response.status() == StatusCode::NOT_FOUND {
+            bail!("server upgrade required: article listing needs GET /v2/articles");
+        }
+        Ok(self.article_ok(response)?.json()?)
+    }
+
+    pub fn article(&self, id: &str) -> Result<Article> {
+        Self::validate_article_id(id, "")?;
+        Ok(self
+            .article_ok(self.get(&format!("/v2/articles/{id}")).send()?)?
+            .json()?)
+    }
+
+    pub fn set_article_read(&self, id: &str, read: bool, version: u64) -> Result<Article> {
+        Self::validate_article_id(id, "")?;
+        Ok(self
+            .article_ok(
+                self.put(&format!("/v2/articles/{id}/read"))
+                    .json(&serde_json::json!({ "read": read, "version": version }))
+                    .send()?,
+            )?
+            .json()?)
+    }
+
+    pub fn create_article_view_session(&self, id: &str) -> Result<ArticleViewSession> {
+        Self::validate_article_id(id, "")?;
+        let response = self
+            .post(&format!("/v2/articles/{id}/view-session"))
+            .send()?;
+        if response.status() == StatusCode::NOT_FOUND {
+            bail!(
+                "server upgrade required: article viewing needs POST /v2/articles/:id/view-session"
+            );
+        }
+        if !response.status().is_success() {
+            bail!(
+                "article viewer session request failed with {}",
+                response.status()
+            );
+        }
+        Ok(response.json()?)
     }
 
     pub fn push(&self, item: &NewItem) -> Result<Item> {

@@ -1,3 +1,4 @@
+mod articles;
 mod client;
 mod commands;
 mod config;
@@ -36,6 +37,9 @@ fn llm_guide() -> &'static str {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Publish and read private HTML articles
+    #[command(subcommand)]
+    Article(ArticleCmd),
     /// Write ~/.config/lam/config.toml
     Init {
         #[arg(long)]
@@ -137,6 +141,36 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum ArticleCmd {
+    /// Publish an HTML file and explicitly listed local assets
+    Publish {
+        #[arg(long)]
+        file: std::path::PathBuf,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        summary: String,
+        #[arg(long = "asset")]
+        assets: Vec<String>,
+        #[arg(long)]
+        silent: bool,
+    },
+    /// List published articles
+    List {
+        #[arg(long, value_enum, default_value = "all")]
+        read: articles::ReadFilter,
+        #[arg(long)]
+        query: Option<String>,
+    },
+    /// Mark an article read
+    Read { id: String },
+    /// Mark an article unread
+    Unread { id: String },
+    /// Open an article in the isolated browser viewer
+    Open { id: String },
+}
+
+#[derive(Subcommand)]
 enum CheckCmd {
     /// Append a check to an open item (agent side); re-notifies
     Add { id: String, label: String },
@@ -172,6 +206,23 @@ fn main() {
 
 fn run(cmd: Cmd) -> Result<i32> {
     match cmd {
+        Cmd::Article(ArticleCmd::Publish {
+            file,
+            title,
+            summary,
+            assets,
+            silent,
+        }) => articles::publish(articles::PublishArgs {
+            file,
+            title,
+            summary,
+            assets,
+            silent,
+        }),
+        Cmd::Article(ArticleCmd::List { read, query }) => articles::list(read, query.as_deref()),
+        Cmd::Article(ArticleCmd::Read { id }) => articles::set_read(&id, true),
+        Cmd::Article(ArticleCmd::Unread { id }) => articles::set_read(&id, false),
+        Cmd::Article(ArticleCmd::Open { id }) => articles::open(&id),
         Cmd::Init {
             server,
             token,
