@@ -302,7 +302,7 @@ try {
     assert.match(result.stdout, /OK \(1 test\)/);
     assert.doesNotMatch(result.stdout, /FAILURES|INSTRUMENTATION_FAILED/);
     assert.notEqual((await readState()).read_at, null, "actual emulator reader committed canonical read state");
-    console.log("PASS: same real CLI-published fixture read and marked read by disposable Android emulator");
+    console.log("PASS: same CLI-published fixture in disposable Android, independent-client read/unread foreground reconciliation and stopped/resumed recovery without manual refresh");
   }
   console.log("PASS: authenticated render, preview inert, opaque sandbox, image decode, details, fragments, selection, zoom, explicit noreferrer/noopener link, download bytes");
   console.log("PASS: missing-image feedback, failed-content unread preservation, explicit retry, blocked script/network/frame canaries, no repeated read after newer unread");
