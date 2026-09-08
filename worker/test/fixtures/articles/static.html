@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Static report</title>
+<style>
+body { font-family: sans-serif; line-height: 1.5; margin: 0 auto; max-width: 70rem; padding: 1rem; }
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+img { max-width: 100%; height: auto; }
+@media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
+.chart { background-image: url("images/chart.png"); }
+</style></head><body>
+<main><h1 id="report">Static report</h1><p>Readable &amp; searchable.</p>
+<section class="grid"><figure><img src="./images/chart.png" alt="Quarterly chart"><figcaption>Quarterly chart</figcaption></figure>
+<table><caption>Results</caption><thead><tr><th scope="col">Quarter</th><th>Value</th></tr></thead><tbody><tr><td>Q1</td><td>42</td></tr></tbody></table></section>
+<pre><code>if (ready) {
+  publish();
+}
+</code></pre>
+<details><summary>More detail</summary><p style="color: #123456">A useful explanation.</p></details>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 80" role="img" aria-label="Flow diagram"><defs><marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="blue"/></marker></defs><rect x="1" y="1" width="90" height="50" fill="#eef"/><text x="10" y="30">Draft</text><path d="M 95 25 L 190 25" stroke="blue" marker-end="url(#arrow)"/><circle cx="230" cy="25" r="24" fill="green"/></svg>
+<a href="#report">Back to top</a> <a href="https://example.org/research">Research source</a> <a href="notes.txt" download>Download notes</a>
+</main></body></html>

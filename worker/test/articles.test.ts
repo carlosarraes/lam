@@ -21,6 +21,17 @@ async function stage(payload?: Awaited<ReturnType<typeof draft>>, key = crypto.r
   expect(response.status).toBe(201);
   return await response.json<{ id: string }>();
 }
+async function stageBundle(sources: { path: string; media_type: string; disposition: string; bytes: Uint8Array<ArrayBuffer> }[]) {
+  const payload = await draft();
+  payload.assets = await Promise.all(sources.map(async ({ bytes, ...asset }) => ({ ...asset, size: bytes.byteLength,
+    sha256: Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)), b => b.toString(16).padStart(2, "0")).join("") })));
+  const { id } = await stage(payload);
+  for (let index = 0; index < sources.length; index++) {
+    const response = await SELF.fetch(`https://example.com/v2/articles/${id}/assets/${index}`, { method: "PUT", headers: { Authorization: "Bearer test-token" }, body: sources[index].bytes });
+    expect(response.status).toBe(204);
+  }
+  return id;
+}
 async function device() {
   const credential = `article-device-${crypto.randomUUID()}`;
   const key = await crypto.subtle.importKey("raw", enc.encode("test-secret"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
@@ -41,7 +52,7 @@ async function published(title = "Report", created = "2026-09-01T12:00:00.000Z",
 }
 
 describe("private article staging", () => {
-  it("stages idempotently, hides drafts, and fails publication closed before and after upload", async () => {
+  it("stages idempotently, hides drafts, and publishes validated canonical HTML after upload", async () => {
     const payload = await draft();
     const key = crypto.randomUUID();
     const { id } = await stage(payload, key);
@@ -54,8 +65,137 @@ describe("private article staging", () => {
     expect((await request(`/${id}/publish`, "POST")).status).toBe(400);
     expect((await request(`/${id}/assets/0`, "PUT", html)).status).toBe(204);
     expect((await request(`/${id}/assets/0`, "PUT", html)).status).toBe(204);
+    const response = await request(`/${id}/publish`, "POST");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ id, assets: payload.assets });
+    expect((await request(`/${id}`)).status).toBe(200);
+    const canonical = await request(`/${id}/assets/0`);
+    const content = await canonical.text();
+    expect(content).toBe("<!DOCTYPE html><html><head></head><body>Report</body></html>");
+    expect(canonical.headers.get("content-length")).toBe(String(enc.encode(content).length));
+    const stored = await env.ARTICLE_BUCKET.get(`articles/${id}/sanitized/index.html`);
+    expect(stored!.customMetadata?.sha256).not.toBe(payload.assets[0].sha256);
+    expect(await (await env.ARTICLE_BUCKET.get(`articles/${id}/original/0`))!.text()).toBe(html);
+    expect((await request(`/${id}/publish`, "POST")).status).toBe(200);
+    expect(await env.DB.prepare("SELECT count(*) AS count FROM article_notification_jobs WHERE article_id = ?").bind(id).first()).toEqual({ count: 1 });
+  });
+
+  it("publishes competing calls once and leaves silent publications without notification jobs", async () => {
+    for (const silent of [false, true]) {
+      const { id } = await stage({ ...await draft(), silent });
+      expect((await request(`/${id}/assets/0`, "PUT", html)).status).toBe(204);
+      const responses = await Promise.all(Array.from({ length: 3 }, () => request(`/${id}/publish`, "POST")));
+      expect(responses.map(response => response.status)).toEqual([200, 200, 200]);
+      const articles = await Promise.all(responses.map(response => response.json()));
+      expect(articles[0]).toEqual(articles[1]);
+      expect(articles[1]).toEqual(articles[2]);
+      const object = await env.ARTICLE_BUCKET.head(`articles/${id}/sanitized/index.html`);
+      expect(object).not.toBeNull();
+      expect(await env.DB.prepare("SELECT count(*) AS count FROM article_notification_jobs WHERE article_id = ?").bind(id).first()).toEqual({ count: silent ? 0 : 1 });
+    }
+  });
+
+  it("keeps malicious uploaded HTML private without canonical objects or notifications", async () => {
+    const source = '<script>alert(1)</script>';
+    const payload = await draft();
+    const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(source))), b => b.toString(16).padStart(2, "0")).join("");
+    const { id } = await stage({ ...payload, assets: [{ ...payload.assets[0], size: enc.encode(source).length, sha256: hash }] });
+    expect((await request(`/${id}/assets/0`, "PUT", source)).status).toBe(204);
+    const response = await request(`/${id}/publish`, "POST");
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: expect.stringContaining("script") });
+    expect((await request(`/${id}`)).status).toBe(404);
+    expect(await env.ARTICLE_BUCKET.head(`articles/${id}/sanitized/index.html`)).toBeNull();
+    expect(await env.DB.prepare("SELECT count(*) AS count FROM article_notification_jobs WHERE article_id = ?").bind(id).first()).toEqual({ count: 0 });
+  });
+
+  it("checks attachment byte formats before publishing and rejects invalid UTF-8 HTML", async () => {
+    for (const media_type of ["image/png", "image/jpeg", "image/webp", "application/pdf"]) {
+      const id = await stageBundle([
+        { path: "index.html", media_type: "text/html", disposition: "inline", bytes: enc.encode(html) },
+        { path: "fake", media_type, disposition: "attachment", bytes: enc.encode("<script>alert(1)</script>") },
+      ]);
+      const response = await request(`/${id}/publish`, "POST");
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: expect.stringContaining("format") });
+      expect((await request(`/${id}`)).status).toBe(404);
+    }
+    const id = await stageBundle([{ path: "index.html", media_type: "text/html", disposition: "inline", bytes: new Uint8Array([0xff, 0xfe, 0x61]) }]);
+    expect((await request(`/${id}/publish`, "POST")).status).toBe(400);
+  });
+
+  it("publishes bundled raster images and inert PDF and text download labels", async () => {
+    const source = '<img src="chart.png"><a href="notes.txt" class="notes" style="color: blue">Notes</a><a href="report.pdf" download>Report PDF</a>';
+    const png = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aTHsAAAAASUVORK5CYII="), c => c.charCodeAt(0));
+    const id = await stageBundle([
+      { path: "index.html", media_type: "text/html", disposition: "inline", bytes: enc.encode(source) },
+      { path: "chart.png", media_type: "image/png", disposition: "inline", bytes: png },
+      { path: "notes.txt", media_type: "text/plain", disposition: "attachment", bytes: enc.encode("Notes\n") },
+      { path: "report.pdf", media_type: "application/pdf", disposition: "attachment", bytes: enc.encode("%PDF-1.7\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n") },
+    ]);
+    expect((await request(`/${id}/publish`, "POST")).status).toBe(200);
+    const canonical = await (await request(`/${id}/assets/0`)).text();
+    expect(canonical).toContain('<img src="lam-asset:1">');
+    expect(canonical).toContain('<span class="notes" style="color:blue" data-lam-attachment="2">Notes</span>');
+    expect(canonical).toContain('<span data-lam-attachment="3">Report PDF</span>');
+    const attachment = await request(`/${id}/assets/3`);
+    expect(attachment.headers.get("content-disposition")).toContain("attachment;");
+    expect(attachment.headers.get("content-security-policy")).toContain("sandbox");
+  });
+
+  it("verifies stored original bytes rather than trusting R2 custom metadata", async () => {
+    const { id } = await stage();
+    expect((await request(`/${id}/assets/0`, "PUT", html)).status).toBe(204);
+    const payload = await draft();
+    await env.ARTICLE_BUCKET.put(`articles/${id}/original/0`, html.replace("Report", "Broken"), { customMetadata: { sha256: payload.assets[0].sha256 } });
     expect((await request(`/${id}/publish`, "POST")).status).toBe(400);
     expect((await request(`/${id}`)).status).toBe(404);
+  });
+
+  it("never overwrites a conflicting canonical object", async () => {
+    const { id } = await stage();
+    expect((await request(`/${id}/assets/0`, "PUT", html)).status).toBe(204);
+    const key = `articles/${id}/sanitized/index.html`;
+    await env.ARTICLE_BUCKET.put(key, "conflicting canonical bytes");
+    expect((await request(`/${id}/publish`, "POST")).status).toBe(409);
+    expect(await (await env.ARTICLE_BUCKET.get(key))!.text()).toBe("conflicting canonical bytes");
+    expect((await request(`/${id}`)).status).toBe(404);
+  });
+
+  it("does not publish an abandoned or expired stage after a late canonical write", async () => {
+    const service = await run(Articles);
+    for (const cleanup of [false, true]) {
+      const { id } = await stage();
+      expect((await request(`/${id}/assets/0`, "PUT", html)).status).toBe(204);
+      const bucket = new Proxy(env.ARTICLE_BUCKET, { get(target, property) {
+        if (property === "put") return async (...args: Parameters<R2Bucket["put"]>) => {
+          await env.DB.prepare("UPDATE articles SET expires_at = '2000-01-01T00:00:00.000Z', cleanup_after = '2000-01-01T00:00:00.000Z' WHERE id = ?").bind(id).run();
+          if (cleanup) await run(service.cleanupAbandoned(new Date(), 100));
+          return target.put(...args);
+        };
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      } });
+      await expect(Effect.runPromise(service.publish(id).pipe(Effect.provideService(Env, { ...bindings, ARTICLE_BUCKET: bucket })))).rejects.toThrow();
+      expect((await request(`/${id}`)).status).toBe(404);
+      expect(await env.ARTICLE_BUCKET.head(`articles/${id}/sanitized/index.html`)).toBeNull();
+      expect(await env.DB.prepare("SELECT count(*) AS count FROM article_notification_jobs WHERE article_id = ?").bind(id).first()).toEqual({ count: 0 });
+    }
+  });
+
+  it("rolls publication back when its notification insert fails and retries the canonical object", async () => {
+    const { id } = await stage();
+    expect((await request(`/${id}/assets/0`, "PUT", html)).status).toBe(204);
+    // Fixed SQL trigger scoped to this generated id exercises real D1 transaction rollback.
+    await env.DB.exec(`CREATE TRIGGER fail_article_job BEFORE INSERT ON article_notification_jobs WHEN NEW.article_id = '${id}' BEGIN SELECT RAISE(ABORT, 'injected job failure'); END`);
+    try {
+      expect((await request(`/${id}/publish`, "POST")).status).toBe(500);
+      expect((await request(`/${id}`)).status).toBe(404);
+      expect(await env.ARTICLE_BUCKET.head(`articles/${id}/sanitized/index.html`)).not.toBeNull();
+      expect(await env.DB.prepare("SELECT count(*) AS count FROM article_notification_jobs WHERE article_id = ?").bind(id).first()).toEqual({ count: 0 });
+    } finally { await env.DB.exec("DROP TRIGGER fail_article_job"); }
+    expect((await request(`/${id}/publish`, "POST")).status).toBe(200);
+    expect(await env.DB.prepare("SELECT count(*) AS count FROM article_notification_jobs WHERE article_id = ?").bind(id).first()).toEqual({ count: 1 });
   });
 
   it("requires bearer credentials and restricts uploads and publication to master", async () => {

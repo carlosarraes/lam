@@ -3,6 +3,7 @@ import { Env, type Bindings } from "../Env";
 import { ArticleStorageError, ReadUpdate, type Article, type ArticleDraft, type ArticlePage, type Asset } from "../domain/Article";
 import { BadRequest, Conflict, DbError, NotFound } from "../domain/Item";
 import { readBoundedBody, validateManifest } from "../articles/manifest";
+import { prepareArticleHtml, validateArticleAsset } from "../articles/content";
 
 // LAM has one owner. Master credentials and active paired devices belong to this owner.
 const OWNER = "owner";
@@ -107,13 +108,46 @@ export class Articles extends Effect.Service<Articles>()("lam/Articles", {
       requireStaging(row);
       const assets = await assetsFor(DB, id);
       if (assets.length === 0 || assets.some(asset => !asset.complete)) throw new BadRequest({ message: "article uploads are incomplete" });
+      let html: string | undefined;
       for (const asset of assets) {
-        const object = await storage(() => ARTICLE_BUCKET.head(asset.object_key));
+        const object = await storage(() => ARTICLE_BUCKET.get(asset.object_key));
         if (!object || object.size !== asset.size || object.customMetadata?.sha256 !== asset.sha256)
           throw new BadRequest({ message: "article upload is missing or invalid" });
+        const bytes = await readBoundedBody(object.body, asset.size);
+        if (bytes.byteLength !== asset.size || await sha256(bytes) !== asset.sha256)
+          throw new BadRequest({ message: "article upload is missing or invalid" });
+        if (asset.path === "index.html") {
+          try { html = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+          catch { throw new BadRequest({ message: "article HTML must be UTF-8" }); }
+        } else validateArticleAsset(bytes, asset);
       }
-      // Task 2 replaces this terminal failure with parsed validation and atomic publication.
-      throw new BadRequest({ message: "article content validation is not available" });
+      if (html === undefined) throw new BadRequest({ message: "article requires index.html" });
+      const canonical = new TextEncoder().encode(prepareArticleHtml(html, assets));
+      const canonicalHash = await sha256(canonical);
+      const written = await storage(() => ARTICLE_BUCKET.put(row.sanitized_html_key, canonical, {
+        onlyIf: { etagDoesNotMatch: "*" }, sha256: canonicalHash,
+        httpMetadata: { contentType: "text/html; charset=utf-8" }, customMetadata: { sha256: canonicalHash },
+      }));
+      if (!written) {
+        // A retry or competing validator must agree with the existing canonical bytes.
+        const existing = await storage(() => ARTICLE_BUCKET.get(row.sanitized_html_key));
+        if (!existing || existing.size !== canonical.byteLength || await sha256(await readBoundedBody(existing.body, canonical.byteLength)) !== canonicalHash)
+          throw new Conflict({ id });
+      }
+      await DB.batch([
+        DB.prepare(`UPDATE articles SET state = 'published' WHERE id = ? AND owner_id = ? AND state = 'staging'
+          AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`).bind(id, OWNER),
+        DB.prepare(`INSERT INTO article_notification_jobs (article_id, next_attempt_at)
+          SELECT id, ? FROM articles WHERE id = ? AND owner_id = ? AND state = 'published' AND silent = 0
+          ON CONFLICT(article_id) DO NOTHING`).bind(new Date().toISOString(), id, OWNER),
+      ]);
+      const current = await rowFor(DB, id);
+      if (current.state !== "published") {
+        // Cleanup may have won during R2 I/O. Its tombstone also catches interrupted late writes.
+        await storage(() => ARTICLE_BUCKET.delete(row.sanitized_html_key));
+        throw new Conflict({ id });
+      }
+      return publicArticle(current, assets);
     }),
 
     get: (id: string) => operation(({ DB }) => getArticle(DB, id)),

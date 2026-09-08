@@ -10,12 +10,15 @@
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@types/css-tree": "3.2.0",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11",
     "wrangler": "^4.125.0"
   },
   "dependencies": {
     "@effect/platform": "^0.97.1",
-    "effect": "^3.22.1"
+    "css-tree": "3.2.1",
+    "effect": "^3.22.1",
+    "parse5": "8.0.1"
   }
 }
