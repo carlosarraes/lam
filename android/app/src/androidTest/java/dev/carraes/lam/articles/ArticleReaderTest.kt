@@ -33,17 +33,19 @@ class ArticleReaderTest {
             val image = java.io.ByteArrayOutputStream().also { pixel.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }.toByteArray()
             pixel.recycle()
             val note = "download-only notes\n".toByteArray()
+            val filename = "article-fixture-${java.util.UUID.randomUUID()}.txt"
             val article = Article("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "Native article reader", "Summary", "Agent", "host", "lam",
                 "2026-09-08T12:00:00Z", null, 0, listOf(
                     ArticleAsset("index.html", "text/html", 1, "0".repeat(64), "inline"),
                     ArticleAsset("pixel.png", "image/png", image.size.toLong(), sha256(image), "inline"),
                     ArticleAsset("missing.png", "image/png", image.size.toLong(), sha256(image), "inline"),
-                    ArticleAsset("article-fixture-notes.txt", "text/plain", note.size.toLong(), sha256(note), "attachment")))
+                    ArticleAsset(filename, "text/plain", note.size.toLong(), sha256(note), "attachment")))
             val session = ArticleSession("test-account", "test-epoch")
             val policy = ArticleResourcePolicy(session.epoch, article)
             val document = LoadedArticle(article, """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
                 <title>Native article reader</title><style>body{font:18px sans-serif;padding:16px}img{width:120px;height:48px}</style></head><body>
                 <h1>A private report</h1><p>Text can be selected and enlarged.</p><img src="${policy.assetUrl(1)}"><img src="${policy.assetUrl(2)}">
+                <p><a href="${server.url("/confirmed-external")}">Open local canary</a></p>
                 <details><summary>More details</summary><p>Additional notes</p></details>
                 <svg width="200" height="70"><rect width="200" height="70" fill="teal"/><text x="10" y="40" fill="white">Static SVG</text></svg>
                 <p><span data-lam-attachment="3">Attachment label</span></p></body></html>""", session)
@@ -76,12 +78,54 @@ class ArticleReaderTest {
                 screenshot.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)
             }
             screenshot.recycle()
-            compose.onNodeWithText("Save article-fixture-notes.txt").performScrollTo().performClick()
+            compose.onNodeWithText("Save $filename").performScrollTo().performClick()
             // Opening the document picker still must not fetch private attachment bytes.
             compose.waitUntil(5000) { automation.rootInActiveWindow?.packageName?.toString()?.contains("documentsui") == true }
             assertEquals(2, server.requestCount)
             automation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
             // Global actions are asynchronous. Finish cancellation before another Activity test starts.
+            compose.waitUntil(5000) { automation.rootInActiveWindow?.packageName?.toString() == compose.activity.packageName }
+            // Complete a second picker operation and read the file written by the real provider.
+            server.enqueue(MockResponse().setBody(Buffer().write(note)))
+            compose.onNodeWithText("Save $filename").performScrollTo().performClick()
+            compose.waitUntil(5000) { automation.rootInActiveWindow?.packageName?.toString()?.contains("documentsui") == true }
+            assertEquals(2, server.requestCount)
+            fun find(node: android.view.accessibility.AccessibilityNodeInfo?, text: String): android.view.accessibility.AccessibilityNodeInfo? {
+                if (node == null) return null
+                if (node.text?.toString()?.equals(text, ignoreCase = true) == true) return node
+                for (index in 0 until node.childCount) find(node.getChild(index), text)?.let { return it }
+                return null
+            }
+            compose.waitUntil(5000) { find(automation.rootInActiveWindow, "Save") != null }
+            assertTrue(find(automation.rootInActiveWindow, "Save")!!.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK))
+            compose.waitUntil(5000) { automation.rootInActiveWindow?.packageName?.toString() == compose.activity.packageName }
+            compose.waitUntil(5000) { compose.onAllNodesWithText("Attachment saved.", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+            assertEquals(3, server.requestCount)
+            val download = server.takeRequest()
+            assertEquals("/v2/articles/${article.id}/assets/3", download.path)
+            assertEquals("Bearer native-test-credential", download.getHeader("Authorization"))
+            val saved = automation.executeShellCommand("cat /sdcard/Download/$filename").use {
+                android.os.ParcelFileDescriptor.AutoCloseInputStream(it).readBytes()
+            }
+            assertArrayEquals("The document provider persisted the authenticated attachment bytes", note, saved)
+            compose.waitUntil(5000) { find(automation.rootInActiveWindow, "Open local canary") != null }
+            val bounds = android.graphics.Rect()
+            find(automation.rootInActiveWindow, "Open local canary")!!.getBoundsInScreen(bounds)
+            automation.executeShellCommand("input tap ${bounds.centerX()} ${bounds.centerY()}").use {
+                android.os.ParcelFileDescriptor.AutoCloseInputStream(it).readBytes()
+            }
+            compose.onNodeWithText("Open in browser").assertExists()
+            assertEquals("Destination confirmation does not navigate", 3, server.requestCount)
+            server.enqueue(MockResponse().setBody("<html><body>Confirmed local canary</body></html>"))
+            compose.onNodeWithText("Open in browser").performClick()
+            compose.waitUntil(8000) { server.requestCount >= 4 }
+            val external = server.takeRequest()
+            assertEquals("/confirmed-external", external.path)
+            assertNull(external.getHeader("Authorization"))
+            assertNull(external.getHeader("Cookie"))
+            assertNull(external.getHeader("Referer"))
+            compose.waitUntil(5000) { automation.rootInActiveWindow?.packageName?.toString() == "org.chromium.webview_shell" }
+            automation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
             compose.waitUntil(5000) { automation.rootInActiveWindow?.packageName?.toString() == compose.activity.packageName }
         }
     }

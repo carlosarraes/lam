@@ -1,0 +1,2 @@
+The HTML entry, chart.png and this text file form the explicit Article bundle.
+The diagram was rendered locally from show-me.mmd and prepared as static SVG.

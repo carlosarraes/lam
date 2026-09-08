@@ -32,10 +32,14 @@ class ArticleRepositoryTest {
         runCurrent()
         val held = CompletableDeferred<Unit>()
         f.api.beforeList = { held.await() }
+        val callsBefore = f.api.listCalls
         events.send(Unit); runCurrent()
+        assertEquals(callsBefore + 1, f.api.listCalls)
         f.api.page = ArticlePage(listOf(articleFixture(version = 3, read = true)), null)
         events.send(Unit)
         held.complete(Unit); runCurrent()
+        assertEquals("The held response captured version 0, so a second GET must consume the invalidation", callsBefore + 2, f.api.listCalls)
+        assertEquals(listOf(0L, 3L), f.api.returnedVersions.takeLast(2))
         assertEquals(3L, f.repo.state.value.items.single().version)
         assertNotNull(f.repo.state.value.items.single().readAt)
         assertTrue(f.api.writes.isEmpty())
@@ -171,8 +175,16 @@ internal class FakeArticleApi : ArticleApi {
     var bytes = byteArrayOf(1, 2, 3, 4)
     var beforeContent: suspend () -> Unit = {}
     var beforeList: suspend (String) -> Unit = {}
+    var listCalls = 0
+    val returnedVersions = mutableListOf<Long>()
     val writes = mutableListOf<Pair<Boolean, Long>>()
-    override suspend fun list(query: String, read: String, cursor: String?): ArticlePage { beforeList(query); return page }
+    override suspend fun list(query: String, read: String, cursor: String?): ArticlePage {
+        val response = page
+        listCalls++
+        beforeList(query)
+        response.items.firstOrNull()?.let { returnedVersions += it.version }
+        return response
+    }
     override suspend fun get(id: String) = article
     override suspend fun content(id: String): ArticleContent {
         beforeContent()

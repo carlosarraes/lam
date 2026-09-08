@@ -7,6 +7,8 @@ import androidx.test.platform.app.InstrumentationRegistry
 import dev.carraes.lam.items.LamDatabase
 import dev.carraes.lam.items.RoomItemStorage
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.flow.first
+import java.time.Instant
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
@@ -42,6 +44,8 @@ class ArticleStorageTest {
                 assertEquals("Keep body", items.get("fyi")!!.canonical.body)
                 assertEquals("2026-09-05T00:00:00Z", items.get("fyi")!!.canonical.seenAt)
                 assertEquals(4294967296L, items.get("fyi")!!.canonical.version)
+                assertEquals(Instant.parse("2026-09-04T12:00:00Z"), items.lastSuccess())
+                assertEquals("fyi", items.history("saved-query").first().single().canonical.id)
                 val articles = RoomArticleStorage(database)
                 val row = ArticleEntity("account-a", "id", "{}", "private text", "digest")
                 assertTrue(articles.save(listOf(row)) { true })

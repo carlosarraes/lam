@@ -18,6 +18,7 @@ import okhttp3.mockwebserver.*
 import org.junit.Assert.*
 import org.junit.Test
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.ConcurrentHashMap
 
 class ArticleLinksNavigationTest {
     @Test fun stableLinksWaitForPairingOpenColdAndWarmAndDoNotReplayAcrossRotation() = runBlocking {
@@ -28,9 +29,11 @@ class ArticleLinksNavigationTest {
         val first = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
         val second = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
         val requests = ConcurrentLinkedQueue<RecordedRequest>()
-        fun article(id: String, read: Boolean = false) = Article(id, "Linked report $id", "Summary", "Agent", "test", "lam",
-            "2026-09-08T00:00:00Z", if (read) "2026-09-08T00:00:01Z" else null, if (read) 1 else 0,
+        val canonical = ConcurrentHashMap<String, Article>()
+        fun initial(id: String) = Article(id, "Linked report $id", "Summary", "Agent", "test", "lam",
+            "2026-09-08T00:00:00Z", null, 0,
             listOf(ArticleAsset("index.html", "text/html", 1, "0".repeat(64), "inline")))
+        fun article(id: String) = canonical.getOrPut(id) { initial(id) }
         fun intent(uri: String) = Intent(Intent.ACTION_VIEW, Uri.parse(uri), application, MainActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         fun contains(node: AccessibilityNodeInfo?, title: String): Boolean = node != null &&
@@ -52,7 +55,14 @@ class ArticleLinksNavigationTest {
                     val payload = when {
                         path == "/v2/events" -> return MockResponse().withWebSocketUpgrade(object : okhttp3.WebSocketListener() {})
                         path.endsWith("/content") -> articleJson.encodeToString(ArticleContent(article(id), listOf(JsonPrimitive("<p>Verified linked content</p>"))))
-                        path.endsWith("/read") -> articleJson.encodeToString(article(id, true))
+                        path.endsWith("/read") -> {
+                            val body = org.json.JSONObject(request.body.readUtf8())
+                            val old = article(id)
+                            if (body.getLong("version") != old.version) return MockResponse().setResponseCode(409)
+                            val updated = old.copy(version = old.version + 1, readAt = if (body.getBoolean("read")) "2026-09-08T00:00:01Z" else null)
+                            canonical[id] = updated
+                            articleJson.encodeToString(updated)
+                        }
                         path == "/v2/articles" -> articleJson.encodeToString(ArticlePage(listOf(article(first), article(second)), null))
                         path.startsWith("/v2/articles/") -> articleJson.encodeToString(article(id))
                         else -> "[]"
@@ -73,6 +83,10 @@ class ArticleLinksNavigationTest {
                     scenario.onActivity { assertNull(ViewModelProvider(it)[ArticleLinks::class.java].pending.value) }
                     application.startActivity(intent("lam://articles/$second"))
                     shown("Linked report $second"); shown("Read state saved.")
+                    // Another reader marks this same canonical Article unread while its reader remains open.
+                    canonical[second] = article(second).copy(version = 2, readAt = null)
+                    application.container.articleRepository.refresh()
+                    assertEquals(2L, application.container.articleRepository.state.value.items.single { it.id == second }.version)
                     val contentBefore = requests.count { it.path?.endsWith("/content") == true }
                     val writesBefore = requests.count { it.method == "PUT" }
                     application.startActivity(intent("lam://articles/$second"))
@@ -85,6 +99,9 @@ class ArticleLinksNavigationTest {
                     shown("Linked report $second")
                     assertEquals(contentBefore, requests.count { it.path?.endsWith("/content") == true })
                     assertEquals(writesBefore, requests.count { it.method == "PUT" })
+                    assertEquals(2L, article(second).version)
+                    assertNull("Activity recreation must preserve the newer explicit unread", article(second).readAt)
+                    assertNull(application.container.articleRepository.state.value.items.single { it.id == second }.readAt)
                 }
                 ActivityScenario.launch<MainActivity>(intent("lam://articles/$first")).use {
                     shown("Linked report $first")
