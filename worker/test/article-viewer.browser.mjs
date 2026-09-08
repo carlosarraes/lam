@@ -156,6 +156,13 @@ try {
   const frame = await debug.frame();
   assert.equal(await frame.evaluate("document.querySelector('img').naturalWidth"), 240);
   assert.equal(await frame.evaluate("document.querySelector('svg').textContent.includes('Prepare report')"), true);
+  assert.deepEqual(await frame.evaluate("Array.from(document.querySelector('table')?.rows ?? [], row => Array.from(row.cells, cell => cell.textContent.trim()))"), [
+    ["File", "Reader behavior"], ["show-me.html", "Static report"], ["chart.png", "Inline image"], ["notes.txt", "Save attachment"],
+  ], "the published report renders its semantic bundle table");
+  assert.equal(await frame.evaluate("document.querySelector('table caption').textContent"), "Article bundle");
+  await frame.evaluate("document.querySelector('table').scrollIntoView({block:'center'})");
+  assert.equal(await frame.evaluate("(() => { const table=document.querySelector('table'); const r=table.getBoundingClientRect(); return r.width>0 && r.height>0 && r.top<innerHeight && r.bottom>0 && getComputedStyle(table).display==='table'; })()"), true);
+  await browser("screenshot", join(folder, "article-table.png"));
   await frame.activate("summary");
   assert.equal(await frame.evaluate("document.querySelector('details').open"), true);
   await frame.activate('a[href="about:srcdoc#end"]');
@@ -308,6 +315,7 @@ try {
   console.log("PASS: missing-image feedback, failed-content unread preservation, explicit retry, blocked script/network/frame canaries, no repeated read after newer unread");
   console.log("PASS: initial background/offscreen unread, failed read plus newer unread/manual retry, expired viewer, cross-article resource denial");
   console.log(`Screenshot: ${join(folder, "article.png")}`);
+  console.log(`Table screenshot: ${join(folder, "article-table.png")}`);
 } finally {
   debug?.close();
   await browser("close").catch(() => {});

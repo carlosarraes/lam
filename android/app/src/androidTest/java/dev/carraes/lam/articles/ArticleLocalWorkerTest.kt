@@ -65,6 +65,12 @@ class ArticleLocalWorkerTest {
                 shown("Show-me delivery report")
                 shown("Read state saved.")
                 shown("Prepare report")
+                shown("Article bundle")
+                shown("Reader behavior")
+                shown("show-me.html")
+                shown("Static report")
+                shown("Inline image")
+                shown("Save attachment")
                 val screenshot = automation.takeScreenshot()
                 java.io.File(application.getExternalFilesDir(null), "article-show-me-worker.png").outputStream().use {
                     assertTrue(screenshot.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it))
