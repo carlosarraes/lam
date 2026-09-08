@@ -114,9 +114,23 @@ mod tests {
     };
     use tungstenite::{
         accept_hdr,
-        handshake::server::{Request, Response},
+        handshake::server::{Callback, ErrorResponse, Request, Response},
         Message,
     };
+
+    struct AssertArticleHandshake;
+
+    impl Callback for AssertArticleHandshake {
+        fn on_request(
+            self,
+            request: &Request,
+            response: Response,
+        ) -> std::result::Result<Response, ErrorResponse> {
+            assert_eq!(request.uri().path(), "/v2/events");
+            assert_eq!(request.headers()["authorization"], "Bearer fixture-token");
+            Ok(response)
+        }
+    }
 
     fn accept(listener: &TcpListener) -> TcpStream {
         let start = Instant::now();
@@ -146,15 +160,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             for _ in 0..2 {
-                let mut socket = accept_hdr(
-                    accept(&listener),
-                    |request: &Request, response: Response| {
-                        assert_eq!(request.uri().path(), "/v2/events");
-                        assert_eq!(request.headers()["authorization"], "Bearer fixture-token");
-                        Ok(response)
-                    },
-                )
-                .unwrap();
+                let mut socket = accept_hdr(accept(&listener), AssertArticleHandshake).unwrap();
                 for frame in [
                     r#"{"event":"item.changed","item_id":"one","version":1,"status":"open"}"#,
                     r#"{"event":"article.read_changed","article_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","version":1,"html":"secret"}"#,
