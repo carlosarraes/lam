@@ -9,7 +9,7 @@ import { viewerParts } from "./article-viewer";
 
 const Id = Schema.Struct({ id: Schema.String.pipe(Schema.pattern(/^[a-f0-9-]{36}$/)) });
 const AssetId = Schema.Struct({ ...Id.fields, index: Schema.NumberFromString.pipe(Schema.int(), Schema.between(0, 50)) });
-const Query = Schema.Struct({ q: Schema.optional(Schema.String), read: Schema.optional(Schema.Literal("all", "read", "unread")), cursor: Schema.optional(Schema.String) });
+const Query = Schema.Struct({ q: Schema.optional(Schema.String), read: Schema.optional(Schema.Literal("all", "read", "unread")), day: Schema.optional(Schema.String), cursor: Schema.optional(Schema.String) });
 const strict = { onExcessProperty: "error" as const };
 const master = Effect.gen(function* () { yield* (yield* Auth).requireMaster(yield* RequestAuthority); });
 const body = Effect.gen(function* () {

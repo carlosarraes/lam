@@ -5,6 +5,7 @@ import { BadRequest, Conflict, DbError, NotFound } from "../domain/Item";
 import { readBoundedBody, validateManifest } from "../articles/manifest";
 import { prepareArticleHtml, validateArticleAsset } from "../articles/content";
 import { articleInvalidated } from "./Events";
+import { articleDayBounds } from "../articles/day";
 
 // LAM has one owner. Master credentials and active paired devices belong to this owner.
 const OWNER = "owner";
@@ -19,7 +20,7 @@ interface ArticleRow extends Omit<Article, "assets"> {
   sanitized_html_key: string;
 }
 interface AssetRow extends Asset { article_id: string; asset_index: number; object_key: string; complete: number }
-export interface ArticleQuery { q?: string; read?: "all" | "read" | "unread"; cursor?: string }
+export interface ArticleQuery { q?: string; read?: "all" | "read" | "unread"; day?: string; cursor?: string }
 const operation = <A>(run: (env: Bindings) => Promise<A>) => Effect.flatMap(Env, env => Effect.tryPromise({
   try: () => run(env),
   catch: cause => cause instanceof BadRequest || cause instanceof Conflict || cause instanceof NotFound || cause instanceof ArticleStorageError
@@ -45,12 +46,12 @@ function publicArticle(row: ArticleRow, assets: readonly AssetRow[]): Article {
 }
 const getArticle = async (db: D1Database, id: string) => publicArticle(await rowFor(db, id, true), await assetsFor(db, id));
 
-const Cursor = Schema.Struct({ created_at: Schema.String, id: Schema.String, q: Schema.String, read: Schema.Literal("all", "read", "unread") });
-function decodeCursor(cursor: string, q: string, read: string): typeof Cursor.Type {
+const Cursor = Schema.Struct({ created_at: Schema.String, id: Schema.String, q: Schema.String, read: Schema.Literal("all", "read", "unread"), day: Schema.optional(Schema.String) });
+function decodeCursor(cursor: string, q: string, read: string, day: string | undefined): typeof Cursor.Type {
   try {
     if (cursor.length > 8192 || !/^[A-Za-z0-9_-]+$/.test(cursor)) throw new Error();
     const decoded = Schema.decodeUnknownSync(Cursor)(JSON.parse(decodeURIComponent(atob(cursor.replace(/-/g, "+").replace(/_/g, "/")))), { onExcessProperty: "error" });
-    if (decoded.q !== q || decoded.read !== read || !/^[a-f0-9-]{36}$/.test(decoded.id) || new Date(decoded.created_at).toISOString() !== decoded.created_at) throw new Error();
+    if (decoded.q !== q || decoded.read !== read || decoded.day !== day || !/^[a-f0-9-]{36}$/.test(decoded.id) || new Date(decoded.created_at).toISOString() !== decoded.created_at) throw new Error();
     return decoded;
   } catch { throw new BadRequest({ message: "invalid article cursor" }); }
 }
@@ -159,9 +160,13 @@ export class Articles extends Effect.Service<Articles>()("lam/Articles", {
       const q = query.q ?? "";
       const read = query.read ?? "all";
       if ([...q].length > 200 || !["all", "read", "unread"].includes(read)) throw new BadRequest({ message: "invalid article query" });
-      const cursor = query.cursor === undefined ? null : decodeCursor(query.cursor, q, read);
+      const day = query.day;
+      const bounds = day === undefined ? null : articleDayBounds(day);
+      const cursor = query.cursor === undefined ? null : decodeCursor(query.cursor, q, read, day);
       const conditions = ["owner_id = ?", "state = 'published'"];
       const values: (string | number)[] = [OWNER];
+      // created_at is the saved timestamp; articles have no publication timestamp.
+      if (bounds) { conditions.push("created_at >= ? AND created_at < ?"); values.push(bounds.start, bounds.end); }
       if (read !== "all") conditions.push(`read_at IS ${read === "read" ? "NOT " : ""}NULL`);
       if (q) {
         conditions.push("(instr(lower(title), lower(?)) > 0 OR instr(lower(summary), lower(?)) > 0 OR instr(lower(name), lower(?)) > 0)");
@@ -172,7 +177,7 @@ export class Articles extends Effect.Service<Articles>()("lam/Articles", {
       const page = rows.slice(0, PAGE_SIZE);
       const last = page.at(-1);
       return { items: await Promise.all(page.map(async row => publicArticle(row, await assetsFor(DB, row.id)))),
-        next_cursor: rows.length > PAGE_SIZE && last ? encodeCursor({ created_at: last.created_at, id: last.id, q, read }) : null };
+        next_cursor: rows.length > PAGE_SIZE && last ? encodeCursor({ created_at: last.created_at, id: last.id, q, read, ...(day === undefined ? {} : { day }) }) : null };
     }),
 
     asset: (id: string, index: number) => operation(async ({ DB, ARTICLE_BUCKET }) => {
