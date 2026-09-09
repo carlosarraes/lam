@@ -70,7 +70,8 @@ private fun PairedApp(container: AppContainer, articleRoute: String?, onArticleR
                 val articleState by articles.state.collectAsStateWithLifecycle()
                 LaunchedEffect(articles) { articles.refresh() }
                 ArticlesScreen(articleState, articles::query, articles::filter, articles::refresh, articles::more,
-                    { id -> articles.open(id); onArticle(id) }, articles::unread, onRequests, onHistory, onSettings)
+                    { id -> articles.open(id); onArticle(id) }, articles::unread, onRequests, onHistory, onSettings,
+                    articles::day, articles::allUnread)
             }, articleContent = { id, onBack ->
                 val reader by articles.reader.collectAsStateWithLifecycle()
                 LaunchedEffect(id) { if (reader.id != id) articles.open(id) }

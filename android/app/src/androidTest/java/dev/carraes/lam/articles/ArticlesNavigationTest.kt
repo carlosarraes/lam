@@ -19,6 +19,26 @@ import java.io.File
 class ArticlesNavigationTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
 
+    @Test fun dayNavigationAndAllUnreadReturnToToday() {
+        var state by mutableStateOf(ArticlesState())
+        compose.setContent { LamTheme {
+            ArticlesScreen(state, {}, { state = state.copy(readFilter = it) }, {}, {}, {}, {}, {}, {}, {},
+                onDay = { state = state.copy(day = it) },
+                onAllUnread = { state = state.copy(day = null, readFilter = "unread") })
+        } }
+        compose.onNodeWithContentDescription("Next day").assertIsNotEnabled()
+        compose.onNodeWithContentDescription("Previous day").performClick()
+        compose.onNodeWithText("Yesterday").assertExists()
+        compose.onNodeWithContentDescription("Next day").performClick()
+        compose.onNodeWithText("Today").assertExists()
+        compose.onNodeWithText("All unread").performClick()
+        compose.runOnIdle { assertNull(state.day); assertEquals("unread", state.readFilter) }
+        compose.onNodeWithText("Today").performClick()
+        compose.runOnIdle { assertEquals(articleToday().toString(), state.day) }
+        compose.onNodeWithText("Today").performClick()
+        compose.onNodeWithText("Cancel").assertExists().performClick()
+    }
+
     @Test fun titleSwitcherPreservesRequestsHistoryAndArticleSearchSelections() {
         var requests by mutableStateOf(RequestsState(query = "request query", loading = false))
         var history by mutableStateOf(HistoryState())

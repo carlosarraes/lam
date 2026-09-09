@@ -1,6 +1,11 @@
 package dev.carraes.lam.articles
 
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
@@ -15,27 +20,65 @@ import dev.carraes.lam.R
 import dev.carraes.lam.ui.components.QueueTopBar
 import dev.carraes.lam.ui.theme.Graphite
 import java.time.Instant
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
-import java.time.format.FormatStyle
+import java.time.LocalDate
+import java.time.ZoneOffset
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ArticlesScreen(state: ArticlesState, onQuery: (String) -> Unit, onFilter: (String) -> Unit, onRefresh: () -> Unit,
     onMore: () -> Unit, onArticle: (String) -> Unit, onUnread: (Article) -> Unit,
-    onRequests: () -> Unit, onHistory: () -> Unit, onSettings: () -> Unit) {
+    onRequests: () -> Unit, onHistory: () -> Unit, onSettings: () -> Unit,
+    onDay: (String?) -> Unit = {}, onAllUnread: () -> Unit = {}) {
     var search by rememberSaveable { mutableStateOf(false) }
+    var datePicker by rememberSaveable { mutableStateOf(false) }
+    var today by remember { mutableStateOf(articleToday()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            today = articleToday()
+            kotlinx.coroutines.delay(1_000)
+        }
+    }
+    val selected = state.day?.let(LocalDate::parse)
+    if (datePicker) {
+        val picker = rememberDatePickerState(
+            initialSelectedDateMillis = (selected ?: today).atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli(),
+            selectableDates = object : SelectableDates {
+                override fun isSelectableDate(utcTimeMillis: Long) =
+                    !Instant.ofEpochMilli(utcTimeMillis).atZone(ZoneOffset.UTC).toLocalDate().isAfter(today)
+                override fun isSelectableYear(year: Int) = year <= today.year
+            })
+        DatePickerDialog(onDismissRequest = { datePicker = false }, confirmButton = {
+            TextButton({
+                picker.selectedDateMillis?.let { onDay(Instant.ofEpochMilli(it).atZone(ZoneOffset.UTC).toLocalDate().toString()) }
+                datePicker = false
+            }, enabled = picker.selectedDateMillis != null) { Text("OK") }
+        }, dismissButton = { TextButton({ datePicker = false }) { Text("Cancel") } }) {
+            DatePicker(picker)
+        }
+    }
     Surface(Modifier.fillMaxSize(), color = Graphite) {
         Column(Modifier.safeDrawingPadding()) {
             QueueTopBar(stringResource(R.string.articles_title), onRequests, onHistory, onSettings, { search = !search },
                 searchLabel = stringResource(R.string.articles_search))
             if (search || state.query.isNotEmpty()) OutlinedTextField(state.query, onQuery, singleLine = true,
                 label = { Text(stringResource(R.string.articles_search)) }, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp))
-            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf("all" to R.string.articles_all, "unread" to R.string.articles_unread, "read" to R.string.articles_read).forEach { (filter, label) ->
-                    FilterChip(state.readFilter == filter, { onFilter(filter) }, { Text(stringResource(label)) })
+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                IconButton({ onDay((selected ?: today).minusDays(1).toString()) }, enabled = selected != null) {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, "Previous day")
                 }
-                Spacer(Modifier.weight(1f))
+                TextButton({ datePicker = true }, Modifier.weight(1f)) {
+                    Text(selected?.let { articleDayLabel(it, today) } ?: "All dates")
+                }
+                IconButton({ onDay(selected?.plusDays(1)?.toString()) }, enabled = selected != null && selected < today) {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, "Next day")
+                }
+                if (selected != today) TextButton({ onDay(today.toString()) }) { Text("Today") }
+            }
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("all" to R.string.articles_all, "unread" to R.string.articles_unread, "read" to R.string.articles_read).forEach { (filter, label) ->
+                    FilterChip(state.day != null && state.readFilter == filter, { onFilter(filter) }, { Text(stringResource(label)) })
+                }
+                FilterChip(state.day == null && state.readFilter == "unread", onAllUnread, { Text("All unread") })
                 TextButton(onRefresh, enabled = !state.loading) { Text(stringResource(R.string.detail_refresh)) }
             }
             PullToRefreshBox(state.loading, onRefresh, Modifier.weight(1f)) {
@@ -64,7 +107,3 @@ fun ArticlesScreen(state: ArticlesState, onQuery: (String) -> Unit, onFilter: (S
         }
     }
 }
-
-private fun articleTime(value: String) = runCatching {
-    DateTimeFormatter.ofLocalizedDateTime(FormatStyle.SHORT).withZone(ZoneId.systemDefault()).format(Instant.parse(value))
-}.getOrDefault(value)

@@ -8,6 +8,16 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ArticleApiTest {
+    @Test fun `day is encoded and all dates omits day`() = runTest {
+        MockWebServer().use { server ->
+            val api = OkHttpArticleApi(server.url("/"), { "fixture" })
+            repeat(2) { server.enqueue(MockResponse().setBody("{\"items\":[],\"next_cursor\":null}")) }
+            api.list("", "all", null, "2026-09-08")
+            assertEquals("2026-09-08", server.takeRequest().requestUrl!!.queryParameter("day"))
+            api.list("", "unread", null)
+            assertNull(server.takeRequest().requestUrl!!.queryParameter("day"))
+        }
+    }
     @Test fun `wire paths queries and CAS use header credentials without redirect forwarding`() = runTest {
         MockWebServer().use { server ->
             MockWebServer().use { other ->

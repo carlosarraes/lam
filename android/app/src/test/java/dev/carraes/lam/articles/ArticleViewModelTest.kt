@@ -7,6 +7,23 @@ import org.junit.Test
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class ArticleViewModelTest {
+    @Test fun `all unread escapes dates and ordinary filters restore today`() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        try {
+            val api = FakeArticleApi()
+            val repo = ArticleRepository(MemoryArticleStorage(), { api }, { ArticleSession("account", "epoch") })
+            val vm = ArticleViewModel(repo)
+            vm.day(articleToday().minusDays(1).toString()); runCurrent()
+            assertTrue(vm.state.value.items.isEmpty())
+            vm.allUnread(); runCurrent()
+            assertNull(vm.state.value.day)
+            assertEquals("unread", vm.state.value.readFilter)
+            assertEquals(1, vm.state.value.items.size)
+            vm.filter("read"); runCurrent()
+            assertEquals(articleToday().toString(), vm.state.value.day)
+            assertTrue(vm.state.value.items.isEmpty())
+        } finally { Dispatchers.resetMain() }
+    }
     @Test fun `verified visible content writes once and reload cannot undo explicit unread`() = runTest {
         Dispatchers.setMain(StandardTestDispatcher(testScheduler))
         try {

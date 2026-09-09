@@ -13,7 +13,8 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.ConcurrentHashMap
 
 data class ArticlesState(val items: List<Article> = emptyList(), val query: String = "", val readFilter: String = "all",
-    val nextCursor: String? = null, val loading: Boolean = false, val failed: Boolean = false, val cached: Boolean = false)
+    val nextCursor: String? = null, val loading: Boolean = false, val failed: Boolean = false, val cached: Boolean = false,
+    val day: String? = articleToday().toString())
 
 class ArticleRepository(private val storage: ArticleStorage, private val api: (ArticleSession) -> ArticleApi?,
     private val session: () -> ArticleSession?, private val onUnauthorized: suspend (ArticleSession) -> Unit = {}) {
@@ -44,15 +45,16 @@ class ArticleRepository(private val storage: ArticleStorage, private val api: (A
         }
     }
 
-    suspend fun refresh(query: String? = null, read: String? = null) {
+    suspend fun refresh(query: String? = null, read: String? = null, day: String? = state.value.day) {
         val captured = sessionChanged() ?: return reset()
         val requestedQuery = query ?: state.value.query
         val requestedRead = read ?: state.value.readFilter
         require(requestedRead in setOf("all", "read", "unread"))
+        day?.let { require(!java.time.LocalDate.parse(it).isAfter(articleToday())) }
         val ticket = generation.incrementAndGet()
-        val sameQuery = state.value.query == requestedQuery && state.value.readFilter == requestedRead
+        val sameQuery = state.value.query == requestedQuery && state.value.readFilter == requestedRead && state.value.day == day
         mutableState.value = if (sameQuery) state.value.copy(loading = true, failed = false)
-            else ArticlesState(query = requestedQuery, readFilter = requestedRead, loading = true)
+            else ArticlesState(query = requestedQuery, readFilter = requestedRead, loading = true, day = day)
         fetchPage(captured, ticket, null)
     }
 
@@ -68,7 +70,7 @@ class ArticleRepository(private val storage: ArticleStorage, private val api: (A
         val requested = state.value
         fun current() = isCurrent(captured) && generation.get() == ticket
         try {
-            val page = requireNotNull(api(captured)).list(requested.query, requested.readFilter, cursor)
+            val page = requireNotNull(api(captured)).list(requested.query, requested.readFilter, cursor, requested.day)
             require(page.items.size <= 25)
             val rows = page.items.map { validateArticle(it); ArticleEntity.from(captured.account, it) }
             if (!storage.save(rows, ::current) || !current()) return
@@ -168,7 +170,8 @@ class ArticleRepository(private val storage: ArticleStorage, private val api: (A
     }
 
     private fun filter(articles: List<Article>, state: ArticlesState) = articles.filter {
-        (state.readFilter == "all" || (it.readAt != null) == (state.readFilter == "read")) &&
+        (state.day == null || articleOnDay(it.createdAt, state.day)) &&
+            (state.readFilter == "all" || (it.readAt != null) == (state.readFilter == "read")) &&
             (state.query.isBlank() || listOf(it.title, it.summary, it.name).any { value -> value.contains(state.query, ignoreCase = true) })
     }.sortedWith(compareByDescending<Article> { it.createdAt }.thenByDescending { it.id })
 }

@@ -22,7 +22,9 @@ class ArticleViewModel(val repository: ArticleRepository) : ViewModel() {
 
     fun refresh() { viewModelScope.launch { repository.refresh() } }
     fun query(query: String) { viewModelScope.launch { repository.refresh(query = query) } }
-    fun filter(read: String) { viewModelScope.launch { repository.refresh(read = read) } }
+    fun filter(read: String) { viewModelScope.launch { repository.refresh(read = read, day = state.value.day ?: articleToday().toString()) } }
+    fun day(day: String?) { viewModelScope.launch { repository.refresh(day = day) } }
+    fun allUnread() { viewModelScope.launch { repository.refresh(read = "unread", day = null) } }
     fun more() { viewModelScope.launch { repository.loadMore() } }
     fun open(id: String) {
         opening?.cancel()

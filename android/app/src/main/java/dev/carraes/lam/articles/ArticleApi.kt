@@ -17,7 +17,7 @@ import java.util.concurrent.TimeUnit
 
 interface ArticleApi {
     fun events(): kotlinx.coroutines.flow.Flow<Unit> = kotlinx.coroutines.flow.emptyFlow()
-    suspend fun list(query: String, read: String, cursor: String?): ArticlePage
+    suspend fun list(query: String, read: String, cursor: String?, day: String? = null): ArticlePage
     suspend fun get(id: String): Article
     suspend fun content(id: String): ArticleContent
     suspend fun setRead(id: String, read: Boolean, version: Long): Article
@@ -32,9 +32,10 @@ class OkHttpArticleApi(private val baseUrl: HttpUrl, private val credential: () 
         .connectTimeout(10, TimeUnit.SECONDS).readTimeout(20, TimeUnit.SECONDS).callTimeout(30, TimeUnit.SECONDS).build()
     private fun url(vararg path: String) = baseUrl.newBuilder().apply { addPathSegments("v2/articles"); path.forEach(::addPathSegment) }.build()
     override fun events() = articleEvents(client, baseUrl, credential)
-    override suspend fun list(query: String, read: String, cursor: String?): ArticlePage {
+    override suspend fun list(query: String, read: String, cursor: String?, day: String?): ArticlePage {
         val url = url().newBuilder().addQueryParameter("q", query).addQueryParameter("read", read).apply {
             cursor?.let { addQueryParameter("cursor", it) }
+            day?.let { addQueryParameter("day", it) }
         }.build()
         return articleJson.decodeFromString(execute(Request.Builder().url(url), 4L * 1024 * 1024).decodeToString(throwOnInvalidSequence = true))
     }

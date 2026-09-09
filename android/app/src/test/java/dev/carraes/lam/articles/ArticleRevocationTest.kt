@@ -91,7 +91,7 @@ class ArticleRevocationTest {
         var beforeCleanup: suspend () -> Unit = {}
         private val wire = object : ArticleApi by api {
             private fun reject(path: String) { if (rejection == path) throw ArticleHttpException(401) }
-            override suspend fun list(query: String, read: String, cursor: String?): ArticlePage { reject("list"); return api.list(query, read, cursor) }
+            override suspend fun list(query: String, read: String, cursor: String?, day: String?): ArticlePage { reject("list"); return api.list(query, read, cursor, day) }
             override suspend fun content(id: String): ArticleContent { reject("content"); return api.content(id) }
             override suspend fun get(id: String): Article { reject("conflict-get"); return api.get(id) }
             override suspend fun setRead(id: String, read: Boolean, version: Long): Article {

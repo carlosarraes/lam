@@ -39,7 +39,7 @@ class ArticleResourcePolicyTest {
 }
 
 internal fun articleFixture(id: String = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", version: Long = 0, read: Boolean = false) = Article(
-    id, "Release notes", "Readable summary", "Agent", "host", "lam", "2026-09-08T12:00:00Z",
+    id, "Release notes", "Readable summary", "Agent", "host", "lam", "${articleToday()}T12:00:00Z",
     if (read) "2026-09-08T12:01:00Z" else null, version,
     listOf(ArticleAsset("index.html", "text/html", 20, "0".repeat(64), "inline"),
         ArticleAsset("chart.png", "image/png", 4, sha256(byteArrayOf(1, 2, 3, 4)), "inline"),

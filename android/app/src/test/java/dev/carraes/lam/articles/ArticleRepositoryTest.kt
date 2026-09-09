@@ -10,6 +10,38 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ArticleRepositoryTest {
+    @Test fun `offline dates use created timestamp at São Paulo midnight`() = runTest {
+        val f = Fixture()
+        val before = articleFixture().copy(createdAt = "2026-09-09T02:59:59Z")
+        val after = articleFixture("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").copy(createdAt = "2026-09-09T03:00:00Z")
+        f.storage.save(listOf(before, after).map { ArticleEntity.from("account-a", it) }, { true })
+        f.api.beforeList = { throw java.io.IOException() }
+        f.repo.refresh(day = "2026-09-08")
+        assertEquals(listOf(before.id), f.repo.state.value.items.map { it.id })
+        f.repo.refresh(day = "2026-09-09")
+        assertEquals(listOf(after.id), f.repo.state.value.items.map { it.id })
+    }
+    @Test fun `switching day clears pagination rejects stale page and isolates offline rows`() = runTest {
+        val f = Fixture()
+        f.api.article = articleFixture().copy(createdAt = "2026-09-08T12:00:00Z")
+        f.api.page = ArticlePage(listOf(f.api.article), "next")
+        f.repo.refresh(day = "2026-09-08")
+        val held = CompletableDeferred<Unit>()
+        f.api.beforeList = { if (it == "old") held.await() }
+        val old = async { f.repo.refresh(query = "old") }
+        runCurrent()
+        f.api.beforeList = { throw java.io.IOException() }
+        f.repo.refresh(query = "", day = "2026-09-09")
+        held.complete(Unit); old.await()
+        assertEquals("2026-09-09", f.repo.state.value.day)
+        assertTrue(f.repo.state.value.items.isEmpty())
+        assertNull(f.repo.state.value.nextCursor)
+        f.repo.refresh(day = "2026-09-08")
+        assertEquals(listOf(f.api.article.id), f.repo.state.value.items.map { it.id })
+        f.repo.refresh(read = "unread", day = null)
+        assertNull(f.repo.state.value.day)
+        assertEquals(1, f.repo.state.value.items.size)
+    }
     @Test fun `delayed session collector cannot reset a refresh started by synchronous binding`() = runTest {
         val f = Fixture()
         f.repo.refresh()
@@ -201,7 +233,7 @@ internal class FakeArticleApi : ArticleApi {
     val returnedVersions = mutableListOf<Long>()
     val writes = mutableListOf<Pair<Boolean, Long>>()
     val assetRequests = mutableListOf<Triple<String, Int, Long>>()
-    override suspend fun list(query: String, read: String, cursor: String?): ArticlePage {
+    override suspend fun list(query: String, read: String, cursor: String?, day: String?): ArticlePage {
         val response = page
         listCalls++
         beforeList(query)
