@@ -161,6 +161,9 @@ enum ArticleCmd {
         read: articles::ReadFilter,
         #[arg(long)]
         query: Option<String>,
+        /// Creation day in America/Sao_Paulo (YYYY-MM-DD); omit for all dates
+        #[arg(long, value_parser = articles::parse_day)]
+        day: Option<chrono::NaiveDate>,
     },
     /// Mark an article read
     Read { id: String },
@@ -219,7 +222,9 @@ fn run(cmd: Cmd) -> Result<i32> {
             assets,
             silent,
         }),
-        Cmd::Article(ArticleCmd::List { read, query }) => articles::list(read, query.as_deref()),
+        Cmd::Article(ArticleCmd::List { read, query, day }) => {
+            articles::list(read, query.as_deref(), day)
+        }
         Cmd::Article(ArticleCmd::Read { id }) => articles::set_read(&id, true),
         Cmd::Article(ArticleCmd::Unread { id }) => articles::set_read(&id, false),
         Cmd::Article(ArticleCmd::Open { id }) => articles::open(&id),

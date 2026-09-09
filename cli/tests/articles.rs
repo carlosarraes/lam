@@ -1230,6 +1230,7 @@ async fn article_list_follows_pages_and_passes_read_and_query_filters() {
         .and(path("/v2/articles"))
         .and(query_param("read", "unread"))
         .and(query_param("q", "quarterly"))
+        .and(query_param("day", "2026-09-08"))
         .respond_with(SequenceResponder::new([
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "items": [article(ARTICLE_ID, "Quarterly report", false, 0)],
@@ -1253,6 +1254,8 @@ async fn article_list_follows_pages_and_passes_read_and_query_filters() {
             "unread",
             "--query",
             "quarterly",
+            "--day",
+            "2026-09-08",
         ],
     );
     assert!(
@@ -1273,6 +1276,34 @@ async fn article_list_follows_pages_and_passes_read_and_query_filters() {
         .query()
         .unwrap()
         .contains("cursor=opaque-cursor"));
+}
+
+#[tokio::test]
+async fn article_list_without_day_searches_all_dates() {
+    let (server, dir) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/articles"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [article(ARTICLE_ID, "Older report", false, 0)], "next_cursor": null
+        })))
+        .mount(&server)
+        .await;
+    let out = lam(&dir, &["article", "list", "--read", "unread"]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Older report"));
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests[0].url.query_pairs().any(|(key, _)| key == "day"));
+}
+
+#[tokio::test]
+async fn article_list_rejects_malformed_day_before_http() {
+    let (server, dir) = setup().await;
+    for day in ["2026-2-01", "2026-02-30", "2026-02-01T00:00:00Z"] {
+        let out = lam(&dir, &["article", "list", "--day", day]);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("YYYY-MM-DD"));
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]

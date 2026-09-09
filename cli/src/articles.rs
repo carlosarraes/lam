@@ -401,11 +401,20 @@ fn unpublished_error(id: &str, error: anyhow::Error) -> anyhow::Error {
     anyhow!("article draft {id} was not published: {detail}")
 }
 
-pub fn list(read: ReadFilter, query: Option<&str>) -> Result<i32> {
+pub fn parse_day(value: &str) -> Result<chrono::NaiveDate, String> {
+    value
+        .parse::<chrono::NaiveDate>()
+        .ok()
+        .filter(|date| value.len() == 10 && date.to_string() == value)
+        .ok_or_else(|| "Use a valid calendar day in YYYY-MM-DD format".into())
+}
+
+pub fn list(read: ReadFilter, query: Option<&str>, day: Option<chrono::NaiveDate>) -> Result<i32> {
     let client = client()?;
+    let day = day.map(|date| date.to_string());
     let mut cursor = None;
     loop {
-        let page = client.article_page(read.as_str(), query, cursor.as_deref())?;
+        let page = client.article_page(read.as_str(), query, cursor.as_deref(), day.as_deref())?;
         for article in page.items {
             println!(
                 "{} {:<6} {:<24} {}",

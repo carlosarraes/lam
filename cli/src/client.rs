@@ -483,6 +483,7 @@ impl Client {
         read: &str,
         query: Option<&str>,
         cursor: Option<&str>,
+        day: Option<&str>,
     ) -> Result<ArticlePage> {
         let mut request = self.get("/v2/articles").query(&[("read", read)]);
         if let Some(query) = query {
@@ -490,6 +491,9 @@ impl Client {
         }
         if let Some(cursor) = cursor {
             request = request.query(&[("cursor", cursor)]);
+        }
+        if let Some(day) = day {
+            request = request.query(&[("day", day)]);
         }
         let response = request.send()?;
         if response.status() == StatusCode::NOT_FOUND {

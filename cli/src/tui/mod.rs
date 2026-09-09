@@ -24,6 +24,7 @@ pub enum Action {
     LoadArticles {
         query: String,
         read: String,
+        day: Option<String>,
         cursor: Option<String>,
         generation: u64,
     },
@@ -70,6 +71,7 @@ enum Mode {
     Reply(String),
     /// Live-filtering by title, agent display name, or body.
     Filter,
+    ArticleDate(String),
 }
 
 /// The queue you answer, and the record of what you already answered.
@@ -435,14 +437,16 @@ impl App {
 
     /// Translates a key press into an Action. Returns None when only internal state changed.
     pub fn handle(&mut self, key: KeyEvent) -> Option<Action> {
-        if !matches!(self.mode, Mode::Filter | Mode::Reply(_))
-            && key.code == KeyCode::Char('3')
+        if !matches!(
+            self.mode,
+            Mode::Filter | Mode::Reply(_) | Mode::ArticleDate(_)
+        ) && key.code == KeyCode::Char('3')
             && key.modifiers.contains(KeyModifiers::CONTROL)
         {
             return self.set_tab(Tab::Articles);
         }
         if self.tab == Tab::Articles {
-            let global = !matches!(self.mode, Mode::Filter)
+            let global = !matches!(self.mode, Mode::Filter | Mode::ArticleDate(_))
                 && (matches!(key.code, KeyCode::Char('h' | 'l' | 'q') | KeyCode::Esc)
                     || (key.modifiers.contains(KeyModifiers::CONTROL)
                         && matches!(key.code, KeyCode::Char('1' | '2' | 'c'))));
@@ -661,6 +665,7 @@ enum Job {
     Articles {
         query: String,
         read: String,
+        day: Option<String>,
         cursor: Option<String>,
         generation: u64,
     },
@@ -787,6 +792,7 @@ fn refresh_articles(app: &mut App, jobs: &mpsc::Sender<Job>) {
     if let Some(Action::LoadArticles {
         query,
         read,
+        day,
         cursor,
         generation,
     }) = app.articles.reload()
@@ -794,6 +800,7 @@ fn refresh_articles(app: &mut App, jobs: &mpsc::Sender<Job>) {
         let _ = jobs.send(Job::Articles {
             query,
             read,
+            day,
             cursor,
             generation,
         });
@@ -815,11 +822,17 @@ pub fn run(silent: bool) -> Result<i32> {
                 Job::Articles {
                     query,
                     read,
+                    day,
                     cursor,
                     generation,
                 } => {
                     let _ = net_tx.send(
-                        match client.article_page(read, Some(query), cursor.as_deref()) {
+                        match client.article_page(
+                            read,
+                            Some(query),
+                            cursor.as_deref(),
+                            day.as_deref(),
+                        ) {
                             Ok(page) => Msg::Articles {
                                 page,
                                 generation: *generation,
@@ -1048,11 +1061,13 @@ fn event_loop(
             Action::LoadArticles {
                 query,
                 read,
+                day,
                 cursor,
                 generation,
             } => Job::Articles {
                 query,
                 read,
+                day,
                 cursor,
                 generation,
             },

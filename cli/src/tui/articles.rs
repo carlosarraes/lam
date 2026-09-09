@@ -1,6 +1,7 @@
 use super::draw::{key, ACCENT, BOLD, DIM, META, RULE, SELECTION};
 use super::{Action, App, Mode};
 use crate::client::{Article, ArticlePage};
+use chrono::{DateTime, NaiveDate, Utc};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Style;
@@ -8,7 +9,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-#[derive(Default)]
 pub(super) struct ArticlesPane {
     pub items: Vec<Article>,
     pub selected: usize,
@@ -17,6 +17,7 @@ pub(super) struct ArticlesPane {
     pub loading: bool,
     pub query: String,
     pub read: usize,
+    pub day: Option<NaiveDate>,
     applied_query: String,
     applied_read: usize,
     requested_query: String,
@@ -24,6 +25,56 @@ pub(super) struct ArticlesPane {
     pub invalidated: bool,
     pub generation: u64,
     pub error: Option<String>,
+}
+
+fn today_at(now: DateTime<Utc>) -> NaiveDate {
+    now.with_timezone(&chrono_tz::America::Sao_Paulo)
+        .date_naive()
+}
+
+fn today() -> NaiveDate {
+    today_at(Utc::now())
+}
+
+fn day_label(day: Option<NaiveDate>, today: NaiveDate) -> String {
+    match day {
+        None => "All dates".into(),
+        Some(day) if day == today => format!("Today · {day}"),
+        Some(day) if Some(day) == today.pred_opt() => format!("Yesterday · {day}"),
+        Some(day) => day.format("%A · %Y-%m-%d").to_string(),
+    }
+}
+
+fn creation_time(value: &str) -> String {
+    DateTime::parse_from_rfc3339(value)
+        .map(|time| {
+            time.with_timezone(&chrono_tz::America::Sao_Paulo)
+                .format("%Y-%m-%d %H:%M %:z")
+                .to_string()
+        })
+        .unwrap_or_else(|_| format!("{value} (UTC)"))
+}
+
+impl Default for ArticlesPane {
+    fn default() -> Self {
+        Self {
+            items: vec![],
+            selected: 0,
+            cursor: None,
+            loaded: false,
+            loading: false,
+            query: String::new(),
+            read: 0,
+            day: Some(today()),
+            applied_query: String::new(),
+            applied_read: 0,
+            requested_query: String::new(),
+            requested_read: 0,
+            invalidated: false,
+            generation: 0,
+            error: None,
+        }
+    }
 }
 
 impl ArticlesPane {
@@ -48,9 +99,19 @@ impl ArticlesPane {
         Some(Action::LoadArticles {
             query: self.query.clone(),
             read: self.read_filter().into(),
+            day: self.day.map(|date| date.to_string()),
             cursor: self.cursor.clone(),
             generation: self.generation,
         })
+    }
+
+    fn set_day(&mut self, day: Option<NaiveDate>) -> Option<Action> {
+        if self.day != day {
+            self.items.clear();
+            self.selected = 0;
+            self.day = day;
+        }
+        self.load(true)
     }
 
     pub fn reload(&mut self) -> Option<Action> {
@@ -124,6 +185,34 @@ impl ArticlesPane {
 
 impl App {
     pub(super) fn handle_articles(&mut self, key: KeyEvent) -> Option<Action> {
+        if let Mode::ArticleDate(input) = &mut self.mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.mode = Mode::Normal;
+                    self.articles.error = None;
+                }
+                KeyCode::Enter => {
+                    match crate::articles::parse_day(input)
+                        .ok()
+                        .filter(|date| *date <= today())
+                    {
+                        Some(date) => {
+                            self.mode = Mode::Normal;
+                            return self.articles.set_day(Some(date));
+                        }
+                        None => {
+                            self.articles.error = Some("Use YYYY-MM-DD, today or earlier.".into())
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() || c == '-' => input.push(c),
+                _ => {}
+            }
+            return None;
+        }
         if matches!(self.mode, Mode::Filter) {
             match key.code {
                 KeyCode::Esc => {
@@ -144,6 +233,27 @@ impl App {
             return None;
         }
         match key.code {
+            KeyCode::Char('[') => self
+                .articles
+                .day
+                .unwrap_or_else(today)
+                .pred_opt()
+                .and_then(|date| self.articles.set_day(Some(date))),
+            KeyCode::Char(']') => self
+                .articles
+                .day
+                .and_then(|date| date.succ_opt())
+                .filter(|date| *date <= today())
+                .and_then(|date| self.articles.set_day(Some(date))),
+            KeyCode::Char('t') => self.articles.set_day(Some(today())),
+            KeyCode::Char('D') => {
+                self.mode = Mode::ArticleDate(String::new());
+                None
+            }
+            KeyCode::Char('U') => {
+                self.articles.read = 1;
+                self.articles.set_day(None)
+            }
             KeyCode::Char('/') => {
                 self.mode = Mode::Filter;
                 None
@@ -185,10 +295,11 @@ impl App {
     }
 
     pub(super) fn draw_articles(&self, frame: &mut Frame) {
-        let [header, body, footer] = Layout::vertical([
+        let [header, days, body, footer] = Layout::vertical([
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .areas(frame.area());
         let list_h =
@@ -211,6 +322,29 @@ impl App {
                 ),
             ],
         );
+        let newer_style = if self.articles.day.is_some_and(|day| day < today()) {
+            META
+        } else {
+            DIM
+        };
+        let label = Span::styled(day_label(self.articles.day, today()), BOLD);
+        let mut navigation = if days.width < 60 {
+            vec![
+                Span::styled("[ ", META),
+                label,
+                Span::styled(" ]", newer_style),
+            ]
+        } else {
+            vec![
+                label,
+                Span::styled("  [ older  ", META),
+                Span::styled("] newer", newer_style),
+            ]
+        };
+        if days.width >= 80 {
+            navigation.push(Span::styled("  · America/Sao_Paulo", DIM));
+        }
+        frame.render_widget(Paragraph::new(Line::from(navigation)), days);
         let rows: Vec<ListItem> = self
             .articles
             .items
@@ -269,7 +403,7 @@ impl App {
                         row.name,
                         row.source_host,
                         row.source_project,
-                        row.created_at,
+                        creation_time(&row.created_at),
                         if row.read_at.is_some() {
                             "read"
                         } else {
@@ -312,7 +446,16 @@ impl App {
                 .block(Block::default().borders(Borders::TOP).border_style(RULE)),
             detail,
         );
-        let footer_text = if matches!(self.mode, Mode::Filter) {
+        let footer_text = if let Mode::ArticleDate(input) = &self.mode {
+            vec![
+                Line::from(vec![
+                    Span::styled("date YYYY-MM-DD› ", ACCENT),
+                    Span::raw(input.clone()),
+                    Span::styled("█", ACCENT),
+                ]),
+                Line::from([key("Enter", "jump"), key("Esc", "cancel")].concat()),
+            ]
+        } else if matches!(self.mode, Mode::Filter) {
             vec![
                 Line::from(vec![
                     Span::styled("filter› ", ACCENT),
@@ -344,6 +487,15 @@ impl App {
                     ),
                     DIM,
                 )),
+                Line::from(
+                    [
+                        key("[/]", "day"),
+                        key("t", "Today"),
+                        key("D", "jump date"),
+                        key("U", "All unread"),
+                    ]
+                    .concat(),
+                ),
             ]
         };
         frame.render_widget(Paragraph::new(footer_text), footer);
@@ -394,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn articles_share_request_header_selection_and_detail_geometry() {
+    fn articles_share_request_header_and_selection_styling_below_day_navigation() {
         for width in [40, 80, 130] {
             let mut app = App::new("host".into());
             app.status = "live".into();
@@ -415,19 +567,19 @@ mod tests {
                 );
             }
             assert_eq!(
-                articles[(0, 1)].symbol(),
+                articles[(0, 2)].symbol(),
                 requests[(0, 1)].symbol(),
-                "list rule stays put"
+                "list keeps the shared rule below the day row"
             );
             assert_eq!(
-                articles[(0, 2)].bg,
+                articles[(0, 3)].bg,
                 requests[(0, 2)].bg,
                 "same selection highlight"
             );
             assert_eq!(
-                articles[(0, 4)].symbol(),
+                articles[(0, 5)].symbol(),
                 requests[(0, 4)].symbol(),
-                "detail rule stays put"
+                "detail keeps the shared rule"
             );
             if width == 130 {
                 let header: String = (0..width).map(|x| articles[(x, 0)].symbol()).collect();
@@ -435,6 +587,49 @@ mod tests {
                 assert!(header.contains("● live"));
             }
         }
+    }
+
+    #[test]
+    fn day_navigation_remains_above_empty_and_failed_lists_in_small_terminals() {
+        for (width, height) in [(30, 8), (40, 10), (80, 24)] {
+            for empty in [true, false] {
+                let mut app = App::new("host".into());
+                app.handle(key('h'));
+                app.articles.day = Some("2026-09-08".parse().unwrap());
+                let items = if empty {
+                    vec![]
+                } else {
+                    vec![article("one", false, 0)]
+                };
+                app.articles.add(page(items, None), 0, true);
+                app.articles.error =
+                    Some("A long error message that fills the detail pane ".repeat(8));
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| app.draw(frame)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let day_row: String = (0..width).map(|x| buffer[(x, 1)].symbol()).collect();
+                assert!(
+                    day_row.contains("2026-09-08"),
+                    "{width}x{height}: {day_row}"
+                );
+                assert!(
+                    day_row.contains('[') && day_row.contains(']'),
+                    "{width}x{height}: {day_row}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selected_article_creation_time_uses_sao_paulo_calendar_day() {
+        let mut app = App::new("host".into());
+        app.handle(key('h'));
+        let mut row = article("one", false, 0);
+        row.created_at = "2026-09-09T02:15:00.000Z".into();
+        app.articles.add(page(vec![row], None), 0, true);
+        let rendered = render(&app);
+        assert!(rendered.contains("2026-09-08 23:15 -03:00"));
+        assert!(!rendered.contains("2026-09-09T02:15"));
     }
 
     #[test]
@@ -448,6 +643,125 @@ mod tests {
         let text = render(&app);
         assert!(text.contains("Article open failed"));
         assert!(text.contains("Press R to retry"));
+    }
+
+    #[test]
+    fn day_navigation_replaces_rows_and_rejects_old_pages() {
+        let mut app = App::new("host".into());
+        app.handle(key('h'));
+        app.articles.add(
+            page(vec![article("old", false, 0)], Some("old-cursor")),
+            0,
+            true,
+        );
+        assert!(matches!(
+            app.handle(key('[')),
+            Some(Action::LoadArticles {
+                cursor: None,
+                generation: 1,
+                ..
+            })
+        ));
+        assert!(app.articles.items.is_empty());
+        app.articles
+            .add(page(vec![article("late", false, 0)], None), 0, false);
+        assert!(app.articles.items.is_empty());
+        assert!(render(&app).contains("Yesterday"));
+        app.handle(key('t'));
+        assert_eq!(app.handle(key(']')), None);
+        assert!(render(&app).contains("Today"));
+    }
+
+    #[test]
+    fn calendar_day_uses_sao_paulo_midnight_and_year_boundaries() {
+        for (instant, expected) in [
+            ("2026-01-01T02:59:59Z", "2025-12-31"),
+            ("2026-01-01T03:00:00Z", "2026-01-01"),
+        ] {
+            let now = instant.parse::<DateTime<Utc>>().unwrap();
+            assert_eq!(today_at(now).to_string(), expected);
+        }
+        let today = "2026-01-01".parse::<NaiveDate>().unwrap();
+        assert_eq!(day_label(today.pred_opt(), today), "Yesterday · 2025-12-31");
+        assert_eq!(
+            day_label(Some("2025-12-30".parse().unwrap()), today),
+            "Tuesday · 2025-12-30"
+        );
+    }
+
+    #[test]
+    fn date_jump_preserves_filters_through_paging_and_reconnect() {
+        let mut app = App::new("host".into());
+        app.handle(key('h'));
+        app.handle(key('f'));
+        app.handle(key('/'));
+        for c in "report".chars() {
+            app.handle(key(c));
+        }
+        app.handle(KeyEvent::from(KeyCode::Enter));
+        app.handle(key('D'));
+        for c in "2024-02-29".chars() {
+            app.handle(key(c));
+        }
+        let action = app.handle(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(action, Some(Action::LoadArticles { day: Some(day), query, read, cursor: None, .. }) if day == "2024-02-29" && query == "report" && read == "unread")
+        );
+        let generation = app.articles.generation;
+        app.articles.add(
+            page(vec![article("one", false, 0)], Some("next")),
+            generation,
+            true,
+        );
+        assert!(
+            matches!(app.handle(key('j')), Some(Action::LoadArticles { day: Some(day), cursor: Some(cursor), .. }) if day == "2024-02-29" && cursor == "next")
+        );
+        app.articles.loading = false;
+        app.handle(key('D'));
+        for c in "2024-03".chars() {
+            app.handle(key(c));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        super::super::refresh_articles(&mut app, &tx);
+        assert!(
+            matches!(rx.recv().unwrap(), super::super::Job::Articles { day: Some(day), query, read, cursor: None, .. } if day == "2024-02-29" && query == "report" && read == "unread")
+        );
+        app.handle(KeyEvent::from(KeyCode::Esc));
+        assert!(
+            matches!(app.handle(key('U')), Some(Action::LoadArticles { day: None, query, read, .. }) if query == "report" && read == "unread")
+        );
+        assert!(app.articles.items.is_empty());
+        assert!(render(&app).contains("All dates"));
+        assert!(
+            matches!(app.handle(key('f')), Some(Action::LoadArticles { day: None, read, .. }) if read == "read")
+        );
+        assert!(
+            matches!(app.handle(key('t')), Some(Action::LoadArticles { day: Some(_), read, .. }) if read == "read")
+        );
+    }
+
+    #[test]
+    fn date_entry_rejects_invalid_and_future_days_without_navigation() {
+        let mut app = App::new("host".into());
+        app.handle(key('h'));
+        for invalid in ["2026-02-30", "2999-01-01", "2026-2-01", ""] {
+            app.handle(key('D'));
+            for c in invalid.chars() {
+                app.handle(key(c));
+            }
+            assert_eq!(app.handle(KeyEvent::from(KeyCode::Enter)), None);
+            assert!(matches!(app.mode, Mode::ArticleDate(_)));
+            assert!(render(&app).contains("Use YYYY-MM-DD"));
+            app.handle(KeyEvent::from(KeyCode::Esc));
+            assert_eq!(app.articles.day, Some(today()));
+        }
+        app.handle(key('D'));
+        app.handle(key('h'));
+        app.handle(key('l'));
+        assert_eq!(app.tab, super::super::Tab::Articles);
+        assert_eq!(app.mode, Mode::ArticleDate(String::new()));
+        app.handle(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.handle(key('q')), Some(Action::Quit));
     }
 
     #[test]
@@ -604,6 +918,7 @@ mod tests {
             Some(Action::LoadArticles {
                 query: "a".into(),
                 read: "all".into(),
+                day: Some(today().to_string()),
                 cursor: None,
                 generation: 1
             })
@@ -619,6 +934,7 @@ mod tests {
             Some(Action::LoadArticles {
                 query: "a".into(),
                 read: "unread".into(),
+                day: Some(today().to_string()),
                 cursor: None,
                 generation: 2
             })
