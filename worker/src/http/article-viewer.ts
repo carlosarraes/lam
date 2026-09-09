@@ -9,6 +9,8 @@ import { BadRequest, DbError, Forbidden, Unauthorized } from "../domain/Item";
 import { Articles } from "../services/Articles";
 import { hmacDigest, constantTimeEqual, RequestAuthority } from "../services/Auth";
 import { bearer } from "./api";
+import { readerControls, readerStyle, themeIcons } from "./reader-controls";
+import { applyReaderTheme } from "./reader-appearance";
 
 const Id = Schema.Struct({ id: Schema.String.pipe(Schema.pattern(/^[a-f0-9-]{36}$/)) });
 const AssetId = Schema.Struct({ ...Id.fields, index: Schema.NumberFromString.pipe(Schema.int(), Schema.between(0, 50)) });
@@ -109,6 +111,22 @@ export function viewerParts(source: string, assets: readonly Asset[], mode: "des
   };
   const rewriteCss = (source: string, context: "stylesheet" | "declarationList" | "value") => {
     const ast = css.parse(source, { context });
+    // Partition mixed SVG/HTML rules without multiplying declarations per selector.
+    // Clone before URL rewriting: each declaration copy needs its own resource slot.
+    if (mode === "desktop") css.walk(ast, { leave(node: css.CssNode, item: css.ListItem<css.CssNode>, list: css.List<css.CssNode>) {
+      if (node.type !== "Rule" || node.prelude?.type !== "SelectorList" || node.prelude.children.size < 2 || !item || !list) return;
+      const svg: css.CssNode[] = [], html: css.CssNode[] = [];
+      node.prelude.children.forEach(selector => {
+        const group = /(^|[\s,>+~])(?:svg|image)(?=[\s.#:[>+~,]|$)/i.test(css.generate(selector)) ? svg : html;
+        group.push(selector);
+      });
+      if (!svg.length || !html.length) return;
+      list.insertData({ ...node,
+        prelude: { ...node.prelude, children: new css.List<css.CssNode>().fromArray(svg) },
+        block: css.clone(node.block) as css.Block,
+      }, item);
+      node.prelude.children = new css.List<css.CssNode>().fromArray(html);
+    } });
     css.walk(ast, node => { if (node.type === "Url") node.value = resource(node.value); });
     // Display-only gradient hooks preserve image layers and the author's original palette.
     if (mode === "desktop") css.walk(ast, { leave(node: css.CssNode) {
@@ -162,41 +180,41 @@ export function viewerParts(source: string, assets: readonly Asset[], mode: "des
 
 // The iframe receives no JavaScript, credentials, cookie access or same-origin permission.
 function wrapper(nonce: string): string {
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>LAM article</title><style>body{margin:0;font:16px system-ui;background:#fafafa;color:#202020}header{padding:12px}button,select{font:inherit;margin:4px;padding:6px}html[data-theme=dark]{color-scheme:dark}html[data-theme=dark] body{background:#17191d;color:#e7e8ec}html[data-theme=dark] iframe{background:#17191d}iframe{width:100%;height:80vh;border:0;background:white}#status{white-space:pre-wrap}#attachments{display:flex;flex-wrap:wrap}</style></head><body><header><h1 id="title">Article</h1><p id="status" role="status">Opening article…</p><button id="retry" hidden>Retry</button><button id="smaller">Zoom out</button><button id="larger">Zoom in</button><label for="theme">Theme</label><select id="theme"><option value="system">System</option><option value="dark">Dark</option><option value="original">Original</option></select><div id="attachments"></div></header><main><iframe title="Article content" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" hidden></iframe></main><script nonce="${nonce}">
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>LAM article</title><style>${readerStyle}</style></head><body>${readerControls}<main><iframe title="Article content" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" hidden></iframe></main><script nonce="${nonce}">
 (() => {
+  const applyReaderTheme = ${applyReaderTheme.toString()};
   let bootstrap = location.hash.slice(1); history.replaceState(null, '', location.pathname);
   let token, captured, manifest, loaded = false, attempted = false, opening = false, zoom = 1, imageNotice = '';
   const base = location.pathname, frame = document.querySelector('iframe'), status = document.querySelector('#status'), retry = document.querySelector('#retry');
   const theme = document.querySelector('#theme'), systemTheme = matchMedia('(prefers-color-scheme: dark)');
-  let originalHtml = '', renderedTheme;
-  try { const saved = localStorage.getItem('lam.article.theme'); if (['system','dark','original'].includes(saved)) theme.value = saved; } catch {}
+  const themeIcons = ${JSON.stringify(themeIcons)};
+  let originalHtml = '', renderedTheme, preference = 'system';
+  try { const saved = localStorage.getItem('lam.article.theme'); if (['system','dark','light','original'].includes(saved)) preference = saved; } catch {}
   function renderTheme() {
-    const dark = theme.value === 'dark' || (theme.value === 'system' && systemTheme.matches);
-    document.documentElement.dataset.theme = dark ? 'dark' : 'original';
-    if (!originalHtml || renderedTheme === dark) return;
-    let html = originalHtml;
-    if (dark) {
-      const doc = new DOMParser().parseFromString(originalHtml, 'text/html');
-      for (const element of [doc.documentElement, doc.body, ...doc.body.querySelectorAll('*')]) {
-        if (element.namespaceURI !== 'http://www.w3.org/1999/xhtml' || element.matches('img, picture, source, style, script')) continue;
-        element.style.setProperty('background-color', '#17191d', 'important');
-        element.style.setProperty('color', element.matches('a') ? '#e8ba70' : '#e7e8ec', 'important');
-        element.style.setProperty('border-color', '#41444d', 'important');
-        element.style.setProperty('box-shadow', 'none', 'important');
-        element.style.setProperty('--lam-viewer-gradient', 'none', 'important');
-      }
-      // A neutral backing keeps transparent diagrams legible without recoloring their paint.
-      const mediaStyle = doc.createElement('style');
-      mediaStyle.textContent = 'svg,img,picture{--lam-viewer-gradient:initial!important}@layer lamViewerMedia{svg{background-color:white;color:#202020}}';
-      doc.head.append(mediaStyle);
-      html = '<!doctype html>' + doc.documentElement.outerHTML;
-    }
-    renderedTheme = dark;
+    const effective = preference === 'system' ? (systemTheme.matches ? 'dark' : 'light') : preference;
+    document.documentElement.dataset.theme = effective;
+    theme.innerHTML = themeIcons[preference];
+    const next = {system:'dark',dark:'light',light:'system',original:'system'}[preference];
+    theme.title = preference + ' theme; switch to ' + next;
+    theme.setAttribute('aria-label', theme.title);
+    if (!originalHtml || renderedTheme === effective) return;
+    const html = effective === 'original' ? originalHtml : applyReaderTheme(originalHtml, effective);
+    renderedTheme = effective;
     loaded = false;
     frame.srcdoc = html;
   }
-  theme.onchange = () => { try { localStorage.setItem('lam.article.theme', theme.value); } catch {} renderTheme(); };
-  systemTheme.addEventListener('change', () => { if (theme.value === 'system') renderTheme(); });
+  const chooseTheme = value => { preference = value; try { localStorage.setItem('lam.article.theme', value); } catch {} renderTheme(); };
+  theme.onclick = () => chooseTheme({system:'dark',dark:'light',light:'system',original:'system'}[preference]);
+  document.querySelector('#original').onclick = () => chooseTheme('original');
+  systemTheme.addEventListener('change', () => { if (preference === 'system') renderTheme(); });
+  const controls = document.querySelector('#controls'), controlsToggle = document.querySelector('#controls-toggle');
+  const showControls = open => { controls.hidden = !open; document.querySelector('#controls-dismiss').hidden = !open; controlsToggle.setAttribute('aria-expanded', String(open)); };
+  controlsToggle.onclick = () => showControls(controls.hidden);
+  document.addEventListener('pointerdown', event => { if (!controls.contains(event.target) && !controlsToggle.contains(event.target)) showControls(false); });
+  document.addEventListener('keydown', event => { if (event.key === 'Escape' && !controls.hidden) { showControls(false); controlsToggle.focus(); } });
+  const attachmentsToggle = document.querySelector('#attachments-toggle');
+  attachmentsToggle.onclick = () => { const attachments = document.querySelector('#attachments'); attachments.hidden = !attachments.hidden; attachmentsToggle.setAttribute('aria-expanded', String(!attachments.hidden)); };
+  new MutationObserver(() => { status.dataset.quiet = String(status.textContent === 'Opened · read'); }).observe(status, {childList:true,subtree:true,characterData:true});
   renderTheme();
   const call = (path, method = 'GET', body, credential = token) => fetch(base + path, { method, credentials:'omit', cache:'no-store', referrerPolicy:'no-referrer', headers:{Authorization:'Bearer ' + credential, 'Content-Type':'application/json'}, body:body === undefined ? undefined : JSON.stringify(body) });
   const failed = message => { status.textContent = message; retry.hidden = false; };
@@ -285,6 +303,8 @@ function wrapper(nonce: string): string {
         };
         attachments.append(button);
       });
+      attachmentsToggle.hidden = attachments.childElementCount === 0;
+      document.querySelector('#attachments-label').textContent = 'Attachments · ' + attachments.childElementCount;
       frame.onload = () => { loaded = true; requestAnimationFrame(() => { void markRead(); }); };
       frame.hidden = false; originalHtml = html.join(''); renderedTheme = undefined; renderTheme();
       status.textContent = 'Opening article… Images may be unavailable if the session expires.';
@@ -294,8 +314,9 @@ function wrapper(nonce: string): string {
   retry.onclick = () => { void openArticle(); };
   document.addEventListener('visibilitychange', () => { void markRead(); });
   new IntersectionObserver(() => { void markRead(); }).observe(frame);
-  document.querySelector('#smaller').onclick = () => { zoom = Math.max(.5, zoom - .1); frame.style.zoom = zoom; frame.style.width = (100/zoom) + '%'; };
-  document.querySelector('#larger').onclick = () => { zoom = Math.min(2, zoom + .1); frame.style.zoom = zoom; frame.style.width = (100/zoom) + '%'; };
+  const resize = delta => { zoom = Math.max(.5, Math.min(2, Math.round((zoom + delta) * 10) / 10)); frame.style.zoom = zoom; frame.style.width = (100/zoom) + '%'; frame.style.height = 'calc((100dvh - 60px) / ' + zoom + ')'; document.querySelector('#zoom-level').textContent = Math.round(zoom * 100) + '%'; };
+  document.querySelector('#smaller').onclick = () => resize(-.1);
+  document.querySelector('#larger').onclick = () => resize(.1);
   void openArticle();
 })();</script></body></html>`;
 }

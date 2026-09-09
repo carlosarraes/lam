@@ -30,9 +30,13 @@ async function inspector() {
   await new Promise((resolve, reject) => { socket.onopen = resolve; socket.onerror = reject; });
   let serial = 0;
   const pending = new Map();
+  const logged = new Set();
   socket.onmessage = event => {
     const response = JSON.parse(event.data);
-    if (response.method === "Log.entryAdded") console.log("Frame log:", response.params.entry.text.replace(/(?:blob:)?https?:\/\/[^\s"']+/g, "[URL]"));
+    if (response.method === "Log.entryAdded") {
+      const message = response.params.entry.text.replace(/(?:blob:)?https?:\/\/[^\s"']+/g, "[URL]");
+      if (!logged.has(message)) { logged.add(message); console.log("Frame log:", message); }
+    }
     if (!response.id) return;
     const operation = pending.get(response.id); pending.delete(response.id);
     if (response.error) operation.reject(new Error("CDP operation failed")); else operation.resolve(response.result);
@@ -96,7 +100,10 @@ try {
   }
   const api = (path, method = "GET", body) => fetch(origin + path, { method, headers: { Authorization: "Bearer browser-test-token", "Idempotency-Key": crypto.randomUUID() }, body: body === undefined ? undefined : JSON.stringify(body) });
   const png = await readFile("test/fixtures/articles/chart.png");
-  const source = (await readFile("test/fixtures/articles/show-me.html", "utf8")).replace("https://example.com/explicit", `${canaryOrigin}/explicit`);
+  const source = (await readFile("test/fixtures/articles/show-me.html", "utf8"))
+    .replace("https://example.com/explicit", `${canaryOrigin}/explicit`)
+    .replace("</style>", "svg,.addition{color:#286440;background:#eaf2e9}.deletion{color:#a13f41;background:#f7eaea}.gradient{background:linear-gradient(white,#eee)}</style>")
+    .replace("</main>", '<pre><span class="addition">+ preserve meaning</span><span class="deletion">- flatten colors</span></pre><p class="gradient">Gradient</p><p id="inline-color" style="color:rgb(30,100,50);background-color:rgb(220,245,225)">Inline addition</p></main>');
   const notes = await readFile("test/fixtures/articles/notes.txt");
   await writeFile(join(folder, "index.html"), source);
   await copyFile("test/fixtures/articles/chart.png", join(folder, "chart.png"));
@@ -153,15 +160,68 @@ try {
   assert.match(await browser("eval", "JSON.stringify({fragment:location.hash, isolated:document.querySelector('iframe').contentDocument === null})"), /isolated.*true/);
   assert.equal(hits.length, 0, "no automatic canary request");
   debug = await inspector();
-  await browser("select", "#theme", "dark");
+  const clickControl = async selector => {
+    const { targetInfos } = await debug.call("Target.getTargets");
+    const parent = targetInfos.find(target => target.type === "page" && target.url.includes(`/view/articles/${id}`));
+    assert.ok(parent, "the reader wrapper has a page target");
+    const { sessionId } = await debug.call("Target.attachToTarget", { targetId: parent.targetId, flatten: true });
+    await debug.call("Page.bringToFront", {}, sessionId);
+    // Wait for the newly revealed overlay to reach Chromium's compositor hit-test tree.
+    await debug.call("Runtime.evaluate", { expression: "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))", awaitPromise: true }, sessionId);
+    const result = await debug.call("Runtime.evaluate", { expression: `(() => {const e=document.querySelector(${JSON.stringify(selector)}); const r=e.getBoundingClientRect(); return {x:r.x+r.width/2,y:r.y+r.height/2};})()`, returnByValue: true }, sessionId);
+    const { x, y } = result.result.value;
+    await debug.call("Input.dispatchMouseEvent", { type: "mouseMoved", x, y }, sessionId);
+    await debug.call("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 }, sessionId);
+    await debug.call("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 }, sessionId);
+  };
+  const themedFrame = async background => {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      try {
+        const candidate = await debug.frame();
+        if (await candidate.evaluate("document.readyState === 'complete' && getComputedStyle(document.body).backgroundColor") === background) return candidate;
+      } catch { /* Frame targets and execution contexts change during srcdoc navigation. */ }
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    throw new Error("the themed article frame did not finish rendering");
+  };
+  assert.match(await browser("eval", "document.querySelector('#controls')?.hidden"), /true/, "reader starts without distracting controls");
+  await clickControl("#controls-toggle");
+  await clickControl("#theme");
+  assert.match(await browser("eval", "localStorage.getItem('lam.article.theme')"), /dark/);
   await browser("wait", "--fn", "document.documentElement.dataset.theme === 'dark'");
-  assert.equal(await (await debug.frame()).evaluate("getComputedStyle(document.body).backgroundColor"), "rgb(23, 25, 29)");
+  const darkFrame = await themedFrame("rgb(25, 26, 29)");
+  const colors = await darkFrame.evaluate("['.addition','.deletion','#inline-color'].map(s=>getComputedStyle(document.querySelector(s)).color.match(/[0-9.]+/g).map(Number))");
+  assert.ok(colors[0][1] > colors[0][0] && colors[0][1] > colors[0][2], "dark additions retain green");
+  assert.ok(colors[1][0] > colors[1][1] && colors[1][0] > colors[1][2], "dark deletions retain red");
+  assert.ok(colors[2][1] > colors[2][0], "inline author colors are adapted too");
+  const backgrounds = await darkFrame.evaluate("['.addition','.deletion'].map(s=>getComputedStyle(document.querySelector(s)).backgroundColor.match(/[0-9.]+/g).map(Number))");
+  assert.ok(backgrounds[0][1] > backgrounds[0][0] && backgrounds[0][1] > backgrounds[0][2], "pale green diff backgrounds retain hue in dark mode");
+  assert.ok(backgrounds[1][0] > backgrounds[1][1], "pale red diff backgrounds retain hue in dark mode");
+  assert.equal(await darkFrame.evaluate("getComputedStyle(document.querySelector('.gradient')).backgroundImage"), "none");
+  assert.equal(await darkFrame.evaluate("getComputedStyle(document.querySelector('svg')).color"), "rgb(40, 100, 64)", "diagram colors are not rewritten");
+  await browser("screenshot", join(folder, "reader-controls.png"));
+  await browser("press", "Escape");
+  assert.match(await browser("eval", "document.querySelector('#controls').hidden"), /true/);
+  await darkFrame.evaluate("document.querySelector('.addition').scrollIntoView({block:'center'})");
+  await browser("screenshot", join(folder, "reader-dark.png"));
   assert.equal((await readState()).version, 1, "theme changes do not acknowledge read again");
   await openSession();
-  assert.match(await browser("eval", "document.querySelector('#theme').value"), /dark/, "theme preference survives reopening");
-  await browser("select", "#theme", "original");
+  assert.match(await browser("eval", "document.documentElement.dataset.theme"), /dark/, "theme preference survives reopening");
+  await clickControl("#controls-toggle");
+  await clickControl("#theme");
+  await browser("wait", "--fn", "document.documentElement.dataset.theme === 'light'");
+  const lightFrame = await themedFrame("rgb(248, 247, 243)");
+  const lightColors = await lightFrame.evaluate("['.addition','.deletion'].map(s=>getComputedStyle(document.querySelector(s)).color.match(/[0-9.]+/g).map(Number))");
+  assert.ok(lightColors[0][1] > lightColors[0][0] && lightColors[1][0] > lightColors[1][1], "light theme preserves semantic color too");
+  await clickControl("#controls-dismiss");
+  await lightFrame.evaluate("document.querySelector('.addition').scrollIntoView({block:'center'})");
+  await browser("screenshot", join(folder, "reader-light.png"));
+  await clickControl("#controls-toggle");
+  await clickControl("#original");
   await browser("wait", "--fn", "document.documentElement.dataset.theme === 'original'");
-  const frame = await debug.frame();
+  const frame = await themedFrame("rgb(245, 247, 250)");
+  await clickControl("#controls-dismiss");
+  assert.match(await browser("eval", "document.querySelector('#controls').hidden"), /true/, "outside click dismisses controls without entering the article frame");
   assert.equal(await frame.evaluate("document.querySelector('img').naturalWidth"), 240);
   assert.equal(await frame.evaluate("document.querySelector('svg').textContent.includes('Prepare report')"), true);
   assert.deepEqual(await frame.evaluate("Array.from(document.querySelector('table')?.rows ?? [], row => Array.from(row.cells, cell => cell.textContent.trim()))"), [
@@ -184,9 +244,11 @@ try {
   assert.equal(hits.length, 1);
   assert.deepEqual(hits[0], { url: "/explicit", referrer: undefined, authorization: undefined, cookie: undefined });
   await browser("tab", "t1");
+  await clickControl("#controls-toggle");
+  await clickControl("#attachments-toggle");
   await browser("download", "#attachments button", join(folder, "downloaded-notes.txt"));
   assert.deepEqual(await readFile(join(folder, "downloaded-notes.txt")), notes);
-  await browser("find", "text", "Zoom in", "click");
+  await clickControl("#larger");
   assert.match(await browser("eval", "document.querySelector('iframe').style.zoom"), /1.1/);
   await frame.evaluate("scrollTo(0,0)");
   await browser("eval", "scrollTo(0,0); void 0");
@@ -232,6 +294,21 @@ try {
   assert.match(await browser("eval", "document.querySelector('#title').textContent"), /Show-me delivery report/);
   assert.match(await browser("eval", "document.querySelector('iframe').contentDocument === null"), /true/);
   const newerUnread = await unread();
+  await clickControl("#controls-toggle");
+  // Original -> System -> Dark -> Light -> System also exercises untrusted
+  // markup conversion in the parent without granting article scripts access.
+  for (const preference of ["system", "dark", "light", "system"]) {
+    await clickControl("#theme");
+    assert.match(await browser("eval", "localStorage.getItem('lam.article.theme')"), new RegExp(preference));
+    const expected = preference === "system"
+      ? (await browser("eval", "matchMedia('(prefers-color-scheme: dark)').matches")).trim() === "true" ? "rgb(25, 26, 29)" : "rgb(248, 247, 243)"
+      : preference === "dark" ? "rgb(25, 26, 29)" : "rgb(248, 247, 243)";
+    const converted = await themedFrame(expected);
+    assert.equal(await converted.evaluate("window.attackExecuted === undefined"), true);
+    assert.equal(hits.length, 1, "theme conversion cannot fetch attack resources");
+    assert.equal((await readState()).version, newerUnread, "theme changes keep newer unread state");
+  }
+  await clickControl("#controls-dismiss");
   await browser("tab", "t2");
   await browser("tab", "t1");
   await new Promise(resolve => setTimeout(resolve, 100));
@@ -295,6 +372,8 @@ try {
 
   // Expire the real D1 viewer sessions and exercise the visible download control.
   await db.prepare("UPDATE article_view_sessions SET expires_at = '2000-01-01T00:00:00.000Z' WHERE article_id = ?").bind(id).run();
+  await clickControl("#controls-toggle");
+  await clickControl("#attachments-toggle");
   await browser("click", "#attachments button");
   await browser("wait", "--text", "Download failed. Try the download button again.");
   assert.equal((await readState()).version, unreadAfterFailure);
