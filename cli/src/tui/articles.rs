@@ -1,8 +1,10 @@
+use super::draw::{key, ACCENT, BOLD, DIM, META, RULE, SELECTION};
 use super::{Action, App, Mode};
 use crate::client::{Article, ArticlePage};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
@@ -183,22 +185,66 @@ impl App {
     }
 
     pub(super) fn draw_articles(&self, frame: &mut Frame) {
-        let [header, list, detail, footer] = Layout::vertical([
-            Constraint::Length(2),
+        let [header, body, footer] = Layout::vertical([
+            Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(7),
-            Constraint::Length(3),
+            Constraint::Length(2),
         ])
         .areas(frame.area());
-        frame.render_widget(
-            Paragraph::new(format!(
-                "lam  requests  history  [articles]   {}\nFilter: {}  /{}{}{}",
-                self.host,
+        let list_h =
+            (self.articles.items.len() as u16 + 1).clamp(3, (frame.area().height / 3).max(3));
+        let [list, detail] =
+            Layout::vertical([Constraint::Length(list_h), Constraint::Min(3)]).areas(body);
+        self.draw_header(
+            frame,
+            header,
+            vec![
+                Span::styled("lam", BOLD),
+                Span::styled(format!("  {} articles", self.articles.items.len()), META),
+                Span::styled(
+                    if self.articles.loading {
+                        "  loading…"
+                    } else {
+                        ""
+                    },
+                    ACCENT,
+                ),
+            ],
+        );
+        let rows: Vec<ListItem> = self
+            .articles
+            .items
+            .iter()
+            .map(|row| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if row.read_at.is_some() {
+                            "read    "
+                        } else {
+                            "unread  "
+                        },
+                        if row.read_at.is_some() { DIM } else { ACCENT },
+                    ),
+                    Span::styled(format!("{}  ", row.name), META),
+                    Span::raw(row.title.clone()),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default().with_selected(Some(self.articles.selected));
+        frame.render_stateful_widget(
+            List::new(rows)
+                .block(Block::default().borders(Borders::TOP).border_style(RULE))
+                .highlight_style(Style::default().bg(SELECTION)),
+            list,
+            &mut state,
+        );
+        let mut lines = vec![Line::from(Span::styled(
+            format!(
+                "Filter: {}  /{}{}",
                 ["all", "unread", "read"][self.articles.applied_read],
                 self.articles.applied_query,
                 if self.articles.query != self.articles.applied_query
                     || self.articles.read != self.articles.applied_read
-                    || matches!(self.mode, Mode::Filter)
                 {
                     format!(
                         " · pending: {} /{}",
@@ -208,73 +254,99 @@ impl App {
                 } else {
                     String::new()
                 },
-                if matches!(self.mode, Mode::Filter) {
-                    "█"
-                } else {
-                    ""
-                }
-            )),
-            header,
-        );
-        let rows: Vec<ListItem> = self
-            .articles
-            .items
-            .iter()
-            .map(|row| {
-                ListItem::new(format!(
-                    "{}  {}  {}",
-                    if row.read_at.is_some() {
-                        "read  "
-                    } else {
-                        "unread"
-                    },
-                    row.name,
-                    row.title
-                ))
-            })
-            .collect();
-        let mut state = ListState::default().with_selected(Some(self.articles.selected));
-        frame.render_stateful_widget(
-            List::new(rows)
-                .block(Block::default().borders(Borders::TOP))
-                .highlight_style(Style::default().fg(Color::Yellow)),
-            list,
-            &mut state,
-        );
-        let text = match self.articles.items.get(self.articles.selected) {
-            Some(row) => format!(
-                "{}\n{}\n{} · {} · {}\n{} attachments · {}",
-                row.title,
-                row.summary,
-                row.source_host,
-                row.source_project,
-                row.created_at,
-                row.assets
-                    .iter()
-                    .filter(|asset| matches!(
-                        asset.disposition,
-                        crate::client::ArticleAssetDisposition::Attachment
-                    ))
-                    .count(),
-                if row.read_at.is_some() {
-                    "read"
-                } else {
-                    "unread"
-                }
             ),
-            None if self.articles.loading => "Loading articles…".into(),
-            None if self.articles.error.is_some() => {
-                "Articles could not be loaded. Press R to retry.".into()
+            DIM,
+        ))];
+        if let Some(error) = &self.articles.error {
+            lines.insert(0, Line::from(Span::styled("Press R to retry", META)));
+            lines.insert(0, Line::from(Span::styled(error.clone(), ACCENT)));
+        }
+        match self.articles.items.get(self.articles.selected) {
+            Some(row) => {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{} · {} · {} · {} · {}",
+                        row.name,
+                        row.source_host,
+                        row.source_project,
+                        row.created_at,
+                        if row.read_at.is_some() {
+                            "read"
+                        } else {
+                            "unread"
+                        },
+                    ),
+                    META,
+                )));
+                lines.push(Line::from(Span::styled(row.title.clone(), BOLD)));
+                lines.extend(row.summary.lines().map(|line| Line::raw(line.to_string())));
+                let attachments = row
+                    .assets
+                    .iter()
+                    .filter(|asset| {
+                        matches!(
+                            asset.disposition,
+                            crate::client::ArticleAssetDisposition::Attachment
+                        )
+                    })
+                    .count();
+                lines.push(Line::from(Span::styled(
+                    format!("{attachments} attachments"),
+                    META,
+                )));
             }
-            None => "No articles match this filter.".into(),
-        };
+            None => lines.push(Line::from(Span::styled(
+                if self.articles.loading {
+                    "Loading articles…"
+                } else if self.articles.error.is_some() {
+                    "Articles could not be loaded. Press R to retry."
+                } else {
+                    "No articles match this filter."
+                },
+                META,
+            ))),
+        }
         frame.render_widget(
-            Paragraph::new(text)
+            Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .block(Block::default().borders(Borders::TOP)),
+                .block(Block::default().borders(Borders::TOP).border_style(RULE)),
             detail,
         );
-        frame.render_widget(Paragraph::new(format!("h requests · l history · a articles · ^3 articles · j/k move · Enter open · u unread\n/ search · Enter apply · f all/unread/read · R refresh · q quit\n{}{}", self.articles.error.as_deref().unwrap_or(&self.status), if self.articles.loading { " · loading" } else if self.articles.cursor.is_some() { " · more below" } else { " · end" })), footer);
+        let footer_text = if matches!(self.mode, Mode::Filter) {
+            vec![
+                Line::from(vec![
+                    Span::styled("filter› ", ACCENT),
+                    Span::raw(self.articles.query.clone()),
+                    Span::styled("█", ACCENT),
+                ]),
+                Line::from([key("Enter", "apply"), key("Esc", "clear")].concat()),
+            ]
+        } else {
+            vec![
+                Line::from(
+                    [
+                        key("Enter", "open"),
+                        key("u", "unread"),
+                        key("f", "all/unread/read"),
+                    ]
+                    .concat(),
+                ),
+                Line::from(Span::styled(
+                    format!(
+                        "h/l prev/next tab · j/k move · / filter · R refresh · q quit{}",
+                        if self.articles.loading {
+                            " · loading"
+                        } else if self.articles.cursor.is_some() {
+                            " · more below"
+                        } else {
+                            " · end"
+                        },
+                    ),
+                    DIM,
+                )),
+            ]
+        };
+        frame.render_widget(Paragraph::new(footer_text), footer);
     }
 }
 
@@ -322,9 +394,66 @@ mod tests {
     }
 
     #[test]
+    fn articles_share_request_header_selection_and_detail_geometry() {
+        for width in [40, 80, 130] {
+            let mut app = App::new("host".into());
+            app.status = "live".into();
+            app.set_items(vec![super::super::tests::item("req", "open", &[], "")]);
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let requests = terminal.backend().buffer().clone();
+            app.handle(key('h'));
+            app.articles
+                .add(page(vec![article("one", false, 4)], None), 0, true);
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let articles = terminal.backend().buffer();
+            for x in width.saturating_sub(12)..width {
+                assert_eq!(
+                    articles[(x, 0)],
+                    requests[(x, 0)],
+                    "host/status at width {width}"
+                );
+            }
+            assert_eq!(
+                articles[(0, 1)].symbol(),
+                requests[(0, 1)].symbol(),
+                "list rule stays put"
+            );
+            assert_eq!(
+                articles[(0, 2)].bg,
+                requests[(0, 2)].bg,
+                "same selection highlight"
+            );
+            assert_eq!(
+                articles[(0, 4)].symbol(),
+                requests[(0, 4)].symbol(),
+                "detail rule stays put"
+            );
+            if width == 130 {
+                let header: String = (0..width).map(|x| articles[(x, 0)].symbol()).collect();
+                assert!(header.contains("[articles]"));
+                assert!(header.contains("● live"));
+            }
+        }
+    }
+
+    #[test]
+    fn article_error_stays_visible_above_a_long_summary() {
+        let mut app = App::new("host".into());
+        app.handle(key('h'));
+        let mut row = article("one", false, 1);
+        row.summary = "Long summary line\n".repeat(40);
+        app.articles.add(page(vec![row], None), 0, true);
+        app.articles.error = Some("Article open failed".into());
+        let text = render(&app);
+        assert!(text.contains("Article open failed"));
+        assert!(text.contains("Press R to retry"));
+    }
+
+    #[test]
     fn opening_preserves_unread_and_explicit_unread_uses_selected_version() {
         let mut app = App::new("host".into());
-        app.handle(key('a'));
+        app.handle(key('h'));
         app.articles
             .add(page(vec![article("one", false, 4)], None), 0, true);
         assert_eq!(
@@ -356,7 +485,7 @@ mod tests {
     #[test]
     fn failed_replacement_keeps_the_applied_filter_label_with_selectable_rows() {
         let mut app = App::new("host".into());
-        app.handle(key('a'));
+        app.handle(key('h'));
         app.articles
             .add(page(vec![article("one", true, 1)], None), 0, true);
         app.handle(key('f'));
@@ -373,7 +502,7 @@ mod tests {
     #[test]
     fn typing_during_a_load_does_not_relabel_its_results_or_submit_search_on_invalidation() {
         let mut app = App::new("host".into());
-        app.handle(key('a'));
+        app.handle(key('h'));
         app.handle(key('/'));
         app.handle(key('x'));
         app.articles
@@ -459,7 +588,7 @@ mod tests {
     #[test]
     fn search_filter_and_paging_keep_query_cursor_and_ignore_stale_generation() {
         let mut app = App::new("host".into());
-        app.handle(key('a'));
+        app.handle(key('h'));
         app.articles.add(
             page(vec![article("one", true, 1)], Some("cursor-one")),
             0,
@@ -499,7 +628,7 @@ mod tests {
     #[test]
     fn empty_error_and_paged_lists_render_retry_and_end_without_phantom_actions() {
         let mut app = App::new("host".into());
-        app.handle(key('a'));
+        app.handle(key('h'));
         assert!(render(&app).contains("Loading articles"));
         app.articles.loading = false;
         app.articles.error = Some("offline".into());

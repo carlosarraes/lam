@@ -14,13 +14,13 @@ const HEADER_SIDES: u16 = 46;
 const HISTORY_DETAIL: u16 = 8;
 
 // Palette: one accent (amber) for "pressable" and attention; priority in red/blue so amber stays unique.
-const ACCENT: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
-const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
-const META: Style = Style::new().fg(Color::Gray);
-const DIM: Style = Style::new().fg(Color::DarkGray);
-const RULE: Style = Style::new().fg(Color::DarkGray);
+pub(super) const ACCENT: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+pub(super) const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
+pub(super) const META: Style = Style::new().fg(Color::Gray);
+pub(super) const DIM: Style = Style::new().fg(Color::DarkGray);
+pub(super) const RULE: Style = Style::new().fg(Color::DarkGray);
 const LINK: Style = Style::new().fg(Color::Cyan);
-const SELECTION: Color = Color::Rgb(0x2a, 0x24, 0x16);
+pub(super) const SELECTION: Color = Color::Rgb(0x2a, 0x24, 0x16);
 
 impl App {
     /// The item's body as markdown with its checklist. The link is appended after rendering —
@@ -133,6 +133,42 @@ impl App {
         Line::from(spans)
     }
 
+    pub(super) fn draw_header(
+        &self,
+        f: &mut Frame,
+        header: ratatui::layout::Rect,
+        left: Vec<Span<'_>>,
+    ) {
+        let live = self.status == "live";
+        let tabs = self.tab_spans(header.width);
+        let tabs_w: u16 = tabs.iter().map(|s| s.width() as u16).sum();
+        // Equal fills are what actually centres the bar; a fixed-width right block would not.
+        let [head_l, head_c, head_r] = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(tabs_w),
+            Constraint::Fill(1),
+        ])
+        .areas(header);
+        f.render_widget(Paragraph::new(Line::from(left)), head_l);
+        f.render_widget(Paragraph::new(Line::from(tabs)), head_c);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{}  ", self.host), META),
+                Span::styled(
+                    "●",
+                    if live {
+                        Style::default().fg(Color::Green)
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    },
+                ),
+                Span::styled(format!(" {}", self.status), META),
+            ]))
+            .right_aligned(),
+            head_r,
+        );
+    }
+
     pub(super) fn draw(&self, f: &mut Frame) {
         if self.tab == Tab::Articles {
             self.draw_articles(f);
@@ -175,18 +211,10 @@ impl App {
             .iter()
             .filter(|item| item.is_fyi() && item.status == "open")
             .count();
-        let live = self.status == "live";
-        let tabs = self.tab_spans(header.width);
-        let tabs_w: u16 = tabs.iter().map(|s| s.width() as u16).sum();
-        // Equal fills are what actually centres the bar; a fixed-width right block would not.
-        let [head_l, head_c, head_r] = Layout::horizontal([
-            Constraint::Fill(1),
-            Constraint::Length(tabs_w),
-            Constraint::Fill(1),
-        ])
-        .areas(header);
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
+        self.draw_header(
+            f,
+            header,
+            vec![
                 Span::styled("lam", BOLD),
                 Span::styled(format!("  {requests} requests · {fyis} FYI"), META),
                 Span::styled(if self.busy { "  working…" } else { "" }, ACCENT),
@@ -206,27 +234,8 @@ impl App {
                     },
                     ACCENT,
                 ),
-            ])),
-            head_l,
+            ],
         );
-        f.render_widget(Paragraph::new(Line::from(tabs)), head_c);
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(format!("{}  ", self.host), META),
-                Span::styled(
-                    "●",
-                    if live {
-                        Style::default().fg(Color::Green)
-                    } else {
-                        Style::default().fg(Color::Yellow)
-                    },
-                ),
-                Span::styled(format!(" {}", self.status), META),
-            ]))
-            .right_aligned(),
-            head_r,
-        );
-
         let rows: Vec<ListItem> = visible
             .iter()
             .map(|i| ListItem::new(row(i, self.tab, list.width)))
@@ -359,7 +368,7 @@ impl App {
                 Line::from([key("Enter", "send"), key("Esc", "cancel")].concat()),
             ],
             (_, Some(i)) if i.is_fyi() && i.status == "open" => {
-                let mut spans = key("Enter", "read");
+                let mut spans = key("Enter", "seen");
                 if !i.link.is_empty() {
                     spans.extend(key("o", "open"));
                 }
@@ -441,7 +450,7 @@ fn adopt_palette(text: Text<'_>) -> Text<'static> {
 }
 
 /// A footer hint: the key in accent, the label dimmed.
-fn key<'a>(k: &str, label: &str) -> Vec<Span<'a>> {
+pub(super) fn key<'a>(k: &str, label: &str) -> Vec<Span<'a>> {
     vec![
         Span::styled(k.to_string(), ACCENT),
         Span::styled(format!(" {label}   "), META),
@@ -1108,9 +1117,9 @@ mod tests {
         a.handle(super::super::tests::key('l'));
         assert_eq!(width(&a, 80), 29, "all tab states keep the bar width");
 
-        a.handle(super::super::tests::key('a'));
-        assert_eq!(width(&a, 80), 29);
         a.handle(super::super::tests::key('l'));
+        assert_eq!(width(&a, 80), 29);
+        a.handle(super::super::tests::key('h'));
         assert_eq!(width(&a, 60), 9, "squeezed down to the active label");
         assert_eq!(width(&a, 40), 0, "and out entirely rather than colliding");
     }

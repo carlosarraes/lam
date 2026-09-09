@@ -288,9 +288,9 @@ impl App {
         match (self.reader, self.kitty) {
             (true, _) => "j/k move · J/K scroll · g/G top/end · m close · / filter · q quit",
             (false, true) => {
-                "h/l/a · ^1/^2/^3 tabs · j/k move · m read · / filter · R refresh · q quit"
+                "h/l prev/next tab · ^1/^2/^3 tabs · j/k move · m read · / filter · R refresh · q quit"
             }
-            (false, false) => "h/l/a tabs · j/k move · m read · / filter · R refresh · q quit",
+            (false, false) => "h/l prev/next tab · j/k move · m read · / filter · R refresh · q quit",
         }
     }
 
@@ -436,9 +436,8 @@ impl App {
     /// Translates a key press into an Action. Returns None when only internal state changed.
     pub fn handle(&mut self, key: KeyEvent) -> Option<Action> {
         if !matches!(self.mode, Mode::Filter | Mode::Reply(_))
-            && (key.code == KeyCode::Char('a')
-                || (key.code == KeyCode::Char('3')
-                    && key.modifiers.contains(KeyModifiers::CONTROL)))
+            && key.code == KeyCode::Char('3')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
         {
             return self.set_tab(Tab::Articles);
         }
@@ -561,8 +560,16 @@ impl App {
                 }
                 Some(action)
             }
-            KeyCode::Char('h') => self.set_tab(Tab::Requests),
-            KeyCode::Char('l') => self.set_tab(Tab::History),
+            KeyCode::Char('h') => self.set_tab(match self.tab {
+                Tab::Requests => Tab::Articles,
+                Tab::History => Tab::Requests,
+                Tab::Articles => Tab::History,
+            }),
+            KeyCode::Char('l') => self.set_tab(match self.tab {
+                Tab::Requests => Tab::History,
+                Tab::History => Tab::Articles,
+                Tab::Articles => Tab::Requests,
+            }),
             KeyCode::Char('m') => {
                 if self.reader {
                     self.reader = false;
@@ -612,11 +619,10 @@ impl App {
                 None
             }
             KeyCode::Enter if self.current().is_some_and(Item::is_fyi) => {
-                if self.reader_item.is_some() {
-                    None
-                } else {
-                    self.open_reader()
-                }
+                self.open_current().map(|item| Action::Seen {
+                    id: item.id.clone(),
+                    version: item.version,
+                })
             }
             KeyCode::Enter => self
                 .actionable_current()
@@ -1095,19 +1101,61 @@ fn open_link(url: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hl_cycles_all_tabs_and_a_is_not_a_shortcut() {
+        let mut a = App::new("host".into());
+        assert_eq!(a.handle(key('a')), None);
+        assert_eq!(a.tab, Tab::Requests);
+        for expected in [Tab::History, Tab::Articles, Tab::Requests] {
+            a.handle(key('l'));
+            assert_eq!(a.tab, expected);
+        }
+        for expected in [Tab::Articles, Tab::History, Tab::Requests] {
+            a.handle(key('h'));
+            assert_eq!(a.tab, expected);
+        }
+    }
+
+    #[test]
+    fn hl_and_a_remain_text_when_editing() {
+        for tab in [Tab::Requests, Tab::History, Tab::Articles] {
+            let mut a = App::new("host".into());
+            a.set_tab(tab);
+            a.handle(key('/'));
+            for c in ['h', 'l', 'a'] {
+                a.handle(key(c));
+            }
+            assert_eq!(a.tab, tab);
+            assert_eq!(
+                if tab == Tab::Articles {
+                    &a.articles.query
+                } else {
+                    &a.filter
+                },
+                "hla"
+            );
+        }
+        let mut a = app();
+        a.handle(key('r'));
+        for c in ['h', 'l', 'a'] {
+            a.handle(key(c));
+        }
+        assert_eq!(a.mode, Mode::Reply("hla".into()));
+        assert_eq!(a.tab, Tab::Requests);
+    }
     use super::*;
 
     #[test]
-    fn articles_tab_has_a_dedicated_key_without_changing_request_choices() {
+    fn articles_ctrl_shortcut_does_not_change_request_choices() {
         let mut a = app();
-        a.handle(key('a'));
+        a.handle(ctrl('3'));
         assert_eq!(format!("{:?}", a.tab), "Articles");
         assert_eq!(a.handle(key('1')), None);
-        a.handle(key('h'));
+        a.handle(key('l'));
         assert!(matches!(a.handle(key('1')), Some(Action::Resolve { .. })));
         a.handle(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL));
         assert_eq!(format!("{:?}", a.tab), "Articles");
-        a.handle(key('l'));
+        a.handle(key('h'));
         assert_eq!(a.tab, Tab::History);
     }
 
@@ -1179,7 +1227,7 @@ mod tests {
                     version: 7
                 })
             );
-            assert!(a.reader);
+            assert_eq!(a.reader, open.code == KeyCode::Char('m'));
             assert_eq!(
                 a.current().unwrap().body,
                 "The deployment completed successfully."
@@ -1351,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn fyi_enter_opens_after_navigating_from_a_request_reader() {
+    fn fyi_enter_acknowledges_without_pinning_after_a_request_reader() {
         let mut a = App::new("host".into());
         a.set_items(vec![item("req01", "open", &[], ""), fyi()]);
         a.handle(key('m'));
@@ -1363,11 +1411,44 @@ mod tests {
                 version: 7
             })
         );
+        assert!(a.reader_item.is_none());
+        let mut seen = fyi();
+        seen.status = "dismissed".into();
+        seen.seen_at = Some("2026-09-08T12:00:00Z".into());
+        seen.version = 8;
+        a.seen_result(Some(seen), None);
+        assert_eq!(a.current().unwrap().id, "req01");
+    }
+
+    #[test]
+    fn fyi_enter_failure_keeps_queue_and_reader_closed() {
+        let mut a = App::new("host".into());
+        a.set_items(vec![fyi()]);
         assert_eq!(
             a.handle(KeyEvent::from(KeyCode::Enter)),
-            None,
-            "already opened"
+            Some(Action::Seen {
+                id: "news1".into(),
+                version: 7,
+            })
         );
+        a.seen_result(None, Some("seen failed".into()));
+        assert!(!a.reader);
+        assert_eq!(a.current().unwrap().status, "open");
+        assert_eq!(a.status, "seen failed");
+    }
+
+    #[test]
+    fn fyi_history_enter_is_inert_but_m_opens_reader() {
+        let mut a = App::new("host".into());
+        a.handle(key('l'));
+        let mut seen = fyi();
+        seen.status = "dismissed".into();
+        seen.seen_at = Some("2026-09-08T12:00:00Z".into());
+        a.add_history(vec![seen], true);
+        assert_eq!(a.handle(KeyEvent::from(KeyCode::Enter)), None);
+        assert!(!a.reader);
+        assert_eq!(a.handle(key('m')), None);
+        assert!(a.reader);
     }
 
     #[tokio::test]
@@ -1501,7 +1582,7 @@ mod tests {
         assert_eq!(a.requests.selected, 2);
         assert_eq!(a.handle(key('o')), None);
         assert!(matches!(
-            a.handle(key('a')),
+            a.handle(key('h')),
             Some(Action::LoadArticles { .. })
         ));
         assert_eq!(a.handle(key('q')), Some(Action::Quit));
@@ -1776,7 +1857,7 @@ mod tests {
             "the first visit loads the newest page"
         );
         assert_eq!(a.tab, Tab::History);
-        assert_eq!(a.handle(key('l')), None, "already there");
+        assert_eq!(a.handle(ctrl('2')), None, "already there");
         assert_eq!(a.handle(key('h')), None);
         assert_eq!(a.tab, Tab::Requests);
 
