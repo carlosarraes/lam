@@ -9,12 +9,43 @@ Use `lam article publish --file PATH --title TITLE --summary TEXT`, adding one `
 ```sh
 lam article publish --file /canonical/report/index.html --title "Report" --summary "Findings and next steps" --asset images/chart.png --asset notes.txt --silent
 lam article list --read all --query "Report"
+lam article list --day 2026-09-08 --read unread
 lam article open ARTICLE_ID
 ```
 
 Only the entry and listed assets upload. Unlisted files stay local. Missing references fail Worker publication, even if the referenced file exists beside the entry. The CLI never discovers resources, recursively uploads directories, or downloads remote URLs. Limits are 2 MiB for HTML, 20 MiB per asset, 50 MiB combined, and fifty additional assets. PNG, JPEG and WebP are inline; PDF and UTF-8 text are download-only. Format screening is not full image decoding or PDF sanitization. Viewers also bound image dimensions and decode images before rendering them.
 
 The server validates and canonicalizes static HTML. Its stored original entry digest differs from the canonical document digest. Resources become `lam-asset:<manifest index>` internally; attachment links become inert markers with native save controls. Author ordinary relative paths, leaving these internal markers to the server.
+
+## Browse by day
+
+The Articles library opens on Today, using each article's creation timestamp (`created_at`) in `America/Sao_Paulo`. The navigator above the list shows Today, Yesterday, or an older weekday and date. Older/newer moves one calendar day, including days without articles; future days are disabled. Search and All/Unread/Read filters apply within the selected day. All unread searches unread articles across dates while keeping the search text. Refresh and reconnect retain the selected day.
+
+In the terminal, `h`/`l` cycle Requests, History and Articles; `Ctrl+3` selects Articles directly. The Articles keys are:
+
+| Key | Action |
+| --- | --- |
+| `[` / `]` | Previous / next calendar day |
+| `t` | Today |
+| `D` | Enter `YYYY-MM-DD`, then Enter to jump or Esc to cancel |
+| `U` | All unread across dates |
+| `/` | Search; Enter applies and Esc clears |
+| `f` | Cycle All, Unread and Read |
+| `j` / `k` | Move through articles; more results load near the end |
+| Enter, `m` or `o` | Open the selected article |
+| `u` | Mark the selected article unread |
+| `R` | Refresh |
+| `q` | Quit |
+
+Android provides previous/next arrows, a date picker, Today and All unread. For command-line searches, `lam article list --day YYYY-MM-DD` selects one creation day. Omitting `--day` searches all dates. Both forms accept `--query` and `--read`.
+
+## Browser reading controls
+
+Click the sliders button at the top right to open reading controls. They start hidden; click outside the panel, press Esc, or click the button again to close it.
+
+The theme icon cycles System → Dark → Light → System. System follows the browser's light/dark preference, and the selected mode is remembered when browser storage is available. Dark and Light use muted backgrounds while retaining meaningful color differences, such as green additions and red deletions. Original styling is a secondary action for the author's palette; the theme icon returns from Original to System.
+
+The same panel contains zoom out, the current zoom percentage, and zoom in. Attachments appears when the article includes downloadable files; expand it to choose a download. Changing theme or zoom leaves read state unchanged.
 
 ## Static show-me preparation
 

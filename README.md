@@ -49,6 +49,11 @@ Every item records **who asked**. `lam push` resolves the name in this order: `-
 | `lam check tick\|untick <id> <n>` | Carlos's side, from the terminal |
 | `lam list [--all] [--json]`, `lam show <id>` | |
 | `lam done <id> [choice] [-m text]`, `lam dismiss <id>` | Carlos's side |
-| `lam` / `lam tui` | interactive queue in the terminal: `1-3` choose, `Enter` done, `Space` tick the next check, `Tab` + `j/k` pick a check, `r` reply text, `d` dismiss, `o` open link, `m` markdown reader, `/` filter by agent, `h`/`l` (or `Ctrl+1`/`Ctrl+2`) switch between the **requests** and **history** tabs, live updates |
+| `lam` / `lam tui` | interactive queue in the terminal: `1-3` choose, `Enter` done or mark FYI seen, `Space` tick the next check, `Tab` + `j/k` pick a check, `r` reply text, `d` dismiss, `o` open link, `m` markdown reader, `/` filter by agent; `h`/`l` cycle Requests, History and Articles, or `Ctrl+1`/`Ctrl+2`/`Ctrl+3` select a tab; live updates |
+| `lam article publish --file PATH --title TITLE --summary TEXT [--asset PATH]… [--silent]` | save a static HTML report and its explicitly listed assets to Articles |
+| `lam article list [--day YYYY-MM-DD] [--read all\|unread\|read] [--query TEXT]` | list articles by creation day in `America/Sao_Paulo`; omit `--day` for all dates |
+| `lam article open ID`, `lam article read ID`, `lam article unread ID` | open the browser reader or explicitly change read state |
 | `lam watch` | mirror ntfy → desktop notifications |
 | `lam --llm` | print the agent guide (the `lam` skill) — for agents that don't have the skill installed |
+
+The Articles tab opens on Today. In the TUI, `[`/`]` move one calendar day, `t` returns to Today, `D` accepts a date, and `U` shows All unread across dates. `/` searches, `f` cycles All/Unread/Read, `Enter` opens, and `u` marks unread. The browser reader keeps theme, zoom and attachments behind one sliders button. See [Articles](docs/articles.md) for publishing, navigation and reading controls.
