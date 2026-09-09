@@ -110,6 +110,15 @@ export function viewerParts(source: string, assets: readonly Asset[], mode: "des
   const rewriteCss = (source: string, context: "stylesheet" | "declarationList" | "value") => {
     const ast = css.parse(source, { context });
     css.walk(ast, node => { if (node.type === "Url") node.value = resource(node.value); });
+    // Display-only gradient hooks preserve image layers and the author's original palette.
+    if (mode === "desktop") css.walk(ast, { leave(node: css.CssNode) {
+      if (node.type !== "Function" || !/^(repeating-)?(linear|radial|conic)-gradient$/i.test(node.name)) return;
+      const original = { ...node };
+      node.name = "var";
+      node.children = new css.List<css.CssNode>().fromArray([
+        { type: "Identifier", name: "--lam-viewer-gradient" }, { type: "Operator", value: "," }, original,
+      ]);
+    } });
     return css.generate(ast);
   };
   const visit = (node: Html.ParentNode) => {
@@ -153,11 +162,42 @@ export function viewerParts(source: string, assets: readonly Asset[], mode: "des
 
 // The iframe receives no JavaScript, credentials, cookie access or same-origin permission.
 function wrapper(nonce: string): string {
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>LAM article</title><style>body{margin:0;font:16px system-ui;background:#fafafa;color:#202020}header{padding:12px}button{font:inherit;margin:4px;padding:6px}iframe{width:100%;height:80vh;border:0;background:white}#status{white-space:pre-wrap}#attachments{display:flex;flex-wrap:wrap}</style></head><body><header><h1 id="title">Article</h1><p id="status" role="status">Opening article…</p><button id="retry" hidden>Retry</button><button id="smaller">Zoom out</button><button id="larger">Zoom in</button><div id="attachments"></div></header><main><iframe title="Article content" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" hidden></iframe></main><script nonce="${nonce}">
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>LAM article</title><style>body{margin:0;font:16px system-ui;background:#fafafa;color:#202020}header{padding:12px}button,select{font:inherit;margin:4px;padding:6px}html[data-theme=dark]{color-scheme:dark}html[data-theme=dark] body{background:#17191d;color:#e7e8ec}html[data-theme=dark] iframe{background:#17191d}iframe{width:100%;height:80vh;border:0;background:white}#status{white-space:pre-wrap}#attachments{display:flex;flex-wrap:wrap}</style></head><body><header><h1 id="title">Article</h1><p id="status" role="status">Opening article…</p><button id="retry" hidden>Retry</button><button id="smaller">Zoom out</button><button id="larger">Zoom in</button><label for="theme">Theme</label><select id="theme"><option value="system">System</option><option value="dark">Dark</option><option value="original">Original</option></select><div id="attachments"></div></header><main><iframe title="Article content" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" hidden></iframe></main><script nonce="${nonce}">
 (() => {
   let bootstrap = location.hash.slice(1); history.replaceState(null, '', location.pathname);
   let token, captured, manifest, loaded = false, attempted = false, opening = false, zoom = 1, imageNotice = '';
   const base = location.pathname, frame = document.querySelector('iframe'), status = document.querySelector('#status'), retry = document.querySelector('#retry');
+  const theme = document.querySelector('#theme'), systemTheme = matchMedia('(prefers-color-scheme: dark)');
+  let originalHtml = '', renderedTheme;
+  try { const saved = localStorage.getItem('lam.article.theme'); if (['system','dark','original'].includes(saved)) theme.value = saved; } catch {}
+  function renderTheme() {
+    const dark = theme.value === 'dark' || (theme.value === 'system' && systemTheme.matches);
+    document.documentElement.dataset.theme = dark ? 'dark' : 'original';
+    if (!originalHtml || renderedTheme === dark) return;
+    let html = originalHtml;
+    if (dark) {
+      const doc = new DOMParser().parseFromString(originalHtml, 'text/html');
+      for (const element of [doc.documentElement, doc.body, ...doc.body.querySelectorAll('*')]) {
+        if (element.namespaceURI !== 'http://www.w3.org/1999/xhtml' || element.matches('img, picture, source, style, script')) continue;
+        element.style.setProperty('background-color', '#17191d', 'important');
+        element.style.setProperty('color', element.matches('a') ? '#e8ba70' : '#e7e8ec', 'important');
+        element.style.setProperty('border-color', '#41444d', 'important');
+        element.style.setProperty('box-shadow', 'none', 'important');
+        element.style.setProperty('--lam-viewer-gradient', 'none', 'important');
+      }
+      // A neutral backing keeps transparent diagrams legible without recoloring their paint.
+      const mediaStyle = doc.createElement('style');
+      mediaStyle.textContent = 'svg,img,picture{--lam-viewer-gradient:initial!important}@layer lamViewerMedia{svg{background-color:white;color:#202020}}';
+      doc.head.append(mediaStyle);
+      html = '<!doctype html>' + doc.documentElement.outerHTML;
+    }
+    renderedTheme = dark;
+    loaded = false;
+    frame.srcdoc = html;
+  }
+  theme.onchange = () => { try { localStorage.setItem('lam.article.theme', theme.value); } catch {} renderTheme(); };
+  systemTheme.addEventListener('change', () => { if (theme.value === 'system') renderTheme(); });
+  renderTheme();
   const call = (path, method = 'GET', body, credential = token) => fetch(base + path, { method, credentials:'omit', cache:'no-store', referrerPolicy:'no-referrer', headers:{Authorization:'Bearer ' + credential, 'Content-Type':'application/json'}, body:body === undefined ? undefined : JSON.stringify(body) });
   const failed = message => { status.textContent = message; retry.hidden = false; };
   async function markRead() {
@@ -208,7 +248,8 @@ function wrapper(nonce: string): string {
       if (!Array.isArray(content.parts) || content.parts.length > 50001) throw Error();
       let markupBytes = 0, slotCount = 0;
       for (const part of content.parts) {
-        if (typeof part === 'string') { markupBytes += new TextEncoder().encode(part).length; if (markupBytes > 2105344) throw Error(); }
+        // Allow parser serialization and gradient fallback hooks to expand the bounded source.
+        if (typeof part === 'string') { markupBytes += new TextEncoder().encode(part).length; if (markupBytes > 6299648) throw Error(); }
         else {
           if (!part || Object.keys(part).length !== 1 || !Number.isInteger(part.asset) || part.asset < 0 || part.asset >= manifest.assets.length) throw Error();
           const asset = manifest.assets[part.asset];
@@ -245,7 +286,7 @@ function wrapper(nonce: string): string {
         attachments.append(button);
       });
       frame.onload = () => { loaded = true; requestAnimationFrame(() => { void markRead(); }); };
-      frame.hidden = false; frame.srcdoc = html.join('');
+      frame.hidden = false; originalHtml = html.join(''); renderedTheme = undefined; renderTheme();
       status.textContent = 'Opening article… Images may be unavailable if the session expires.';
     } catch { failed('Could not open the article. Retry, or open it again from LAM if the link expired.'); }
     finally { opening = false; }
@@ -258,7 +299,6 @@ function wrapper(nonce: string): string {
   void openArticle();
 })();</script></body></html>`;
 }
-
 export const articleViewerSessions = HttpRouter.empty.pipe(
   HttpRouter.post("/v2/articles/:id/view-session", Effect.gen(function* () {
     const { id } = yield* HttpRouter.schemaPathParams(Id);

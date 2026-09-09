@@ -153,6 +153,14 @@ try {
   assert.match(await browser("eval", "JSON.stringify({fragment:location.hash, isolated:document.querySelector('iframe').contentDocument === null})"), /isolated.*true/);
   assert.equal(hits.length, 0, "no automatic canary request");
   debug = await inspector();
+  await browser("select", "#theme", "dark");
+  await browser("wait", "--fn", "document.documentElement.dataset.theme === 'dark'");
+  assert.equal(await (await debug.frame()).evaluate("getComputedStyle(document.body).backgroundColor"), "rgb(23, 25, 29)");
+  assert.equal((await readState()).version, 1, "theme changes do not acknowledge read again");
+  await openSession();
+  assert.match(await browser("eval", "document.querySelector('#theme').value"), /dark/, "theme preference survives reopening");
+  await browser("select", "#theme", "original");
+  await browser("wait", "--fn", "document.documentElement.dataset.theme === 'original'");
   const frame = await debug.frame();
   assert.equal(await frame.evaluate("document.querySelector('img').naturalWidth"), 240);
   assert.equal(await frame.evaluate("document.querySelector('svg').textContent.includes('Prepare report')"), true);
