@@ -2,6 +2,7 @@ mod articles;
 mod client;
 mod commands;
 mod config;
+mod herdr;
 mod name;
 mod notify;
 mod tui;

@@ -951,7 +951,8 @@ pub fn run(silent: bool) -> Result<i32> {
         }));
     }
     app.set_kitty(kitty);
-    let result = event_loop(&mut terminal, &mut app, &jobs, &rx, silent);
+    let mut herdr = crate::herdr::Herdr::detect();
+    let result = event_loop(&mut terminal, &mut app, &jobs, &rx, silent, &mut herdr);
     if kitty {
         let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     }
@@ -965,6 +966,7 @@ fn event_loop(
     jobs: &mpsc::Sender<Job>,
     rx: &mpsc::Receiver<Msg>,
     silent: bool,
+    herdr: &mut Option<crate::herdr::Herdr>,
 ) -> Result<()> {
     let refresh = || {
         let _ = jobs.send(Job::Refresh);
@@ -1031,6 +1033,9 @@ fn event_loop(
                         // The bell reaches you through ssh; the desktop popup is left to
                         // `lam watch` when it owns notifications here, so it never fires twice.
                         let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x07");
+                        if let Some(herdr) = herdr.as_mut() {
+                            herdr.flag(&title);
+                        }
                         if !crate::notify::watch_running() {
                             let _ = crate::notify::desktop(&title, &body, critical);
                         }
@@ -1053,6 +1058,9 @@ fn event_loop(
         };
         if key.kind != event::KeyEventKind::Press {
             continue;
+        }
+        if let Some(herdr) = herdr.as_mut() {
+            herdr.clear();
         }
         let Some(action) = app.handle(key) else {
             continue;

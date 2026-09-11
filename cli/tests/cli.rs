@@ -1065,6 +1065,8 @@ async fn push_without_any_name_source_fails_with_guidance() {
         .env_remove("TMUX_PANE")
         .env_remove("ZELLIJ_SESSION_NAME")
         .env_remove("STY")
+        .env_remove("HERDR_WORKSPACE_ID")
+        .env_remove("HERDR_TAB_ID")
         .args(["push", "who am i", "--recommendation", "Do it."])
         .output()
         .unwrap();

@@ -22,7 +22,7 @@ pub fn pick(s: Sources) -> Result<String> {
     }
     bail!(
         "who is asking? pass --name <name> (or set LAM_NAME).\n\
-         Inside tmux/zellij/screen the name is inferred as session:window automatically."
+         Inside tmux/zellij/screen/herdr the name is inferred as session:window automatically."
     )
 }
 
@@ -64,11 +64,38 @@ fn from_screen() -> Option<String> {
     Some(screen_name(&sty, &env::var("WINDOW").unwrap_or_default()))
 }
 
+/// `workspace:tab` labels, herdr's counterparts of a tmux session and window. Labels come from
+/// two CLI calls because `pane get` reports only ids; the ids stand in when a label is unset.
+fn from_herdr() -> Option<String> {
+    let workspace = clean(env::var("HERDR_WORKSPACE_ID").ok())?;
+    let tab = clean(env::var("HERDR_TAB_ID").ok())?;
+    let bin = crate::herdr::binary(env::var("HERDR_BIN_PATH").ok());
+    let label = |kind: &str, id: &str| -> Option<String> {
+        let out = Command::new(&bin).args([kind, "get", id]).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+        clean(json["result"][kind]["label"].as_str().map(String::from))
+    };
+    Some(herdr_name(
+        &label("workspace", &workspace).unwrap_or(workspace),
+        &label("tab", &tab).unwrap_or(tab),
+    ))
+}
+
+pub fn herdr_name(workspace: &str, tab: &str) -> String {
+    format!("{workspace}:{tab}")
+}
+
 pub fn resolve(explicit: Option<String>) -> Result<String> {
     pick(Sources {
         explicit,
         lam_name: env::var("LAM_NAME").ok(),
-        multiplexer: from_tmux().or_else(from_zellij).or_else(from_screen),
+        multiplexer: from_tmux()
+            .or_else(from_zellij)
+            .or_else(from_screen)
+            .or_else(from_herdr),
     })
 }
 
@@ -106,6 +133,12 @@ mod tests {
         let err = pick(sources(None, Some(""), None)).unwrap_err().to_string();
         assert!(err.contains("--name"), "{err}");
         assert!(err.contains("LAM_NAME"), "{err}");
+    }
+
+    #[test]
+    fn herdr_names_mirror_session_window() {
+        assert_eq!(herdr_name("locus", "status"), "locus:status");
+        assert_eq!(herdr_name("w3", "w3:t1"), "w3:w3:t1");
     }
 
     #[test]
