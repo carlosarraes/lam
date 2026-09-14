@@ -303,7 +303,7 @@ fn hex_prefix(digest: &[u8]) -> String {
         .collect()
 }
 
-fn validate_path_components(path: &Path) -> Result<()> {
+pub(super) fn validate_path_components(path: &Path) -> Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
         match component {
@@ -384,7 +384,7 @@ fn runtime_root_name() -> String {
 }
 
 #[cfg(unix)]
-fn ensure_private_dir(path: &Path, label: &str) -> Result<()> {
+pub(super) fn ensure_private_dir(path: &Path, label: &str) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
     if !path.exists() {
@@ -408,7 +408,7 @@ fn ensure_private_dir(path: &Path, label: &str) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn ensure_private_dir(path: &Path, label: &str) -> Result<()> {
+pub(super) fn ensure_private_dir(path: &Path, label: &str) -> Result<()> {
     std::fs::create_dir_all(path)
         .with_context(|| format!("cannot create {label} {}", path.display()))?;
     ensure!(path.is_dir(), "{label} must be a directory");
