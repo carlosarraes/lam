@@ -22,6 +22,8 @@ No model, permissions, rules, hook or trust overrides were supplied. No trust pr
 
 `hook-identity.mjs` and `proposed-hooks.json` are a proposed diagnostic only. They are retained in the owned topology directory, not in an active `.codex/hooks.json` path. There is no `hooks.jsonl` output because the fixture has not been run as a hook. The fixture emits zero stdout/stderr and never outputs context or changes a tool decision. It records only event, stdin `session_id`/`agent_id`, environment `CODEX_THREAD_ID`, boot identity and its own process ancestry. It does not retain tool inputs, responses, credentials, transcript paths or contents.
 
+After validating the owned cwd and allowed event, operational failures append a separate private `hook-errors.jsonl` record containing only the allowlisted event, `status: "error"`, and `stage: "process"` or `"record"`. Each record is under 128 bytes. The diagnostic file is opened without following symlinks and must be a mode-0600 regular file owned by the current UID with one hard link. Exception text, identifiers and input fields are not copied into errors. Malformed JSON and out-of-scope input are intentionally unlogged because they cannot pass the cwd/event check. If diagnostic storage itself fails, the fixture stays silent and missing output remains inconclusive; absence does not prove the hook never ran.
+
 The proposed cwd is the previously owned `/tmp/lam-chat-gate.Bx9ROj`. Read-only checks confirmed its active `.codex/hooks.json` and `codex-pending.json` were absent before this proposal. Recheck before any run. The old Task 1 hook approvals do not authorize the new fixture.
 
 The proposed events are SessionStart for root enrollment evidence, SubagentStart for the native child ID, Bash PostToolUse for each root/child command's hook association, and SubagentStop for child completion association. Each uses the exact command `node /tmp/lam-chat-task6-topology.TwJPU1/hook-identity.mjs` and a two-second timeout. No additionalContext limit is needed because this fixture emits no model content. It does not test inline delivery or solve the separate output-spill gate.
@@ -31,10 +33,18 @@ To run it, approval must cover activating the exact proposed config at `/tmp/lam
 | File in `/tmp/lam-chat-task6-topology.TwJPU1` | SHA-256 |
 | --- | --- |
 | `capture.mjs` | `59ea77c53e4ffe0f58948d4bd09229e8063bbcc8bac59ff36064ae807e4bd758` |
-| `hook-identity.mjs` | `a9b5f6fd726b9a9911294fdacd5300ea8913cafe9c5f5aec22f12a3ccdd7f877` |
+| `hook-identity.mjs` | `81d8e98480a8bf32b2bcb028b9271f479e0302e75f3cd75a9c638fb6d819d5ef` |
 | `proposed-hooks.json` | `abd111c81b64342d301d5586a0831e97a558be9cb12956f813d2de049129d513` |
 
 The committed copies have identical bytes. Any edit changes the scope that must be reviewed.
+
+The hook script hash changed during checkpoint review. The earlier proposal was withdrawn; approval for its old bytes cannot authorize this version. The proposed JSON remains unchanged. Fresh scoped native trust approval is still required before activation.
+
+## Direct diagnostic tests
+
+Run `node --test docs/chat-probes/2026-09-14/task-6-binding/hook-identity.test.mjs` from the repository root. Seven tests passed. The tests launch the actual script in Node subprocesses with a test-only filesystem adapter, synthetic process evidence and output redirected to fresh owned temporary directories. They exercise success, forced process-read and record-write failures, malformed/out-of-scope input, preserving earlier diagnostics, symlink refusal and unavailable diagnostic storage. Every subprocess exits zero with empty stdout/stderr. Error records contain only the fixed fields above. Test directories are removed afterward.
+
+Before the fix, the two forced operational failure tests failed because `hook-errors.jsonl` was missing; afterward they passed. These are direct isolated fixture tests, not native hook execution, credential proof or delivery evidence. `hook-test-loader.mjs` is test-only and is not referenced by the proposed hook configuration.
 
 ## Options still open
 
