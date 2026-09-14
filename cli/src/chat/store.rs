@@ -6,9 +6,11 @@ use anyhow::{bail, ensure, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
+use super::registry::{Registration, SessionState};
+use super::types::SessionRef;
 use super::types::{Actor, Draft, Message, Target};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
 pub struct Store {
@@ -76,6 +78,62 @@ impl Store {
                 )?;
             }
         }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(super) fn machine(&self) -> Result<String> {
+        self.connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'machine'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .context("Chat machine identity is not initialized")
+    }
+
+    pub(super) fn load_sessions(&self) -> Result<Vec<SessionState>> {
+        let mut statement = self.connection.prepare(
+            "SELECT machine, incarnation, project, name, client, native_id, process_start,
+                    eligible, connected, ended FROM sessions ORDER BY machine, incarnation",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(SessionState {
+                registration: Registration {
+                    session: SessionRef {
+                        machine: row.get(0)?,
+                        incarnation: row.get(1)?,
+                    },
+                    project: row.get(2)?,
+                    name: row.get(3)?,
+                    client: row.get(4)?,
+                    native_id: row.get(5)?,
+                    process_start: row.get(6)?,
+                    eligible: row.get(7)?,
+                },
+                connected: row.get(8)?,
+                ended: row.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub(super) fn save_session(&mut self, entry: &SessionState) -> Result<()> {
+        let registration = &entry.registration;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO sessions(machine, incarnation, project, name, client, native_id, process_start, eligible, connected, ended)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(machine, incarnation) DO UPDATE SET
+                 name = excluded.name, eligible = excluded.eligible,
+                 connected = excluded.connected, ended = excluded.ended",
+            params![registration.session.machine, registration.session.incarnation, registration.project,
+                registration.name, registration.client, registration.native_id, registration.process_start,
+                registration.eligible, entry.connected, entry.ended],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -203,9 +261,13 @@ impl Store {
 }
 
 fn migrate(connection: &mut Connection, version: u32) -> Result<()> {
-    ensure!(version == 0, "no migration path from Chat schema {version}");
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(include_str!("schema.sql"))?;
+    if version == 0 {
+        transaction.execute_batch(include_str!("schema.sql"))?;
+    }
+    if version < 2 {
+        transaction.execute_batch(include_str!("migration-002.sql"))?;
+    }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -304,6 +366,85 @@ mod tests {
 
     use super::Store;
     use crate::chat::types::{Actor, Draft, SessionRef, Target};
+
+    #[test]
+    fn v1_upgrade_preserves_messages_and_initializes_registry() {
+        use crate::chat::registry::Registry;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(include_str!("schema.sql"))
+            .unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        let mut legacy = Store { connection };
+        legacy.set_machine("pc").unwrap();
+        let original = legacy.send(&sender(), &draft("before-upgrade")).unwrap();
+        drop(legacy);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut upgraded = Store::open(&path).unwrap();
+        let retry = upgraded.send(&sender(), &draft("before-upgrade")).unwrap();
+        assert_eq!(retry.id, original.id);
+        assert_eq!(retry.created_at, original.created_at);
+        assert_eq!(retry.sender_seq, original.sender_seq);
+        assert!(Registry::new(&mut upgraded)
+            .unwrap()
+            .snapshot("lam")
+            .is_empty());
+    }
+
+    #[test]
+    fn registry_database_errors_propagate_without_changing_cached_state() {
+        use crate::chat::registry::{ClientKind, NativeEvidence, Registry};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.sqlite3");
+        let mut store = Store::open(&path).unwrap();
+        store.set_machine("pc").unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_session_update BEFORE UPDATE ON sessions
+             BEGIN SELECT RAISE(ABORT, 'session update rejected'); END;",
+            )
+            .unwrap();
+        let mut registry = Registry::new(&mut store).unwrap();
+        let registration = registry
+            .connect(
+                "lam",
+                crate::name::Sources {
+                    explicit: Some("pm".into()),
+                    lam_name: None,
+                    multiplexer: None,
+                },
+                NativeEvidence {
+                    client: ClientKind::Codex,
+                    native_id: "native".into(),
+                    process_start: "boot:1:2".into(),
+                },
+                true,
+            )
+            .unwrap();
+        assert!(registry.disconnect(&registration.session).is_err());
+        assert!(registry.state(&registration.session).unwrap().connected);
+        drop(registry);
+        drop(store);
+        let mut store = Store::open(&path).unwrap();
+        assert!(
+            Registry::new(&mut store)
+                .unwrap()
+                .state(&registration.session)
+                .unwrap()
+                .connected
+        );
+        store
+            .connection
+            .execute_batch("DROP TABLE sessions;")
+            .unwrap();
+        assert!(Registry::new(&mut store).is_err());
+    }
 
     fn sender() -> Actor {
         Actor::Agent(SessionRef {
@@ -585,7 +726,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.sqlite3");
         let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 2).unwrap();
+        connection
+            .pragma_update(None, "user_version", super::SCHEMA_VERSION + 1)
+            .unwrap();
         drop(connection);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
@@ -595,7 +738,7 @@ mod tests {
         let version: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, super::SCHEMA_VERSION + 1);
     }
 
     #[test]

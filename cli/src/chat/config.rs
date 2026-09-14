@@ -22,6 +22,15 @@ pub struct Config {
     pub machine: String,
     pub inline_bytes: usize,
     pub batch_bytes: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<ProjectMapping>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectMapping {
+    pub id: String,
+    pub roots: Vec<PathBuf>,
 }
 
 impl Config {
@@ -34,6 +43,7 @@ impl Config {
             machine: uuid::Uuid::new_v4().to_string(),
             inline_bytes: DEFAULT_LIMITS.inline_bytes,
             batch_bytes: DEFAULT_LIMITS.batch_bytes,
+            projects: Vec::new(),
         };
         config.create_or_load(path)
     }
@@ -43,6 +53,47 @@ impl Config {
             inline_bytes: self.inline_bytes,
             batch_bytes: self.batch_bytes,
         }
+    }
+
+    /// Match a repository/workspace root exactly. Callers discover that root;
+    /// ancestor matching here would silently merge nested worktrees.
+    pub fn project_for_root(&self, root: &Path) -> Result<String> {
+        let mappings = self.project_roots()?;
+        let root = normalize_project_root(root)?;
+        if let Some(project) = mappings.get(&root) {
+            return Ok(project.clone());
+        }
+        let digest = Sha256::digest(root.as_os_str().as_encoded_bytes());
+        Ok(format!("local:{}:{digest:x}", self.machine))
+    }
+
+    fn project_roots(&self) -> Result<std::collections::BTreeMap<PathBuf, String>> {
+        let mut roots = std::collections::BTreeMap::new();
+        for project in &self.projects {
+            let id = uuid::Uuid::parse_str(&project.id)
+                .context("Chat project ID is not a UUID")?
+                .to_string();
+            ensure!(
+                !project.roots.is_empty(),
+                "Chat project {id} needs at least one local root"
+            );
+            for root in &project.roots {
+                ensure!(
+                    root.is_absolute(),
+                    "Chat project root must be absolute: {}",
+                    root.display()
+                );
+                let root = normalize_project_root(root)?;
+                if let Some(previous) = roots.insert(root.clone(), id.clone()) {
+                    ensure!(
+                        previous == id,
+                        "Chat root {} maps to multiple project IDs",
+                        root.display()
+                    );
+                }
+            }
+        }
+        Ok(roots)
     }
 
     fn load(path: &Path) -> Result<Self> {
@@ -60,6 +111,7 @@ impl Config {
         );
         uuid::Uuid::parse_str(&config.machine).context("Chat machine ID is not a UUID")?;
         validate_limits(config.limits())?;
+        config.project_roots()?;
         Ok(config)
     }
 
@@ -81,6 +133,18 @@ impl Config {
             Err(error) => Err(error).with_context(|| format!("cannot create {}", path.display())),
         }
     }
+}
+
+fn normalize_project_root(root: &Path) -> Result<PathBuf> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("cannot resolve Chat project root {}", root.display()))?;
+    ensure!(
+        root.is_dir(),
+        "Chat project root is not a directory: {}",
+        root.display()
+    );
+    Ok(root)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -381,6 +445,98 @@ fn open_read_no_follow(path: &Path) -> std::io::Result<File> {
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn project_roots_are_machine_local_until_explicitly_mapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left/repo");
+        let right = dir.path().join("right/repo");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        let config_path = dir.path().join("config/chat.toml");
+        let mut config = super::Config::load_or_create(&config_path).unwrap();
+        let left_id = config.project_for_root(&left).unwrap();
+        assert_ne!(left_id, config.project_for_root(&right).unwrap());
+        assert_eq!(left_id, config.project_for_root(&left.join(".")).unwrap());
+        let mut another_machine = config.clone();
+        another_machine.machine = uuid::Uuid::new_v4().to_string();
+        assert_ne!(left_id, another_machine.project_for_root(&left).unwrap());
+
+        let shared = "a6eebdad-52bb-4f4b-aa7b-1c041efa9091";
+        config.projects = vec![super::ProjectMapping {
+            id: shared.into(),
+            roots: vec![left.clone(), right.clone()],
+        }];
+        let raw = toml::to_string(&config).unwrap();
+        std::fs::write(&config_path, raw).unwrap();
+        let loaded = super::Config::load_or_create(&config_path).unwrap();
+        assert_eq!(loaded.project_for_root(&left).unwrap(), shared);
+        assert_eq!(loaded.project_for_root(&right).unwrap(), shared);
+    }
+
+    #[test]
+    fn project_mapping_rejects_ambiguous_roots_and_invalid_shared_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let mut config =
+            super::Config::load_or_create(&dir.path().join("config/chat.toml")).unwrap();
+        let mapping = super::ProjectMapping {
+            id: "a6eebdad-52bb-4f4b-aa7b-1c041efa9091".into(),
+            roots: vec![root.clone()],
+        };
+        config.projects = vec![
+            mapping.clone(),
+            super::ProjectMapping {
+                id: "b6eebdad-52bb-4f4b-aa7b-1c041efa9091".into(),
+                roots: vec![root.join(".")],
+            },
+        ];
+        assert!(config.project_for_root(&root).is_err());
+        config.projects = vec![super::ProjectMapping {
+            id: "repo".into(),
+            ..mapping.clone()
+        }];
+        assert!(config.project_for_root(&root).is_err());
+        config.projects = vec![super::ProjectMapping {
+            roots: vec![std::path::PathBuf::from("repo")],
+            ..mapping
+        }];
+        assert!(config.project_for_root(&root).is_err());
+    }
+
+    #[test]
+    fn unmapped_worktrees_stay_separate_and_physical_aliases_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("repo");
+        let worktree = main.join(".worktrees/feature");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let config_path = dir.path().join("config/chat.toml");
+        let mut config = super::Config::load_or_create(&config_path).unwrap();
+        assert_ne!(
+            config.project_for_root(&main).unwrap(),
+            config.project_for_root(&worktree).unwrap()
+        );
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&main, &alias).unwrap();
+        assert_eq!(
+            config.project_for_root(&main).unwrap(),
+            config.project_for_root(&alias).unwrap()
+        );
+        config.projects = vec![super::ProjectMapping {
+            id: "a6eebdad-52bb-4f4b-aa7b-1c041efa9091".into(),
+            roots: vec![main.clone()],
+        }];
+        assert_ne!(
+            config.project_for_root(&main).unwrap(),
+            config.project_for_root(&worktree).unwrap()
+        );
+        config.projects[0].roots.push(worktree.clone());
+        assert_eq!(
+            config.project_for_root(&main).unwrap(),
+            config.project_for_root(&worktree).unwrap()
+        );
+    }
+
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
     use std::sync::Mutex;
