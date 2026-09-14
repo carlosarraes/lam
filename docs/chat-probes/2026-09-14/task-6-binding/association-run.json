@@ -1,0 +1,59 @@
+{
+  "date": "2026-09-14",
+  "cwd": "/tmp/lam-chat-gate.Bx9ROj",
+  "clientVersion": "0.154.0",
+  "executingServerVersion": "0.153.4",
+  "executingServerPid": 28534,
+  "executingServerStartTicks": "76781",
+  "setup": {
+    "argv": [
+      "codex",
+      "Owned LAM hook association probe. Say READY without tools, spawning agents, reading files or changing settings, then wait."
+    ],
+    "thread": "01a09fda-fdc7-70b0-8f06-ae833e09b420",
+    "ptySession": 66687,
+    "exitCode": 0
+  },
+  "probe": {
+    "argv": [
+      "codex",
+      "Owned LAM native hook association test. You are a test subject only, not an implementation agent. Do not read files, skills, transcripts, settings, or other environment variables; do not change permissions, trust, hooks, or code. Run exactly node -p 'JSON.stringify({nativeThread:process.env.CODEX_THREAD_ID,pid:process.pid,parent:process.ppid})' once as a shell tool. Then create exactly one native child test subject, instructing it to run that exact same command once, inspect nothing else, change nothing, report its result, and finish. Wait for that single child to finish. Report your root thread ID, child thread ID, and the two command results, then say PROBE_DONE and wait without further tools. This explicitly authorizes one owned native child test subject, not implementation delegation. Preserve any native tool denial and stop if denied."
+    ],
+    "thread": "01a09fdd-adb1-7271-9e56-3c88181ba077",
+    "childThread": "01a09fdd-e5bd-71d3-bf43-c934c522ba7b",
+    "ptySession": 9296,
+    "rootCommand": {
+      "nativeThread": "01a09fdd-adb1-7271-9e56-3c88181ba077",
+      "pid": 2214541,
+      "parent": 28534
+    },
+    "childCommand": {
+      "nativeThread": "01a09fdd-e5bd-71d3-bf43-c934c522ba7b",
+      "pid": 2214720,
+      "parent": 28534
+    },
+    "completed": true,
+    "exitCode": 0
+  },
+  "trust": {
+    "route": "Native startup Review hooks and individual handler trust",
+    "projectSource": "/tmp/lam-chat-gate.Bx9ROj/.codex/hooks.json",
+    "events": [
+      "PostToolUse",
+      "SessionStart",
+      "SubagentStart",
+      "SubagentStop"
+    ],
+    "postToolUseEnabled": true,
+    "unrelatedHandlerChanged": false,
+    "folderTrustPrompt": false,
+    "permissionOverrides": false
+  },
+  "cleanup": {
+    "activeHookDefinitionRemoved": true,
+    "definitionRetained": "proposed-hooks.json",
+    "commandAndHookPidsAbsent": true,
+    "sharedServerPreserved": true,
+    "errorFilePresent": false
+  }
+}
