@@ -4,6 +4,9 @@ use super::{
 };
 use anyhow::Result;
 
+pub(super) const HOOK_UNCONFIRMED: &str = "Codex hook output and native acceptance are unconfirmed";
+pub(super) const HOOK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Called only after native binding and observation validation. Epochs persist
 /// across daemon restarts. A new native observation is required for every claim;
 /// finishing NotSubmitted never calls this function recursively.

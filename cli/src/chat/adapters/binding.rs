@@ -162,11 +162,68 @@ pub(in crate::chat) struct Participant {
     deadline: std::time::Instant,
 }
 
+fn deliver_hook(
+    files: &BindingFiles,
+    binding: &NativeBinding,
+    socket: &std::path::Path,
+    deadline: std::time::Instant,
+    output: impl FnOnce(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use crate::chat::{
+        protocol::Operation,
+        types::{Attempt, ClientEvent, Handoff},
+    };
+    let epoch = files.next_epoch(binding, deadline)?;
+    let credential = format!("{}.{}", binding.locator()?, binding.integration_secret);
+    let claimed = request(
+        socket,
+        &credential,
+        Operation::Delivery {
+            event: ClientEvent::Hook,
+            epoch,
+        },
+        deadline,
+    )?;
+    let attempt: Option<Attempt> = serde_json::from_value(claimed)
+        .map_err(|_| anyhow::anyhow!("invalid native hook claim response"))?;
+    let Some(attempt) = attempt else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        Some(&attempt.recipient) == binding.session.as_ref(),
+        "native hook recipient mismatch"
+    );
+    binding.process.validate()?;
+    let encoded = crate::chat::render::hook_output(&attempt.batch.text)?;
+    anyhow::ensure!(
+        encoded.len() <= 8192,
+        "native hook output exceeds its bound"
+    );
+    let written = output(&encoded);
+    let finished = request(
+        socket,
+        &credential,
+        Operation::Finish {
+            attempt: attempt.id,
+            outcome: Handoff::Unknown {
+                reason: crate::chat::delivery::HOOK_UNCONFIRMED.into(),
+            },
+        },
+        deadline,
+    );
+    // Even a partial/failed stdout attempt is uncertain. Lost Finish is recovered
+    // by the owner after the native hook deadline, never by replaying the batch.
+    written?;
+    finished?;
+    Ok(())
+}
+
 pub(super) fn codex_check(
     paths: &crate::chat::config::Paths,
     input: &super::codex::HookInput,
     explicit_name: Option<String>,
     deadline: std::time::Instant,
+    output: impl FnOnce(&str) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
     let runtime = NativeRuntime::discover(std::process::id(), deadline)?;
@@ -207,6 +264,9 @@ pub(super) fn codex_check(
         );
         binding
     };
+    if input.hook_event_name == "PostToolUse" {
+        return deliver_hook(&files, &binding, &paths.socket, deadline, output);
+    }
     let credential = format!("{}.{}", binding.locator()?, binding.integration_secret);
     let operation = if matches!(
         input.hook_event_name.as_str(),
@@ -608,6 +668,8 @@ struct NativeBinding {
     name: String,
     session: Option<crate::chat::types::SessionRef>,
     eligible: bool,
+    #[serde(default)]
+    observation_epoch: u64,
     enrollment_secret: String,
     participant_secret: String,
     integration_secret: String,
@@ -640,6 +702,7 @@ impl NativeBinding {
             name: name.into(),
             session: None,
             eligible: true,
+            observation_epoch: 0,
             enrollment_secret: secret(),
             participant_secret: secret(),
             integration_secret: secret(),
@@ -651,6 +714,10 @@ impl NativeBinding {
     fn validate_shape(&self) -> anyhow::Result<()> {
         use crate::chat::protocol;
         anyhow::ensure!(self.schema == 1, "unsupported private binding schema");
+        anyhow::ensure!(
+            self.observation_epoch <= i64::MAX as u64,
+            "invalid native observation epoch"
+        );
         self.client_kind()?;
         protocol::validate_uuid(&self.native_id)?;
         protocol::validate_uuid(&self.process.boot_id)?;
@@ -784,6 +851,29 @@ impl BindingFiles {
         Ok(Self {
             directory: directory.to_owned(),
         })
+    }
+
+    fn next_epoch(
+        &self,
+        binding: &NativeBinding,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<u64> {
+        let key = binding.locator()?;
+        let _lock = self.lock(&key, deadline)?;
+        let mut current = self.load(&key)?;
+        anyhow::ensure!(
+            current.session.is_some()
+                && current.session == binding.session
+                && current.integration_secret == binding.integration_secret,
+            "native observation binding changed"
+        );
+        current.observation_epoch = current
+            .observation_epoch
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("native observation epoch exhausted"))?;
+        current.validate_shape()?;
+        self.replace(&key, &current)?;
+        Ok(current.observation_epoch)
     }
 
     fn create(&self, binding: &NativeBinding, deadline: std::time::Instant) -> anyhow::Result<()> {
@@ -999,6 +1089,126 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    struct ObservedBindings(NativeBindings);
+    impl crate::chat::daemon::BindingValidator for ObservedBindings {
+        fn validate(
+            &self,
+            peer: crate::chat::daemon::PeerIdentity,
+            credential: &str,
+        ) -> anyhow::Result<crate::chat::daemon::VerifiedContext> {
+            self.0.validate_with(peer, credential, || {
+                Ok(NativeRuntime {
+                    client: "codex".into(),
+                    version: "0.153.4".into(),
+                    process: ProcessEvidence::read(std::process::id())?,
+                })
+            })
+        }
+    }
+
+    #[test]
+    fn native_hook_delivery_keeps_exclusion_during_output_and_finishes_unknown() {
+        use crate::chat::{
+            protocol::Operation,
+            types::{Draft, FeedEvent, Target},
+        };
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        let dir = tempfile::tempdir().unwrap();
+        let files = BindingFiles::open(&dir.path().join("bindings")).unwrap();
+        let socket = dir.path().join("participant.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let owner = crate::chat::daemon::tests::owned_connections(
+            listener,
+            std::sync::Arc::new(ObservedBindings(
+                NativeBindings::open(&files.directory).unwrap(),
+            )),
+            dir.path().join("chat.sqlite3"),
+            9,
+        );
+        let registered = enroll(
+            &files,
+            &socket,
+            binding(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        let participant = Participant {
+            binding: registered,
+            socket: socket.clone(),
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        let send = |key: &str| {
+            participant.request(Operation::Send {
+                draft: Draft {
+                    key: key.into(),
+                    project: participant.project().into(),
+                    to: vec![Target::Agent(participant.binding.session.clone().unwrap())],
+                    body: key.into(),
+                    reply_to: None,
+                },
+            })
+        };
+        send("owned first body").unwrap();
+        let mut wrote_first = false;
+        deliver_hook(
+            &files,
+            &participant.binding,
+            &socket,
+            participant.deadline,
+            |output| {
+                let decoded: serde_json::Value = serde_json::from_str(output)?;
+                assert!(decoded["hookSpecificOutput"]["additionalContext"]
+                    .as_str()
+                    .unwrap()
+                    .contains("owned first body"));
+                assert!(output.len() <= 8192);
+                wrote_first = true;
+                send("arrived while writing")?;
+                deliver_hook(
+                    &files,
+                    &participant.binding,
+                    &socket,
+                    participant.deadline,
+                    |_| panic!("concurrent hook overtook output"),
+                )?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(wrote_first, "hook never emitted the claimed batch");
+        assert!(deliver_hook(
+            &files,
+            &participant.binding,
+            &socket,
+            participant.deadline,
+            |output| {
+                assert!(output.contains("arrived while writing"));
+                assert!(!output.contains("owned first body"));
+                anyhow::bail!("owned failed output")
+            }
+        )
+        .is_err());
+        deliver_hook(
+            &files,
+            &participant.binding,
+            &socket,
+            participant.deadline,
+            |_| panic!("Unknown was replayed"),
+        )
+        .unwrap();
+        owner.join().unwrap();
+        let store = crate::chat::store::Store::open(&dir.path().join("chat.sqlite3")).unwrap();
+        let events = store
+            .feed(participant.project(), None, 0, 100, false)
+            .unwrap();
+        assert_eq!(events.iter().filter(|(_, event)| matches!(event, FeedEvent::Receipt { state, .. } if state == "unknown")).count(), 2);
+        assert!(!events.iter().any(|(_, event)| matches!(
+            event,
+            FeedEvent::Exposure { .. } | FeedEvent::Fetched { .. }
+        )));
+    }
+
     #[test]
     fn private_socket_request_sends_credentials_and_honors_one_deadline() {
         use crate::chat::protocol::{self, Operation};
@@ -1052,28 +1262,11 @@ mod tests {
     #[test]
     fn issued_private_binding_enrolls_then_sends_through_the_real_store_owner() {
         use crate::chat::{
-            daemon::{BindingValidator, PeerIdentity, VerifiedContext},
             protocol::Operation,
             types::{Draft, Target},
         };
         use std::os::unix::{fs::PermissionsExt, net::UnixListener};
         use std::time::{Duration, Instant};
-        struct ObservedBindings(NativeBindings);
-        impl BindingValidator for ObservedBindings {
-            fn validate(
-                &self,
-                peer: PeerIdentity,
-                credential: &str,
-            ) -> anyhow::Result<VerifiedContext> {
-                self.0.validate_with(peer, credential, || {
-                    Ok(NativeRuntime {
-                        client: "codex".into(),
-                        version: "0.153.4".into(),
-                        process: ProcessEvidence::read(std::process::id())?,
-                    })
-                })
-            }
-        }
         let dir = tempfile::tempdir().unwrap();
         let files = BindingFiles::open(&dir.path().join("bindings")).unwrap();
         let socket = dir.path().join("participant.sock");

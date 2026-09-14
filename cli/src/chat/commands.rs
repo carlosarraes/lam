@@ -12,7 +12,7 @@ pub struct ChatArgs {
 }
 #[derive(Subcommand)]
 pub enum ChatCommand {
-    /// Run the experimental silent registration hook. Automatic delivery is not wired yet.
+    /// Run the experimental native-unverified Codex hook. Empty checks are silent; PostToolUse may supply peer context.
     Hook {
         #[arg(long, value_parser = ["codex"])]
         client: String,
@@ -34,7 +34,7 @@ pub enum ChatCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Queue for exact registered recipients. Automatic native delivery is not wired yet.
+    /// Queue for exact registered recipients. Native delivery remains experimental and unverified.
     Send {
         #[arg(long, required = true)]
         to: Vec<String>,

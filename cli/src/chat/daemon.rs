@@ -200,6 +200,9 @@ fn repair_fetch(service: &mut Service, changes: &Changes, now: Instant) -> bool 
 
 fn run_owner(mut service: Service, receiver: mpsc::Receiver<Work>, changes: &Changes) -> Service {
     loop {
+        if service.expire_hooks(Instant::now()) {
+            changes.notify();
+        }
         repair_fetch(&mut service, changes, Instant::now());
         match receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(work) => apply_work(&mut service, work, changes),
@@ -709,6 +712,7 @@ struct Service {
     machine: String,
     cursor_key: String,
     limits: Limits,
+    hook_deadlines: BTreeMap<String, Instant>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -734,6 +738,7 @@ impl Service {
             machine: machine.into(),
             cursor_key,
             limits: super::config::DEFAULT_LIMITS,
+            hook_deadlines: BTreeMap::new(),
         })
     }
 
@@ -799,6 +804,7 @@ impl Service {
                         "Chat attempt belongs to another recipient"
                     );
                     self.store.finish(&attempt, outcome)?;
+                    self.hook_deadlines.remove(&attempt);
                     Ok(json!({"finished": attempt}))
                 }
                 _ => bail!("operation requires participant or observer authority"),
@@ -891,13 +897,53 @@ impl Service {
             self.store.observe(&registration.session, event, epoch)?;
             return Ok(Value::Null);
         }
-        Ok(serde_json::to_value(super::delivery::request(
+        ensure!(
+            event != ClientEvent::Hook || self.hook_deadlines.len() < MAX_CONNECTIONS,
+            "Chat hook handoff capacity is full"
+        );
+        let attempt = super::delivery::request(
             &mut self.store,
             &registration.session,
             event,
             epoch,
             self.limits,
-        )?)?)
+        )?;
+        if event == ClientEvent::Hook {
+            if let Some(attempt) = &attempt {
+                // Claim happens after hook startup. Its two-second expiry is
+                // therefore later than the hook's start-relative output bound.
+                self.hook_deadlines.insert(
+                    attempt.id.clone(),
+                    Instant::now() + super::delivery::HOOK_DEADLINE,
+                );
+            }
+        }
+        Ok(serde_json::to_value(attempt)?)
+    }
+
+    fn expire_hooks(&mut self, now: Instant) -> bool {
+        let expired: Vec<_> = self
+            .hook_deadlines
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut changed = false;
+        for id in expired {
+            let outcome = super::types::Handoff::Unknown {
+                reason: super::delivery::HOOK_UNCONFIRMED.into(),
+            };
+            if self.store.finish(&id, outcome).is_ok() {
+                self.hook_deadlines.remove(&id);
+                changed = true;
+            } else {
+                // Failed persistence retains durable Submitting and exclusion.
+                // Retry at a bounded cadence, never requeue or expose the body.
+                self.hook_deadlines
+                    .insert(id, now + Duration::from_millis(100));
+            }
+        }
+        changed
     }
 
     fn verify_registration(&mut self, registration: &Registration) -> Result<()> {
@@ -1130,6 +1176,213 @@ pub(super) mod tests {
             process_start: format!("boot:1:{id}"),
             eligible: true,
         }
+    }
+
+    #[test]
+    fn hook_expiry_persistence_failure_retains_exclusion_and_retries_without_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.sqlite3");
+        let mut service = Service::open(&path, MACHINE).unwrap();
+        let recipient = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        let integration = VerifiedContext::Integration(recipient.clone());
+        service
+            .handle(&integration, Operation::Register {})
+            .unwrap();
+        service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Send {
+                    draft: Draft {
+                        key: "owned".into(),
+                        project: PROJECT.into(),
+                        to: vec![Target::Agent(recipient.session.clone())],
+                        body: "owned".into(),
+                        reply_to: None,
+                    },
+                },
+            )
+            .unwrap();
+        service
+            .handle(
+                &integration,
+                Operation::Delivery {
+                    event: ClientEvent::Hook,
+                    epoch: 1,
+                },
+            )
+            .unwrap();
+        let fault = rusqlite::Connection::open(&path).unwrap();
+        fault.execute_batch("CREATE TRIGGER reject_hook_timeout BEFORE UPDATE ON delivery_receipts WHEN NEW.state = 'unknown' BEGIN SELECT RAISE(ABORT, 'owned persistence failure'); END;").unwrap();
+        let expired = Instant::now() + Duration::from_secs(3);
+        assert!(!service.expire_hooks(expired));
+        assert_eq!(service.hook_deadlines.len(), 1);
+        assert!(service
+            .handle(
+                &integration,
+                Operation::Delivery {
+                    event: ClientEvent::Idle,
+                    epoch: 2
+                }
+            )
+            .unwrap()
+            .is_null());
+        let state: String = fault
+            .query_row("SELECT state FROM delivery_attempts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            state, "submitting",
+            "terminal write failure must roll back atomically"
+        );
+        fault
+            .execute_batch("DROP TRIGGER reject_hook_timeout")
+            .unwrap();
+        drop(fault);
+        assert!(
+            !service.expire_hooks(expired + Duration::from_millis(50)),
+            "retry cadence must remain bounded"
+        );
+        assert!(service.expire_hooks(expired + Duration::from_millis(100)));
+        assert!(service.hook_deadlines.is_empty());
+        assert!(!service.expire_hooks(expired + Duration::from_secs(1)));
+        assert!(service
+            .handle(
+                &integration,
+                Operation::Delivery {
+                    event: ClientEvent::Hook,
+                    epoch: 3
+                }
+            )
+            .unwrap()
+            .is_null());
+    }
+
+    #[test]
+    fn live_owner_expires_lost_hook_finish_without_replay_or_overtaking() {
+        use crate::chat::types::{ClientEvent, Handoff};
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = Service::open(&dir.path().join("chat.sqlite3"), MACHINE).unwrap();
+        let recipient = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        let integration = VerifiedContext::Integration(recipient.clone());
+        service
+            .handle(&integration, Operation::Register {})
+            .unwrap();
+        let send = |key: &str| Operation::Send {
+            draft: Draft {
+                key: key.into(),
+                project: PROJECT.into(),
+                to: vec![Target::Agent(recipient.session.clone())],
+                body: key.into(),
+                reply_to: None,
+            },
+        };
+        service
+            .handle(&VerifiedContext::Observer, send("first"))
+            .unwrap();
+        let first = service
+            .handle(
+                &integration,
+                Operation::Delivery {
+                    event: ClientEvent::Hook,
+                    epoch: 1,
+                },
+            )
+            .unwrap();
+        let attempt = first["id"].as_str().unwrap().to_owned();
+        let next = service
+            .handle(&VerifiedContext::Observer, send("arrived-during-output"))
+            .unwrap();
+        for (event, epoch) in [(ClientEvent::Idle, 2), (ClientEvent::Hook, 3)] {
+            assert!(service
+                .handle(&integration, Operation::Delivery { event, epoch })
+                .unwrap()
+                .is_null());
+        }
+        let (sender, receiver) = mpsc::sync_channel(WRITER_QUEUE);
+        let changes = Arc::new(Changes::default());
+        let owner_changes = changes.clone();
+        let owner = thread::spawn(move || run_owner(service, receiver, &owner_changes));
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let recovered = loop {
+            let history = dispatch(
+                &sender,
+                &VerifiedContext::Observer,
+                Operation::History {
+                    project: PROJECT.into(),
+                    cursor: None,
+                    limit: 100,
+                },
+            )
+            .unwrap();
+            if history["events"].as_array().unwrap().iter().any(|entry| {
+                entry["event"]["attempt_id"] == attempt && entry["event"]["state"] == "unknown"
+            }) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        if !recovered {
+            drop(sender);
+            owner.join().unwrap();
+            panic!("live daemon stranded a lost hook Finish in Submitting");
+        }
+        assert!(dispatch(
+            &sender,
+            &integration,
+            Operation::Finish {
+                attempt: attempt.clone(),
+                outcome: Handoff::Accepted {
+                    receipt: "unsupported late acceptance".into()
+                },
+            }
+        )
+        .is_err());
+        dispatch(
+            &sender,
+            &integration,
+            Operation::Finish {
+                attempt,
+                outcome: Handoff::Unknown {
+                    reason: "Codex hook output and native acceptance are unconfirmed".into(),
+                },
+            },
+        )
+        .unwrap();
+        let claimed = dispatch(
+            &sender,
+            &integration,
+            Operation::Delivery {
+                event: ClientEvent::Idle,
+                epoch: 4,
+            },
+        )
+        .unwrap();
+        assert_eq!(claimed["batch"]["full_ids"], json!([next["id"]]));
+        dispatch(
+            &sender,
+            &integration,
+            Operation::Finish {
+                attempt: claimed["id"].as_str().unwrap().into(),
+                outcome: Handoff::Unknown {
+                    reason: "owned idle fixture".into(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(dispatch(
+            &sender,
+            &integration,
+            Operation::Delivery {
+                event: ClientEvent::Hook,
+                epoch: 5,
+            }
+        )
+        .unwrap()
+        .is_null());
+        drop(sender);
+        owner.join().unwrap();
     }
 
     #[test]
