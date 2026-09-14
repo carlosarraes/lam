@@ -2,7 +2,7 @@
 
 Date: 2026-09-14
 
-Status: agreed direction recorded for written-spec review; not implemented.
+Status: approved on 2026-09-14; implementation not started.
 
 ## Decision summary
 
@@ -205,6 +205,6 @@ The hook's standalone empty check emitted zero stdout/stderr bytes and took abou
 
 Tests used owned interactive PTYs and throwaway Node scripts. Herdr was inspected but not used as a host or transport. No production LAM code changed. Cross-machine delivery, production inboxes/receipts, races, and safe arbitrary inline content were not proven. The initially suggested mandatory `lam inbox` fetch was superseded by the inline-first decision on 2026-09-14.
 
-## Review checkpoint
+## Implementation plans
 
-Review this document before creating the implementation plan. The new 64 KiB ingestion bound and the uncertainty/stale-roster rules are explicit design defaults for review. The Codex inline provenance and race-handling cases are release gates that must be resolved through implementation evidence, not assumptions.
+The approved design is split into [local messaging](../plans/2026-09-14-lam-chat-local.md), [PC/Mac synchronization](../plans/2026-09-14-lam-chat-peers.md), and [setup/rollout](../plans/2026-09-14-lam-chat-rollout.md), in that order. The 64 KiB ingestion bound and uncertainty/stale-roster rules are part of the approved baseline. Codex inline provenance and race handling remain release gates that must be resolved through implementation evidence, not assumptions.
