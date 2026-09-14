@@ -161,22 +161,12 @@ impl Store {
             "sender is not local to this store"
         );
 
-        let existing: Option<String> = transaction
-            .query_row(
-                "SELECT payload_json FROM messages
-                 WHERE sender_key = ?1 AND idempotency_key = ?2",
-                params![sender_key, canonical_draft.key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(payload) = existing {
-            let message: Message = serde_json::from_str(&payload)
-                .context("stored Chat message contains invalid JSON")?;
-            let existing_draft_json = serde_json::to_string(&message.draft)?;
-            ensure!(
-                existing_draft_json == canonical_draft_json,
-                "idempotency key was already used for a different Chat message"
-            );
+        if let Some(message) = find_retry(
+            &transaction,
+            &sender_key,
+            &canonical_draft.key,
+            &canonical_draft_json,
+        )? {
             return Ok(message);
         }
 
@@ -256,6 +246,120 @@ impl Store {
         transaction.commit()?;
         Ok(message)
     }
+
+    pub(super) fn cursor_key(&mut self) -> Result<String> {
+        let fresh = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        self.connection.execute(
+            "INSERT OR IGNORE INTO metadata(key, value) VALUES ('cursor_key', ?1)",
+            [fresh],
+        )?;
+        Ok(self.connection.query_row(
+            "SELECT value FROM metadata WHERE key = 'cursor_key'",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The sole owner checks committed retries before applying current routing
+    /// eligibility. A retry must not recalculate an immutable recipient set.
+    pub(super) fn retry(&self, sender: &Actor, draft: &Draft) -> Result<Option<Message>> {
+        let canonical = canonical_draft(draft)?;
+        find_retry(
+            &self.connection,
+            &serde_json::to_string(sender)?,
+            &canonical.key,
+            &serde_json::to_string(&canonical)?,
+        )
+    }
+
+    pub(super) fn message(&self, id: &str) -> Result<Message> {
+        let payload: String = self
+            .connection
+            .query_row(
+                "SELECT payload_json FROM messages WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .context("Chat message is unavailable")?;
+        Ok(serde_json::from_str(&payload)?)
+    }
+
+    /// Durable feed sequence, filtered before pagination. Reads never update inbox,
+    /// receipt or exposure state. The serialized page is capped below a frame.
+    pub(super) fn feed(
+        &self,
+        project: &str,
+        viewer: Option<&SessionRef>,
+        after: u64,
+        limit: u16,
+        inbox: bool,
+    ) -> Result<Vec<(u64, Message)>> {
+        ensure!((1..=100).contains(&limit), "invalid Chat page limit");
+        let sender = viewer
+            .map(|s| serde_json::to_string(&Actor::Agent(s.clone())))
+            .transpose()?;
+        let target = viewer
+            .map(|s| serde_json::to_string(&Target::Agent(s.clone())))
+            .transpose()?;
+        let mut statement = self.connection.prepare(
+            "SELECT e.project_seq, e.payload_json FROM events e
+             JOIN messages m ON m.id = json_extract(e.payload_json, '$.id')
+             WHERE e.project = ?1 AND e.project_seq > ?2
+               AND (?3 IS NULL OR (?5 = 0 AND m.sender_key = ?3) OR EXISTS (
+                   SELECT 1 FROM recipients r WHERE r.message_id = m.id AND r.target_key = ?4))
+             ORDER BY e.project_seq LIMIT ?6",
+        )?;
+        let mut rows = statement.query(params![
+            project,
+            to_sql_integer(after)?,
+            sender,
+            target,
+            inbox,
+            limit
+        ])?;
+        let mut page = Vec::new();
+        let mut bytes = 0;
+        while let Some(row) = rows.next()? {
+            let seq: i64 = row.get(0)?;
+            let payload: String = row.get(1)?;
+            if bytes + payload.len() > 768 * 1024 {
+                break;
+            }
+            bytes += payload.len();
+            page.push((u64::try_from(seq)?, serde_json::from_str(&payload)?));
+        }
+        Ok(page)
+    }
+}
+
+fn find_retry(
+    connection: &Connection,
+    sender_key: &str,
+    key: &str,
+    canonical_draft_json: &str,
+) -> Result<Option<Message>> {
+    let payload: Option<String> = connection
+        .query_row(
+            "SELECT payload_json FROM messages WHERE sender_key = ?1 AND idempotency_key = ?2",
+            params![sender_key, key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let message: Message =
+        serde_json::from_str(&payload).context("stored Chat message contains invalid JSON")?;
+    ensure!(
+        serde_json::to_string(&message.draft)? == canonical_draft_json,
+        "idempotency key was already used for a different Chat message"
+    );
+    Ok(Some(message))
 }
 
 fn migrate(connection: &mut Connection, version: u32) -> Result<()> {

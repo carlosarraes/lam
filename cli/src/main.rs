@@ -40,6 +40,10 @@ fn llm_guide() -> &'static str {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Private local messaging between agent sessions
+    Chat(chat::commands::ChatArgs),
+    /// Read the current authenticated participant's Chat inbox
+    Inbox(chat::commands::InboxArgs),
     /// Publish and read private HTML articles
     #[command(subcommand)]
     Article(ArticleCmd),
@@ -212,6 +216,8 @@ fn main() {
 
 fn run(cmd: Cmd) -> Result<i32> {
     match cmd {
+        Cmd::Chat(args) => chat::commands::run_chat(args),
+        Cmd::Inbox(args) => chat::commands::run_inbox(args),
         Cmd::Article(ArticleCmd::Publish {
             file,
             title,

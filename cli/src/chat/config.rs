@@ -152,10 +152,29 @@ pub struct Paths {
     pub config: PathBuf,
     pub database: PathBuf,
     pub socket: PathBuf,
+    pub observer_socket: PathBuf,
     pub lock: PathBuf,
 }
 
 impl Paths {
+    pub fn validate(&self) -> Result<()> {
+        for path in [
+            &self.config,
+            &self.database,
+            &self.socket,
+            &self.observer_socket,
+            &self.lock,
+        ] {
+            validate_path_components(path)?;
+            ensure_private_dir(
+                path.parent().context("Chat path has no parent")?,
+                "Chat managed directory",
+            )?;
+        }
+        validate_socket_path(&self.socket)?;
+        validate_socket_path(&self.observer_socket)
+    }
+
     pub fn discover() -> Result<Self> {
         let config_override = std::env::var_os("LAM_CHAT_CONFIG");
         let data_override = std::env::var_os("LAM_CHAT_DATA_DIR");
@@ -229,13 +248,16 @@ fn build_paths(config: PathBuf, data: PathBuf, runtime_base: PathBuf) -> Result<
     validate_path_components(&runtime)?;
     ensure_private_dir(&runtime, "Chat runtime namespace")?;
     let socket = runtime.join("chat.sock");
+    let observer_socket = runtime.join("observer.sock");
     validate_socket_path(&socket)?;
+    validate_socket_path(&observer_socket)?;
 
     Ok(Paths {
         config,
         database: canonical_data.join("chat.sqlite3"),
         socket,
-        lock: runtime.join("chat.lock"),
+        observer_socket,
+        lock: canonical_data.join("chat.lock"),
     })
 }
 
@@ -446,6 +468,24 @@ fn open_read_no_follow(path: &Path) -> std::io::Result<File> {
 #[cfg(all(test, unix))]
 mod tests {
     #[test]
+    fn one_data_directory_keeps_one_lock_across_runtime_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = super::build_paths(
+            dir.path().join("config/chat.toml"),
+            dir.path().join("data"),
+            dir.path().join("runtime-a"),
+        )
+        .unwrap();
+        let second = super::build_paths(
+            dir.path().join("config/chat.toml"),
+            dir.path().join("data"),
+            dir.path().join("runtime-b"),
+        )
+        .unwrap();
+        assert_eq!(first.lock, second.lock);
+        assert_ne!(first.socket, second.socket);
+    }
+    #[test]
     fn project_roots_are_machine_local_until_explicitly_mapped() {
         let dir = tempfile::tempdir().unwrap();
         let left = dir.path().join("left/repo");
@@ -616,7 +656,7 @@ mod tests {
         assert_eq!(paths.config, config_path);
         assert_eq!(paths.database, data_path.join("chat.sqlite3"));
         assert!(paths.socket.as_os_str().as_bytes().len() < 108);
-        assert_eq!(paths.socket.parent(), paths.lock.parent());
+        assert_eq!(paths.database.parent(), paths.lock.parent());
 
         let first = Config::load_or_create(&paths.config).unwrap();
         let second = Config::load_or_create(&paths.config).unwrap();

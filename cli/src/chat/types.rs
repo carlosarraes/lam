@@ -1,4 +1,5 @@
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionRef {
     pub machine: String,
     pub incarnation: String,
@@ -31,12 +32,14 @@ pub enum Actor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Target {
     Agent(SessionRef),
     Human { machine: String },
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Draft {
     pub key: String,
     pub project: String,

@@ -14,6 +14,7 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+hmac = "0.12"
 toml = "0.8"
 unicode-normalization = "0.1"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
@@ -22,7 +23,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 chrono-tz = "0.10"
 ratatui = "0.29"
 crossterm = "0.28"
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
 qrcode = { version = "0.14", default-features = false }
 # Pinned: 0.3.6+ switched to ratatui-core 0.1 (the 0.30 split) and no longer matches ratatui 0.29.
 # default-features off drops syntect, which only highlights fenced code.
