@@ -370,6 +370,16 @@ async fn interrupt_pairing(
     server: &MockServer,
     ready_path: &str,
 ) -> (std::process::Output, std::time::Duration) {
+    signal_pairing(dir, server, ready_path, libc::SIGINT).await
+}
+
+#[cfg(unix)]
+async fn signal_pairing(
+    dir: &tempfile::TempDir,
+    server: &MockServer,
+    ready_path: &str,
+    signal: libc::c_int,
+) -> (std::process::Output, std::time::Duration) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lam"))
         .env("LAM_CONFIG", dir.path().join("config.toml"))
         .args(["pair"])
@@ -398,10 +408,76 @@ async fn interrupt_pairing(
     }
     let interrupted_at = std::time::Instant::now();
     unsafe {
-        assert_eq!(libc::kill(child.id() as libc::pid_t, libc::SIGINT), 0);
+        assert_eq!(libc::kill(child.id() as libc::pid_t, signal), 0);
+    }
+    while child.try_wait().unwrap().is_none() {
+        if interrupted_at.elapsed() >= std::time::Duration::from_secs(5) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("pairing did not terminate after signal {signal}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let out = child.wait_with_output().unwrap();
     (out, interrupted_at.elapsed())
+}
+
+#[cfg(unix)]
+async fn assert_pairing_terminates_without_cancellation(signal: libc::c_int) {
+    use std::os::unix::process::ExitStatusExt;
+
+    let (server, dir) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/pairings"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(pairing_created(&server, "pair-termination")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/pairings/pair-termination/wait"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(2))
+                .set_body_json(serde_json::json!({ "status": "pending" })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/pairings/pair-termination"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": "cancelled" })),
+        )
+        .mount(&server)
+        .await;
+
+    let (out, _) = signal_pairing(&dir, &server, "/pairings/pair-termination/wait", signal).await;
+    let cancellations = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.method == "DELETE")
+        .count();
+    assert_eq!(
+        (out.status.signal(), cancellations),
+        (Some(signal), 0),
+        "SIGTERM/SIGHUP must not enter Ctrl-C cancellation; status={:?}",
+        out.status
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pair_sigterm_terminates_without_ctrl_c_cancellation() {
+    assert_pairing_terminates_without_cancellation(libc::SIGTERM).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pair_sighup_terminates_without_ctrl_c_cancellation() {
+    assert_pairing_terminates_without_cancellation(libc::SIGHUP).await;
 }
 
 #[tokio::test]

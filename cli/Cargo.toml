@@ -23,7 +23,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 chrono-tz = "0.10"
 ratatui = "0.29"
 crossterm = "0.28"
-ctrlc = { version = "3", features = ["termination"] }
+ctrlc = "3"
 qrcode = { version = "0.14", default-features = false }
 # Pinned: 0.3.6+ switched to ratatui-core 0.1 (the 0.30 split) and no longer matches ratatui 0.29.
 # default-features off drops syntect, which only highlights fenced code.
@@ -41,3 +41,4 @@ lto = true
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.189"
+signal-hook = "0.3"

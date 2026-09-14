@@ -83,16 +83,14 @@ pub fn run_with_validator(paths: &Paths, validator: Arc<dyn BindingValidator>) -
     let _lock = lock_instance(&paths.lock)?;
     let config = Config::load_or_create(&paths.config)?;
     let service = Service::open(&paths.database, &config.machine)?;
+    // Register termination handling only for this command. Enabling ctrlc's
+    // global termination feature would also change the existing pairing flow.
+    let mut signals =
+        signal_hook::iterator::Signals::new([libc::SIGINT, libc::SIGTERM, libc::SIGHUP])?;
     let (participant, _participant_path) = bind(&paths.socket)?;
     let (observer, _observer_path) = bind(&paths.observer_socket)?;
     let stop = Arc::new(AtomicBool::new(false));
     let changes = Arc::new(Changes::default());
-    let signal_stop = stop.clone();
-    let signal_changes = changes.clone();
-    ctrlc::set_handler(move || {
-        signal_stop.store(true, Ordering::SeqCst);
-        signal_changes.notify();
-    })?;
     let (sender, receiver) = mpsc::sync_channel::<Work>(WRITER_QUEUE);
     let writer_stop = stop.clone();
     let writer_changes = changes.clone();
@@ -126,6 +124,9 @@ pub fn run_with_validator(paths: &Paths, validator: Arc<dyn BindingValidator>) -
     let mut clients: Vec<thread::JoinHandle<()>> = Vec::new();
     let serving = (|| -> Result<()> {
         while !stop.load(Ordering::SeqCst) {
+            if signals.pending().next().is_some() {
+                break;
+            }
             let mut index = 0;
             while index < clients.len() {
                 if clients[index].is_finished() {
