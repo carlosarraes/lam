@@ -1,0 +1,87 @@
+2.1.270 (Claude Code)
+codex-cli 0.154.0
+0.85.1
+Queue a message for an existing session
+
+Usage: codex queue [OPTIONS] --thread <THREAD> --message <TEXT>
+
+Options:
+      --thread <THREAD>
+          Session UUID or exact session name
+
+      --enable <FEATURE>
+          Enable a feature (repeatable). Equivalent to `-c features.<name>=true`
+
+      --message <TEXT>
+          Message text to queue
+
+      --disable <FEATURE>
+          Disable a feature (repeatable). Equivalent to `-c features.<name>=false`
+
+      --remote <ADDR>
+          Connect the TUI to a remote app server endpoint.
+
+          Accepted forms: `ws://host:port`, `wss://host:port`, `unix://`, or `unix://PATH`.
+
+      --remote-auth-token-env <ENV_VAR>
+          Name of the environment variable containing the bearer token to send to a remote app
+          server websocket
+
+  -i, --image <FILE>...
+          Optional image(s) to attach to the initial prompt
+
+  -m, --model <MODEL>
+          Model the agent should use
+
+      --oss
+          Use open-source provider
+
+      --local-provider <OSS_PROVIDER>
+          Specify which local provider to use (lmstudio or ollama). If not specified with --oss,
+          will use config default or show selection
+
+  -p, --profile <CONFIG_PROFILE_V2>
+          Layer $CODEX_HOME/<name>.config.toml on top of the base user config
+
+  -s, --sandbox <SANDBOX_MODE>
+          Select the sandbox policy to use when executing model-generated shell commands
+
+          [possible values: read-only, workspace-write, danger-full-access]
+
+      --approve-for-me
+          Route approval requests through automatic review using the workspace-write sandbox
+
+      --dangerously-bypass-approvals-and-sandbox
+          Skip all confirmation prompts and execute commands without sandboxing. EXTREMELY
+          DANGEROUS. Intended solely for running in environments that are externally sandboxed
+
+      --dangerously-bypass-hook-trust
+          Run enabled hooks without requiring persisted hook trust for this invocation. DANGEROUS.
+          Intended only for automation that already vets hook sources
+
+  -C, --cd <DIR>
+          Tell the agent to use the specified directory as its working root
+
+      --worktree
+          Run the session in a new managed Git worktree
+
+      --add-dir <DIR>
+          Additional directories that should be writable alongside the primary workspace
+
+      --strict-config
+          Error out when config.toml contains fields that are not recognized by this version of
+          Codex
+
+  -c, --config <key=value>
+          Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`.
+          Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed
+          as TOML. If it fails to parse as TOML, the raw string is used as a literal.
+
+          Examples: - `-c model="o3"` - `-c 'sandbox_permissions=["disk-full-read-access"]'` - `-c
+          shell_environment_policy.inherit=all`
+
+  -h, --help
+          Print help (see a summary with '-h')
+a09a84b02fe47353bc269f90d314595722ac47e688ab7c19b7eb733a5990c757  /home/carraes/.pi/agent/extensions/control.ts
+a4e4865e343bf87f8078f75ff179a2a77cd7c2700cf8473476bd4dc5ed36adb6  /home/carraes/.nvm/versions/node/v22.19.0/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/messages.js
+2c5272d732b475bbf91a027203b1f98d25fe43d2c1402530a442b288aeaca1e4  /home/carraes/github/herdr/src/integration/assets/pi/herdr-agent-state.ts

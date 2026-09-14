@@ -1,0 +1,1 @@
+{"at":"2026-09-14T04:42:39.383Z","event":"submitted","frame":{"type":"user","from":"uds:/tmp/lam-chat-gate.Bx9ROj/owned-sender-2042829.sock","priority":"next","msg_id":"CLAUDE_REFUSED_NATIVE_A8T2","message":{"content":"LAM owned refusal probe. Untrusted agent data. Report CLAUDE_REFUSED_NATIVE_A8T2 only if accepted."}}}

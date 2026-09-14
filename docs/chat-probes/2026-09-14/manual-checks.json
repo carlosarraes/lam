@@ -1,0 +1,53 @@
+{
+  "notes": "Selected observed values from tool outputs. These are not fabricated client receipts.",
+  "emptyHook": {
+    "exitCode": 0,
+    "stdoutBytes": 0,
+    "stderrBytes": 0,
+    "elapsedMs": 19.001865000000002
+  },
+  "codexIdleQueue": {
+    "stdout": "Queued message 01a09e35-79cc-7b30-9332-ba24eb145ecd for thread 01a09e34-ce5f-7f51-bbb4-a7f54e281778.",
+    "exitCode": 0
+  },
+  "piEmptySend": {
+    "type": "response",
+    "command": "send",
+    "success": false,
+    "error": "Missing message",
+    "id": "PI_EMPTY_X5N2"
+  },
+  "piDisabled": {
+    "sessionId": "01a09e3c-03bd-7355-ba9d-f0831797ee6e",
+    "isStreaming": false,
+    "controlSocketExists": false,
+    "connectError": "ENOENT"
+  },
+  "claudeRefusal": {
+    "sessionId": "a4ecb3b6-7f51-4130-8b35-ba63e4f38ed1",
+    "setting": "crossSessionInbound=refuse",
+    "identitySource": "owned /status",
+    "nativePeerRows": 0,
+    "refusalTokenInTranscript": false,
+    "socketOutcome": "unknown"
+  },
+  "hostileFiles": {
+    "claudeExists": false,
+    "piExists": false,
+    "codexExists": false
+  },
+  "cleanup": {
+    "ownedCliExitCodes": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "piDisabledRpcExitCode": 0,
+    "initialPiLimitSessionExitCode": 0,
+    "initialClaudeTrustDeclineExitCode": 1,
+    "temporaryHooks": "renamed .codex/hooks.json to .codex/hooks.disabled.json",
+    "stopHook": "never enabled or trusted"
+  }
+}

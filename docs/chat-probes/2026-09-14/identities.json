@@ -1,0 +1,22 @@
+[
+  {
+    "caseId": "claude-busy-repeat",
+    "pid": 2036239,
+    "parentPid": 2036237,
+    "claudeSocket": "/run/user/1000/cc-socks/2032408.sock",
+    "codexThread": "01a09e30-1b99-7923-adcb-0e937a52a2b9"
+  },
+  {
+    "caseId": "pi-busy-auth",
+    "pid": 2037400,
+    "parentPid": 2036331,
+    "piSession": "01a09e35-757e-778b-8650-9f45af841bd9",
+    "codexThread": "01a09e30-1b99-7923-adcb-0e937a52a2b9"
+  },
+  {
+    "caseId": "codex-hook-busy",
+    "pid": 2043185,
+    "parentPid": 28534,
+    "codexThread": "01a09e38-dc41-7131-96fb-ea8607a2c2a7"
+  }
+]

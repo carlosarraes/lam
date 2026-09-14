@@ -1,0 +1,16 @@
+{"at":"2026-09-14T04:36:14.394Z","caseId":"claude-busy","event":"ready"}
+{"at":"2026-09-14T04:36:34.413Z","caseId":"claude-busy","event":"completed","elapsedMs":20022}
+{"at":"2026-09-14T04:37:42.589Z","caseId":"codex-busy","event":"ready"}
+{"at":"2026-09-14T04:38:02.174Z","caseId":"claude-busy-repeat","event":"ready"}
+{"at":"2026-09-14T04:38:02.606Z","caseId":"codex-busy","event":"completed","elapsedMs":20020}
+{"at":"2026-09-14T04:38:22.194Z","caseId":"claude-busy-repeat","event":"completed","elapsedMs":20023}
+{"at":"2026-09-14T04:38:58.115Z","caseId":"pi-busy-auth","event":"ready"}
+{"at":"2026-09-14T04:39:18.124Z","caseId":"pi-busy-auth","event":"completed","elapsedMs":20013}
+{"at":"2026-09-14T04:40:51.063Z","caseId":"claude-transition","event":"ready"}
+{"at":"2026-09-14T04:40:53.621Z","caseId":"pi-transition","event":"ready"}
+{"at":"2026-09-14T04:41:11.082Z","caseId":"claude-transition","event":"completed","elapsedMs":20023}
+{"at":"2026-09-14T04:41:13.640Z","caseId":"pi-transition","event":"completed","elapsedMs":20022}
+{"at":"2026-09-14T04:41:20.657Z","caseId":"codex-queue-busy","event":"ready"}
+{"at":"2026-09-14T04:41:40.676Z","caseId":"codex-queue-busy","event":"completed","elapsedMs":20022}
+{"at":"2026-09-14T04:43:32.458Z","caseId":"codex-hook-busy","event":"ready"}
+{"at":"2026-09-14T04:43:52.477Z","caseId":"codex-hook-busy","event":"completed","elapsedMs":20022}
