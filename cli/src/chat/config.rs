@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -94,53 +95,95 @@ impl Paths {
     pub fn discover() -> Result<Self> {
         let config_override = std::env::var_os("LAM_CHAT_CONFIG");
         let data_override = std::env::var_os("LAM_CHAT_DATA_DIR");
-        let config = config_override.as_ref().map(PathBuf::from).unwrap_or(
-            dirs::config_dir()
+        let current_dir = std::env::current_dir().context("cannot resolve current directory")?;
+        let config_is_override = config_override.is_some();
+        let data_is_override = data_override.is_some();
+        let mut config = choose_path(config_override, || {
+            Ok(dirs::config_dir()
                 .context("no platform config directory")?
                 .join("lam-chat")
-                .join("chat.toml"),
-        );
-        let data = data_override.as_ref().map(PathBuf::from).unwrap_or(
-            dirs::data_local_dir()
+                .join("chat.toml"))
+        })?;
+        let mut data = choose_path(data_override, || {
+            Ok(dirs::data_local_dir()
                 .context("no platform data directory")?
-                .join("lam-chat"),
-        );
-
-        if config_override.is_some() {
-            validate_override_components(&config)?;
+                .join("lam-chat"))
+        })?;
+        if config_is_override {
+            config = anchor_override(config, &current_dir);
         }
-        if data_override.is_some() {
-            validate_override_components(&data)?;
-        }
-        let config_directory = config
-            .parent()
-            .context("LAM_CHAT_CONFIG must name a file in a directory")?;
-        ensure_private_dir(config_directory, "Chat config directory")?;
-        ensure_private_dir(&data, "Chat data directory")?;
-        if config.exists() {
-            validate_private_file(&config, "Chat config")?;
+        if data_is_override {
+            data = anchor_override(data, &current_dir);
         }
 
-        let runtime_base = runtime_base()?;
-        let runtime_root = runtime_base.join(runtime_root_name());
-        ensure_private_dir(&runtime_root, "Chat runtime directory")?;
-        let namespace = hex_prefix(&Sha256::digest(data.as_os_str().as_encoded_bytes()));
-        let runtime = runtime_root.join(namespace);
-        ensure_private_dir(&runtime, "Chat runtime namespace")?;
-        let socket = runtime.join("chat.sock");
-        ensure!(
-            socket.as_os_str().as_encoded_bytes().len() < 108,
-            "Chat socket path is too long for a Unix socket: {}",
-            socket.display()
-        );
-
-        Ok(Self {
-            config,
-            database: data.join("chat.sqlite3"),
-            socket,
-            lock: runtime.join("chat.lock"),
-        })
+        build_paths(config, data, runtime_base()?)
     }
+}
+
+fn choose_path<F>(override_value: Option<OsString>, fallback: F) -> Result<PathBuf>
+where
+    F: FnOnce() -> Result<PathBuf>,
+{
+    match override_value {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => fallback(),
+    }
+}
+
+fn anchor_override(path: PathBuf, current_dir: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        current_dir.join(path)
+    }
+}
+
+fn build_paths(config: PathBuf, data: PathBuf, runtime_base: PathBuf) -> Result<Paths> {
+    validate_path_components(&config)?;
+    validate_path_components(&data)?;
+    validate_path_components(&runtime_base)?;
+
+    let config_directory = config
+        .parent()
+        .context("LAM_CHAT_CONFIG must name a file in a directory")?;
+    ensure_private_dir(config_directory, "Chat config directory")?;
+    ensure_private_dir(&data, "Chat data directory")?;
+    if config.exists() {
+        validate_private_file(&config, "Chat config")?;
+    }
+
+    let canonical_data = data
+        .canonicalize()
+        .with_context(|| format!("cannot resolve Chat data directory {}", data.display()))?;
+    let runtime_root = runtime_base.join(runtime_root_name());
+    validate_path_components(&runtime_root)?;
+    ensure_private_dir(&runtime_root, "Chat runtime directory")?;
+    let namespace = hex_prefix(&Sha256::digest(
+        canonical_data.as_os_str().as_encoded_bytes(),
+    ));
+    let runtime = runtime_root.join(namespace);
+    validate_path_components(&runtime)?;
+    ensure_private_dir(&runtime, "Chat runtime namespace")?;
+    let socket = runtime.join("chat.sock");
+    validate_socket_path(&socket)?;
+
+    Ok(Paths {
+        config,
+        database: canonical_data.join("chat.sqlite3"),
+        socket,
+        lock: runtime.join("chat.lock"),
+    })
+}
+
+fn validate_socket_path(path: &Path) -> Result<()> {
+    const PORTABLE_SUN_PATH_CAPACITY: usize = 104;
+
+    ensure!(
+        path.as_os_str().as_encoded_bytes().len() < PORTABLE_SUN_PATH_CAPACITY,
+        "Chat socket path exceeds the portable 103-byte Unix socket pathname limit: {}",
+        path.display()
+    );
+    Ok(())
 }
 
 pub fn validate_limits(limits: Limits) -> Result<()> {
@@ -166,7 +209,7 @@ fn hex_prefix(digest: &[u8]) -> String {
         .collect()
 }
 
-fn validate_override_components(path: &Path) -> Result<()> {
+fn validate_path_components(path: &Path) -> Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
         match component {
@@ -180,10 +223,10 @@ fn validate_override_components(path: &Path) -> Result<()> {
             Ok(metadata) => {
                 ensure!(
                     !metadata.file_type().is_symlink(),
-                    "Chat override cannot traverse symlink {}; choose a direct path",
+                    "Chat path cannot traverse symlink {}; choose a direct path",
                     current.display()
                 );
-                validate_ancestor_permissions(&current, &metadata)?;
+                validate_component_permissions(&current, &metadata)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -193,15 +236,20 @@ fn validate_override_components(path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn validate_ancestor_permissions(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
+fn validate_component_permissions(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    if metadata.file_type().is_dir()
-        && metadata.mode() & 0o022 != 0
-        && metadata.mode() & 0o1000 == 0
-    {
-        anyhow::bail!(
-            "Chat override has writable ancestor {}; remove group/world write access or use a sticky temporary directory",
+    if metadata.file_type().is_dir() {
+        let effective_uid = unsafe { libc::geteuid() };
+        ensure!(
+            metadata.uid() == 0 || metadata.uid() == effective_uid,
+            "Chat path has ancestor {} owned by uid {}; use a path owned by root or the current user",
+            path.display(),
+            metadata.uid()
+        );
+        ensure!(
+            ancestor_is_trusted(metadata.uid(), metadata.mode(), effective_uid),
+            "Chat path has writable ancestor {}; remove group/world write access or use a sticky directory owned by root or the current user",
             path.display()
         );
     }
@@ -209,8 +257,14 @@ fn validate_ancestor_permissions(path: &Path, metadata: &std::fs::Metadata) -> R
 }
 
 #[cfg(not(unix))]
-fn validate_ancestor_permissions(_path: &Path, _metadata: &std::fs::Metadata) -> Result<()> {
+fn validate_component_permissions(_path: &Path, _metadata: &std::fs::Metadata) -> Result<()> {
     Ok(())
+}
+
+fn ancestor_is_trusted(owner: u32, mode: u32, effective_uid: u32) -> bool {
+    let trusted_owner = owner == 0 || owner == effective_uid;
+    let not_replaceable = mode & 0o022 == 0 || mode & 0o1000 != 0;
+    trusted_owner && not_replaceable
 }
 
 #[cfg(unix)]
@@ -331,7 +385,10 @@ mod tests {
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
     use std::sync::Mutex;
 
-    use super::{validate_limits, Config, Paths, DEFAULT_LIMITS};
+    use super::{
+        ancestor_is_trusted, anchor_override, build_paths, choose_path, validate_limits,
+        validate_socket_path, Config, Paths, DEFAULT_LIMITS,
+    };
     use crate::chat::types::Limits;
 
     static ENVIRONMENT: Mutex<()> = Mutex::new(());
@@ -473,5 +530,137 @@ mod tests {
 
         let error = Paths::discover().unwrap_err();
         assert!(format!("{error:#}").contains("writable ancestor"));
+    }
+
+    #[test]
+    fn ancestor_policy_rejects_third_party_owners_including_sticky_directories() {
+        let current_uid = 1000;
+        assert!(ancestor_is_trusted(0, 0o040755, current_uid));
+        assert!(ancestor_is_trusted(current_uid, 0o040700, current_uid));
+        assert!(ancestor_is_trusted(0, 0o041777, current_uid));
+        assert!(!ancestor_is_trusted(2000, 0o040755, current_uid));
+        assert!(!ancestor_is_trusted(2000, 0o041777, current_uid));
+        assert!(!ancestor_is_trusted(current_uid, 0o040777, current_uid));
+    }
+
+    #[test]
+    fn default_config_and_data_paths_receive_complete_ancestry_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let unsafe_parent = dir.path().join("replaceable-default");
+        std::fs::create_dir(&unsafe_parent).unwrap();
+        std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let runtime = dir.path().join("runtime");
+
+        let error = build_paths(
+            unsafe_parent.join("config").join("chat.toml"),
+            unsafe_parent.join("data"),
+            runtime,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("writable ancestor"));
+    }
+
+    #[test]
+    fn runtime_path_receives_complete_ancestry_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let unsafe_runtime = dir.path().join("replaceable-runtime");
+        std::fs::create_dir(&unsafe_runtime).unwrap();
+        std::fs::set_permissions(&unsafe_runtime, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = build_paths(
+            dir.path().join("config").join("chat.toml"),
+            dir.path().join("data"),
+            unsafe_runtime,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("writable ancestor"));
+    }
+
+    #[test]
+    fn portable_socket_boundary_reserves_the_nul_terminator() {
+        let maximum = std::path::PathBuf::from("x".repeat(103));
+        let too_long = std::path::PathBuf::from("x".repeat(104));
+
+        validate_socket_path(&maximum).unwrap();
+        assert!(validate_socket_path(&too_long).is_err());
+    }
+
+    #[test]
+    fn equivalent_data_path_spellings_share_one_runtime_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let physical = dir.path().join("state");
+        let direct = build_paths(
+            dir.path().join("config-a").join("chat.toml"),
+            physical.clone(),
+            runtime.clone(),
+        )
+        .unwrap();
+        let aliased = build_paths(
+            dir.path().join("config-b").join("chat.toml"),
+            physical.join("."),
+            runtime,
+        )
+        .unwrap();
+
+        assert_eq!(direct.database, aliased.database);
+        assert_eq!(direct.socket, aliased.socket);
+        assert_eq!(direct.lock, aliased.lock);
+    }
+
+    #[test]
+    fn same_relative_override_from_distinct_roots_gets_distinct_namespaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_root = dir.path().join("first");
+        let second_root = dir.path().join("second");
+        std::fs::create_dir(&first_root).unwrap();
+        std::fs::create_dir(&second_root).unwrap();
+        let runtime = dir.path().join("runtime");
+        let first_data = anchor_override(std::path::PathBuf::from("state"), &first_root);
+        let second_data = anchor_override(std::path::PathBuf::from("state"), &second_root);
+        let first = build_paths(
+            first_root.join("config").join("chat.toml"),
+            first_data,
+            runtime.clone(),
+        )
+        .unwrap();
+        let second = build_paths(
+            second_root.join("config").join("chat.toml"),
+            second_data,
+            runtime,
+        )
+        .unwrap();
+
+        assert_ne!(first.database, second.database);
+        assert_ne!(first.socket, second.socket);
+        assert_ne!(first.lock, second.lock);
+    }
+
+    #[test]
+    fn relative_override_validates_the_current_directory_ancestry() {
+        let dir = tempfile::tempdir().unwrap();
+        let unsafe_root = dir.path().join("replaceable-cwd");
+        std::fs::create_dir(&unsafe_root).unwrap();
+        std::fs::set_permissions(&unsafe_root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let data = anchor_override(std::path::PathBuf::from("state"), &unsafe_root);
+
+        let error = build_paths(
+            dir.path().join("config").join("chat.toml"),
+            data,
+            dir.path().join("runtime"),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("writable ancestor"));
+    }
+
+    #[test]
+    fn explicit_path_does_not_evaluate_a_failing_platform_fallback() {
+        let explicit = std::ffi::OsString::from("isolated/chat.toml");
+        let selected = choose_path(Some(explicit.clone()), || {
+            anyhow::bail!("platform directory unavailable")
+        })
+        .unwrap();
+
+        assert_eq!(selected, std::path::PathBuf::from(explicit));
     }
 }
