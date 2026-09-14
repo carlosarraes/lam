@@ -74,7 +74,8 @@ impl<'a> Registry<'a> {
         })
     }
 
-    /// Called only after adapter validation; reconnect cannot undo opt-out.
+    /// Called only for trusted native startup. A live reconnect cannot undo
+    /// opt-out; startup after explicit End creates a separate incarnation.
     pub fn connect(
         &mut self,
         project: &str,
@@ -85,7 +86,8 @@ impl<'a> Registry<'a> {
         let name = crate::name::pick(names)?;
         let existing = self.entries.iter().find(|entry| {
             let registration = &entry.registration;
-            registration.client == evidence.client.as_str()
+            !entry.ended
+                && registration.client == evidence.client.as_str()
                 && registration.native_id == evidence.native_id
                 && registration.process_start == evidence.process_start
         });
@@ -380,9 +382,19 @@ mod tests {
         let mut registry = Registry::new(&mut store).unwrap();
         assert!(registry.state(&ended.session).unwrap().ended);
         assert!(!registry.state(&ended.session).unwrap().connected);
-        assert!(registry
+        let replacement = registry
             .connect("lam", name("old"), evidence("boot:1:1"), true)
-            .is_err());
+            .unwrap();
+        assert_ne!(replacement.session, ended.session);
+        assert!(replacement.eligible);
+        assert!(registry.state(&ended.session).unwrap().ended);
+        assert_eq!(
+            registry
+                .connect("lam", name("old"), evidence("boot:1:1"), true)
+                .unwrap()
+                .session,
+            replacement.session
+        );
         assert!(registry.register(ended.clone()).is_err());
         assert!(registry.set_eligible(&ended.session, true).is_err());
         let reconnected = registry

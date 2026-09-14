@@ -17,6 +17,7 @@ pub struct Request {
 pub enum Operation {
     Register {},
     End {},
+    Lifecycle {},
     Send {
         draft: Draft,
     },
@@ -138,7 +139,11 @@ impl Operation {
                 validate_project(project)?;
                 validate_page(cursor, *limit)?;
             }
-            Self::Status {} | Self::Register {} | Self::End {} | Self::SetState { .. } => {}
+            Self::Status {}
+            | Self::Register {}
+            | Self::End {}
+            | Self::Lifecycle {}
+            | Self::SetState { .. } => {}
         }
         Ok(())
     }

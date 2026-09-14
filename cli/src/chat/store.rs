@@ -11,7 +11,7 @@ use super::types::{
     SessionRef, SessionState, Target,
 };
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
 pub struct Store {
@@ -636,6 +636,9 @@ fn migrate(connection: &mut Connection, version: u32) -> Result<()> {
     if version < 4 {
         transaction.execute_batch(include_str!("migration-004.sql"))?;
     }
+    if version < 5 {
+        transaction.execute_batch(include_str!("migration-005.sql"))?;
+    }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -895,6 +898,101 @@ mod tests {
             .unwrap()
             .snapshot("lam")
             .is_empty());
+    }
+
+    #[test]
+    fn v4_upgrade_keeps_ended_recipients_and_allows_one_replacement() {
+        use crate::chat::registry::{ClientKind, NativeEvidence, Registry};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        for schema in [
+            include_str!("schema.sql"),
+            include_str!("migration-002.sql"),
+            include_str!("migration-003.sql"),
+            include_str!("migration-004.sql"),
+        ] {
+            connection.execute_batch(schema).unwrap();
+        }
+        connection.pragma_update(None, "user_version", 4).unwrap();
+        let mut legacy = Store { connection };
+        legacy.set_machine("pc").unwrap();
+        let connect = |store: &mut Store| {
+            Registry::new(store).unwrap().connect(
+                "lam",
+                crate::name::Sources {
+                    explicit: Some("owned".into()),
+                    lam_name: None,
+                    multiplexer: None,
+                },
+                NativeEvidence {
+                    client: ClientKind::Codex,
+                    native_id: "same-thread".into(),
+                    process_start: "same-backend".into(),
+                },
+                true,
+            )
+        };
+        let original = connect(&mut legacy).unwrap();
+        let mut queued = draft("pinned-before-upgrade");
+        queued.to = vec![Target::Agent(original.session.clone())];
+        let message = legacy.send(&sender(), &queued).unwrap();
+        Registry::new(&mut legacy)
+            .unwrap()
+            .end(&original.session)
+            .unwrap();
+        drop(legacy);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut upgraded = Store::open(&path).unwrap();
+        let replacement = connect(&mut upgraded).unwrap();
+        assert_ne!(replacement.session, original.session);
+        assert_eq!(connect(&mut upgraded).unwrap().session, replacement.session);
+        assert_eq!(
+            serde_json::to_value(upgraded.message(&message.id).unwrap()).unwrap(),
+            serde_json::to_value(&message).unwrap()
+        );
+        assert!(upgraded
+            .feed("lam", Some(&replacement.session), 0, 100, true)
+            .unwrap()
+            .is_empty());
+        let mut registry = Registry::new(&mut upgraded).unwrap();
+        assert!(registry.state(&original.session).unwrap().ended);
+        let mut duplicate = replacement.clone();
+        duplicate.session.incarnation = uuid::Uuid::new_v4().to_string();
+        assert!(
+            registry.register(duplicate).is_err(),
+            "only one live native binding is permitted"
+        );
+        assert!(registry.register(original).is_err());
+        drop(registry);
+        let check_preserved = |store: &Store| {
+            let violations: i64 = store
+                .connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(violations, 0);
+            let receipt: (String, String) = store
+                .connection
+                .query_row(
+                    "SELECT target_key, state FROM delivery_receipts WHERE message_id = ?1",
+                    [&message.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(receipt.0, serde_json::to_string(&queued.to[0]).unwrap());
+            assert_eq!(receipt.1, "queued");
+            assert_eq!(
+                serde_json::to_value(store.message(&message.id).unwrap()).unwrap(),
+                serde_json::to_value(&message).unwrap()
+            );
+        };
+        check_preserved(&upgraded);
+        drop(upgraded);
+        let reopened = Store::open(&path).unwrap();
+        check_preserved(&reopened);
     }
 
     #[test]

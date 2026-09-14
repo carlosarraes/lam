@@ -113,34 +113,47 @@ fn enroll(
             return Err(error);
         }
     }
-    let existing = files.load(&key)?;
-    anyhow::ensure!(
-        existing.project == candidate.project
-            && existing.process == candidate.process
-            && existing.version == candidate.version,
-        "native enrollment configuration changed"
-    );
-    files.enroll(&key, deadline, |binding| {
-        let credential = format!("{key}.{}", binding.enrollment_secret);
-        let result = request(
-            socket,
-            &credential,
-            crate::chat::protocol::Operation::Register {},
-            deadline,
-        )?;
-        let session = serde_json::from_value(result["session"].clone())
-            .map_err(|_| anyhow::anyhow!("invalid enrollment session response"))?;
-        let eligible = result["eligible"]
-            .as_bool()
-            .ok_or_else(|| anyhow::anyhow!("invalid enrollment eligibility response"))?;
-        anyhow::ensure!(
-            result["project"] == binding.project
-                && result["client"] == binding.client
-                && result["name"] == binding.name,
-            "enrollment identity response mismatch"
-        );
-        Ok((session, eligible))
-    })
+    files.enroll(
+        &candidate,
+        deadline,
+        |binding| {
+            let credential = format!("{key}.{}", binding.integration_secret);
+            let state = request(
+                socket,
+                &credential,
+                crate::chat::protocol::Operation::Lifecycle {},
+                deadline,
+            )?;
+            anyhow::ensure!(
+                state["session"] == serde_json::to_value(&binding.session)?,
+                "native lifecycle response mismatch"
+            );
+            state["ended"]
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("invalid native lifecycle response"))
+        },
+        |binding| {
+            let credential = format!("{key}.{}", binding.enrollment_secret);
+            let result = request(
+                socket,
+                &credential,
+                crate::chat::protocol::Operation::Register {},
+                deadline,
+            )?;
+            let session = serde_json::from_value(result["session"].clone())
+                .map_err(|_| anyhow::anyhow!("invalid enrollment session response"))?;
+            let eligible = result["eligible"]
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("invalid enrollment eligibility response"))?;
+            anyhow::ensure!(
+                result["project"] == binding.project
+                    && result["client"] == binding.client
+                    && result["name"] == binding.name,
+                "enrollment identity response mismatch"
+            );
+            Ok((session, eligible))
+        },
+    )
 }
 
 pub(in crate::chat) struct Participant {
@@ -873,20 +886,40 @@ impl BindingFiles {
     }
 
     /// Only the daemon's Store owner assigns the session. Concurrent native
-    /// hooks serialize this handshake, and a bound file is never re-enrolled.
+    /// hooks serialize this handshake; a live bound file is never re-enrolled.
     fn enroll(
         &self,
-        key: &str,
+        candidate: &NativeBinding,
         deadline: std::time::Instant,
+        has_ended: impl FnOnce(&NativeBinding) -> anyhow::Result<bool>,
         register: impl FnOnce(&NativeBinding) -> anyhow::Result<(crate::chat::types::SessionRef, bool)>,
     ) -> anyhow::Result<NativeBinding> {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
         use std::time::Instant;
-        let _lock = self.lock(key, deadline)?;
-        let mut binding = self.load(key)?;
+        let key = candidate.locator()?;
+        let _lock = self.lock(&key, deadline)?;
+        let mut binding = self.load(&key)?;
+        anyhow::ensure!(
+            binding.project == candidate.project
+                && binding.process == candidate.process
+                && binding.version == candidate.version,
+            "native enrollment configuration changed"
+        );
         if binding.session.is_some() {
-            return Ok(binding);
+            if !has_ended(&binding)? {
+                return Ok(binding);
+            }
+            // Only a trusted startup and the exact owner's confirmed End may
+            // rotate credentials. Publish before Register so its authentication
+            // sees the fresh enrollment secret; failures can resume this file.
+            binding = NativeBinding::new(
+                &candidate.client,
+                &candidate.version,
+                &candidate.native_id,
+                candidate.process.clone(),
+                &candidate.project,
+                &candidate.name,
+            )?;
+            self.replace(&key, &binding)?;
         }
         anyhow::ensure!(
             Instant::now() < deadline,
@@ -895,7 +928,15 @@ impl BindingFiles {
         let (session, eligible) = register(&binding)?;
         binding.bind(session)?;
         binding.eligible = eligible;
-        let encoded = serde_json::to_vec(&binding)?;
+        self.replace(&key, &binding)?;
+        Ok(binding)
+    }
+
+    /// Caller holds the record lock and has validated the existing final file.
+    fn replace(&self, key: &str, binding: &NativeBinding) -> anyhow::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let encoded = serde_json::to_vec(binding)?;
         anyhow::ensure!(
             encoded.len() <= 16_384,
             "private binding record exceeds its bound"
@@ -919,8 +960,7 @@ impl BindingFiles {
         if result.is_err() {
             let _ = std::fs::remove_file(&temporary);
         }
-        result?;
-        Ok(binding)
+        result
     }
 
     fn load(&self, key: &str) -> anyhow::Result<NativeBinding> {
@@ -1045,7 +1085,7 @@ mod tests {
             listener,
             std::sync::Arc::new(validator),
             dir.path().join("chat.sqlite3"),
-            9,
+            17,
         );
         let registered = enroll(
             &files,
@@ -1118,6 +1158,14 @@ mod tests {
         assert!(serde_json::to_string(&inbox)
             .unwrap()
             .contains("explicit reply"));
+        let pending = recipient
+            .request(Operation::Reply {
+                id: sent["id"].as_str().unwrap().into(),
+                key: "owned-pinned-reply".into(),
+                body: "pending old incarnation".into(),
+                all: false,
+            })
+            .unwrap();
         assert!(
             participant.request(Operation::End {}).is_err(),
             "participant cannot end a native registration"
@@ -1140,10 +1188,80 @@ mod tests {
             .is_err(),
             "ended incarnation cannot revive"
         );
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let startups: Vec<_> = (0..2)
+            .map(|_| {
+                let start = start.clone();
+                let directory = files.directory.clone();
+                let socket = participant.socket.clone();
+                std::thread::spawn(move || {
+                    let files = BindingFiles::open(&directory).unwrap();
+                    start.wait();
+                    enroll(
+                        &files,
+                        &socket,
+                        binding(),
+                        Instant::now() + Duration::from_secs(1),
+                    )
+                })
+            })
+            .collect();
+        start.wait();
+        let mut results = startups
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap());
+        let renewed = results.next().unwrap();
+        let concurrent = results.next().unwrap();
+        assert_eq!(concurrent.session, renewed.session);
+        assert_eq!(concurrent.participant_secret, renewed.participant_secret);
+        assert_ne!(renewed.session, Some(session.clone()));
+        assert_ne!(
+            renewed.enrollment_secret,
+            participant.binding.enrollment_secret
+        );
+        assert_ne!(
+            renewed.participant_secret,
+            participant.binding.participant_secret
+        );
+        assert_ne!(
+            renewed.integration_secret,
+            participant.binding.integration_secret
+        );
+        let reconnect =
+            enroll(&files, &participant.socket, binding(), participant.deadline).unwrap();
+        assert_eq!(reconnect.session, renewed.session);
+        assert_eq!(reconnect.participant_secret, renewed.participant_secret);
+        assert!(participant.request(Operation::Status {}).is_err());
+        let renewed = Participant {
+            binding: renewed,
+            socket: participant.socket.clone(),
+            deadline: participant.deadline,
+        };
+        assert!(!serde_json::to_string(
+            &renewed
+                .request(Operation::Inbox {
+                    cursor: None,
+                    limit: 10,
+                })
+                .unwrap()
+        )
+        .unwrap()
+        .contains("pending old incarnation"));
+        assert!(renewed
+            .request(Operation::Show {
+                id: pending["id"].as_str().unwrap().into(),
+            })
+            .is_err());
         owner.join().unwrap();
         let restored = files.load(&key).unwrap();
-        assert_eq!(restored.session, Some(session));
+        assert_eq!(restored.session, renewed.binding.session);
         assert!(restored.context(&restored.enrollment_secret).is_err());
+        assert!(restored
+            .context(&participant.binding.participant_secret)
+            .is_err());
+        assert!(restored
+            .context(&participant.binding.integration_secret)
+            .is_err());
     }
 
     #[test]
@@ -1425,28 +1543,122 @@ mod tests {
         };
         assert!(files
             .enroll(
-                &key,
+                &binding,
                 Instant::now() + Duration::from_secs(1),
+                |_| panic!("unbound record has no ended incarnation"),
                 |_| anyhow::bail!("owner unavailable")
             )
             .is_err());
         assert!(files.load(&key).unwrap().session.is_none());
         let enrolled = files
-            .enroll(&key, Instant::now() + Duration::from_secs(1), |_| {
-                Ok((session.clone(), false))
-            })
+            .enroll(
+                &binding,
+                Instant::now() + Duration::from_secs(1),
+                |_| panic!("unbound record"),
+                |_| Ok((session.clone(), false)),
+            )
             .unwrap();
         assert_eq!(enrolled.session, Some(session.clone()));
         assert!(!enrolled.eligible);
         let reopened = BindingFiles::open(&dir.path().join("bindings")).unwrap();
         let restored = reopened
-            .enroll(&key, Instant::now() + Duration::from_secs(1), |_| {
-                panic!("must not reenroll a bound incarnation")
-            })
+            .enroll(
+                &binding,
+                Instant::now() + Duration::from_secs(1),
+                |_| Ok(false),
+                |_| panic!("must not reenroll a bound incarnation"),
+            )
             .unwrap();
         assert_eq!(restored.session, Some(session));
         assert_eq!(restored.participant_secret, binding.participant_secret);
         assert!(restored.context(&binding.enrollment_secret).is_err());
+    }
+
+    #[test]
+    fn trusted_startup_rotation_fails_closed_and_resumes_pending_enrollment() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = dir.path().join("bindings");
+        let files = BindingFiles::open(&directory).unwrap();
+        let mut original = binding();
+        let old_session = crate::chat::types::SessionRef {
+            machine: uuid::Uuid::new_v4().to_string(),
+            incarnation: uuid::Uuid::new_v4().to_string(),
+        };
+        original.bind(old_session.clone()).unwrap();
+        files
+            .create(&original, Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        let key = original.locator().unwrap();
+        let candidate = binding();
+        assert!(files
+            .enroll(
+                &candidate,
+                Instant::now() + Duration::from_secs(1),
+                |_| anyhow::bail!("owner unavailable"),
+                |_| panic!("unknown End cannot register")
+            )
+            .is_err());
+        assert_eq!(
+            files.load(&key).unwrap().participant_secret,
+            original.participant_secret
+        );
+
+        // A real filesystem publication failure must preserve the old complete
+        // record and never attempt registration with unpublished credentials.
+        let displaced = dir.path().join("displaced-bindings");
+        let failed = files.enroll(
+            &candidate,
+            Instant::now() + Duration::from_secs(1),
+            |_| {
+                std::fs::rename(&directory, &displaced)?;
+                std::fs::File::create(&directory)?;
+                Ok(true)
+            },
+            |_| panic!("failed rotation cannot register"),
+        );
+        std::fs::remove_file(&directory).unwrap();
+        std::fs::rename(&displaced, &directory).unwrap();
+        assert!(failed.is_err());
+        assert_eq!(files.load(&key).unwrap().session, Some(old_session));
+        assert_eq!(
+            files.load(&key).unwrap().participant_secret,
+            original.participant_secret
+        );
+
+        assert!(files
+            .enroll(
+                &candidate,
+                Instant::now() + Duration::from_secs(1),
+                |_| Ok(true),
+                |fresh| {
+                    assert!(fresh.session.is_none());
+                    assert_ne!(fresh.enrollment_secret, original.enrollment_secret);
+                    assert_eq!(
+                        files.load(&key).unwrap().enrollment_secret,
+                        fresh.enrollment_secret
+                    );
+                    anyhow::bail!("registration response lost")
+                }
+            )
+            .is_err());
+        let pending = files.load(&key).unwrap();
+        assert!(pending.session.is_none());
+        assert!(pending.context(&original.integration_secret).is_err());
+        let next = crate::chat::types::SessionRef {
+            machine: original.session.as_ref().unwrap().machine.clone(),
+            incarnation: uuid::Uuid::new_v4().to_string(),
+        };
+        let resumed = files
+            .enroll(
+                &candidate,
+                Instant::now() + Duration::from_secs(1),
+                |_| panic!("pending enrollment has no ended incarnation"),
+                |_| Ok((next.clone(), true)),
+            )
+            .unwrap();
+        assert_eq!(resumed.session, Some(next));
+        assert_eq!(resumed.participant_secret, pending.participant_secret);
+        assert_eq!(resumed.integration_secret, pending.integration_secret);
     }
 
     #[test]

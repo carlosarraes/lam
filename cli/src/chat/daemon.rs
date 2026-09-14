@@ -768,6 +768,10 @@ impl Service {
         }
         if let VerifiedContext::Integration(registration) = context {
             return match operation {
+                Operation::Lifecycle {} => {
+                    let ended = self.registration_ended(registration)?;
+                    Ok(json!({"session": registration.session, "ended": ended}))
+                }
                 Operation::End {} => {
                     self.verify_registration(registration)?;
                     Registry::new(&mut self.store)?.end(&registration.session)?;
@@ -897,20 +901,27 @@ impl Service {
     }
 
     fn verify_registration(&mut self, registration: &Registration) -> Result<()> {
+        ensure!(
+            !self.registration_ended(registration)?,
+            "Chat binding is no longer valid"
+        );
+        Ok(())
+    }
+
+    fn registration_ended(&mut self, registration: &Registration) -> Result<bool> {
         let registry = Registry::new(&mut self.store)?;
         let state = registry
             .state(&registration.session)
             .context("Chat session is not registered")?;
         let current = &state.registration;
         ensure!(
-            !state.ended
-                && current.project == registration.project
+            current.project == registration.project
                 && current.client == registration.client
                 && current.native_id == registration.native_id
                 && current.process_start == registration.process_start,
             "Chat binding is no longer valid"
         );
-        Ok(())
+        Ok(state.ended)
     }
 
     fn actor(&self, context: &VerifiedContext) -> Result<Actor> {
@@ -1904,6 +1915,65 @@ pub(super) mod tests {
     fn peer_owner_must_match_effective_user() {
         assert!(validate_peer_owner(1000, 1000).is_ok());
         assert!(validate_peer_owner(1001, 1000).is_err());
+    }
+
+    #[test]
+    fn lifecycle_query_is_exact_integration_only_and_never_revives_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = Service::open(&dir.path().join("chat.sqlite3"), MACHINE).unwrap();
+        let registration = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        let integration = VerifiedContext::Integration(registration.clone());
+        service
+            .handle(&integration, Operation::Register {})
+            .unwrap();
+        let live = service
+            .handle(&integration, Operation::Lifecycle {})
+            .unwrap();
+        assert_eq!(
+            live,
+            json!({"session": registration.session, "ended": false})
+        );
+        assert!(service
+            .handle(&VerifiedContext::Observer, Operation::Lifecycle {})
+            .is_err());
+        assert!(service
+            .handle(
+                &VerifiedContext::Participant(registration.clone()),
+                Operation::Lifecycle {}
+            )
+            .is_err());
+        let mut foreign = registration.clone();
+        foreign.project = "33333333-3333-4333-8333-333333333333".into();
+        assert!(service
+            .handle(
+                &VerifiedContext::Integration(foreign),
+                Operation::Lifecycle {}
+            )
+            .is_err());
+        let mut unknown = registration.clone();
+        unknown.session.incarnation = uuid::Uuid::new_v4().to_string();
+        assert!(service
+            .handle(
+                &VerifiedContext::Integration(unknown),
+                Operation::Lifecycle {}
+            )
+            .is_err());
+        service.handle(&integration, Operation::End {}).unwrap();
+        assert_eq!(
+            service
+                .handle(&integration, Operation::Lifecycle {})
+                .unwrap(),
+            json!({"session": registration.session, "ended": true})
+        );
+        assert!(service
+            .handle(&integration, Operation::Register {})
+            .is_err());
+        assert!(service
+            .handle(
+                &VerifiedContext::Participant(registration),
+                Operation::Status {}
+            )
+            .is_err());
     }
 
     #[test]
