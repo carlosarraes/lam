@@ -1,3 +1,263 @@
+/// Authenticate only on the private participant endpoint. Connection and both
+/// frames share the caller's absolute deadline, including a congested listener.
+fn request(
+    socket: &std::path::Path,
+    credential: &str,
+    operation: crate::chat::protocol::Operation,
+    deadline: std::time::Instant,
+) -> anyhow::Result<serde_json::Value> {
+    use crate::chat::{daemon, protocol};
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{ffi::OsStrExt, net::UnixStream},
+    };
+    use std::time::Instant;
+    daemon::validate_socket(socket)?;
+    operation.validate()?;
+    let path = socket.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    anyhow::ensure!(
+        path.len() < address.sun_path.len() && !path.contains(&0),
+        "invalid private socket path"
+    );
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (target, source) in address.sun_path.iter_mut().zip(path) {
+        *target = *source as libc::c_char;
+    }
+    anyhow::ensure!(Instant::now() < deadline, "native request deadline expired");
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
+    anyhow::ensure!(fd >= 0, "cannot create private Chat connection");
+    let mut stream = unsafe { UnixStream::from_raw_fd(fd) };
+    let result = unsafe {
+        libc::connect(
+            fd,
+            (&address as *const libc::sockaddr_un).cast(),
+            (std::mem::size_of::<libc::sa_family_t>() + path.len() + 1) as libc::socklen_t,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(error.into());
+        }
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| anyhow::anyhow!("native request deadline expired"))?;
+            let mut poll = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let ready = unsafe {
+                libc::poll(
+                    &mut poll,
+                    1,
+                    remaining.as_millis().min(i32::MAX as u128) as i32,
+                )
+            };
+            if ready < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            anyhow::ensure!(ready > 0, "private Chat connection deadline expired");
+            if let Some(error) = stream.take_error()? {
+                return Err(error.into());
+            }
+            break;
+        }
+    }
+    stream.set_nonblocking(false)?;
+    daemon::peer_identity(&stream)?;
+    let mut stream = daemon::DeadlineStream::until(&mut stream, deadline);
+    protocol::write_frame(
+        &mut stream,
+        &serde_json::json!({"version":1,"binding":credential}),
+    )?;
+    protocol::write_frame(
+        &mut stream,
+        &serde_json::to_value(protocol::Request {
+            version: 1,
+            operation,
+        })?,
+    )?;
+    let response = protocol::read_frame(&mut stream)?;
+    anyhow::ensure!(
+        response["version"] == 1 && response["ok"] == true,
+        "Chat participant request failed: {}",
+        response["error"]
+    );
+    Ok(response["data"].clone())
+}
+
+fn enroll(
+    files: &BindingFiles,
+    socket: &std::path::Path,
+    candidate: NativeBinding,
+    deadline: std::time::Instant,
+) -> anyhow::Result<NativeBinding> {
+    candidate.process.validate()?;
+    let key = candidate.locator()?;
+    if let Err(error) = files.create(&candidate) {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_none_or(|error| error.kind() != std::io::ErrorKind::AlreadyExists)
+        {
+            return Err(error);
+        }
+    }
+    let existing = files.load(&key)?;
+    anyhow::ensure!(
+        existing.project == candidate.project
+            && existing.process == candidate.process
+            && existing.version == candidate.version,
+        "native enrollment configuration changed"
+    );
+    files.enroll(&key, deadline, |binding| {
+        let credential = format!("{key}.{}", binding.enrollment_secret);
+        let result = request(
+            socket,
+            &credential,
+            crate::chat::protocol::Operation::Register {},
+            deadline,
+        )?;
+        let session = serde_json::from_value(result["session"].clone())
+            .map_err(|_| anyhow::anyhow!("invalid enrollment session response"))?;
+        let eligible = result["eligible"]
+            .as_bool()
+            .ok_or_else(|| anyhow::anyhow!("invalid enrollment eligibility response"))?;
+        anyhow::ensure!(
+            result["project"] == binding.project
+                && result["client"] == binding.client
+                && result["name"] == binding.name,
+            "enrollment identity response mismatch"
+        );
+        Ok((session, eligible))
+    })
+}
+
+pub(in crate::chat) struct Participant {
+    binding: NativeBinding,
+    socket: std::path::PathBuf,
+    deadline: std::time::Instant,
+}
+
+pub(super) fn codex_check(
+    paths: &crate::chat::config::Paths,
+    input: &super::codex::HookInput,
+    explicit_name: Option<String>,
+    deadline: std::time::Instant,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let runtime = NativeRuntime::discover(std::process::id(), deadline)?;
+    let directory = paths
+        .database
+        .parent()
+        .context("missing Chat data directory")?
+        .join("bindings");
+    let files = BindingFiles::open(&directory)?;
+    let binding = if matches!(
+        input.hook_event_name.as_str(),
+        "SessionStart" | "SubagentStart"
+    ) {
+        let config = crate::chat::config::Config::load_or_create(&paths.config)?;
+        let project = config.project_for_root(&input.cwd)?;
+        let name = crate::name::pick(crate::name::Sources {
+            explicit: explicit_name,
+            lam_name: std::env::var("LAM_NAME").ok(),
+            multiplexer: None,
+        })?;
+        let candidate = NativeBinding::new(
+            "codex",
+            &runtime.version,
+            input.native_id(),
+            runtime.process,
+            &project,
+            &name,
+        )?;
+        enroll(&files, &paths.socket, candidate, deadline)?
+    } else {
+        let key = binding_locator("codex", input.native_id(), &runtime.process)?;
+        let binding = files.load(&key)?;
+        anyhow::ensure!(
+            binding.session.is_some()
+                && binding.version == runtime.version
+                && binding.process == runtime.process,
+            "native hook binding is missing or changed"
+        );
+        binding
+    };
+    let credential = format!("{}.{}", binding.locator()?, binding.integration_secret);
+    let operation = if matches!(
+        input.hook_event_name.as_str(),
+        "SessionEnd" | "SubagentStop"
+    ) {
+        crate::chat::protocol::Operation::End {}
+    } else {
+        crate::chat::protocol::Operation::Register {}
+    };
+    request(&paths.socket, &credential, operation, deadline)?;
+    Ok(())
+}
+
+impl Participant {
+    pub fn current(
+        paths: &crate::chat::config::Paths,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        (|| -> anyhow::Result<Self> {
+            let native_id = std::env::var("CODEX_THREAD_ID").context("missing native thread locator")?;
+            crate::chat::protocol::validate_uuid(&native_id)?;
+            let runtime = NativeRuntime::discover(std::process::id(), deadline)?;
+            let directory = paths.database.parent().context("missing Chat data directory")?.join("bindings");
+            anyhow::ensure!(directory.exists(), "native integration has not issued a binding");
+            let files = BindingFiles::open(&directory)?;
+            let locator = binding_locator(&runtime.client, &native_id, &runtime.process)?;
+            let binding = files.load(&locator)?;
+            anyhow::ensure!(binding.session.is_some() && binding.version == runtime.version && binding.process == runtime.process, "native enrollment missing or changed");
+            Ok(Self { binding, socket: paths.socket.clone(), deadline })
+        })().context("Chat requires a validated native participant binding; configure the client integration")
+    }
+
+    pub fn project(&self) -> &str {
+        &self.binding.project
+    }
+
+    pub fn request(
+        &self,
+        operation: crate::chat::protocol::Operation,
+    ) -> anyhow::Result<serde_json::Value> {
+        let credential = format!(
+            "{}.{}",
+            self.binding.locator()?,
+            self.binding.participant_secret
+        );
+        request(&self.socket, &credential, operation, self.deadline)
+    }
+}
+
+fn binding_locator(
+    client: &str,
+    native_id: &str,
+    process: &ProcessEvidence,
+) -> anyhow::Result<String> {
+    use sha2::Digest;
+    let lifetime = format!(
+        "{}:{}:{}",
+        process.boot_id, process.pid, process.start_ticks
+    );
+    let input = serde_json::to_vec(&(client, native_id, lifetime))?;
+    Ok(format!("{:x}", sha2::Sha256::digest(input)))
+}
+
 #[cfg(target_os = "linux")]
 struct NativeRuntime {
     client: String,
@@ -79,7 +339,7 @@ fn native_client(executable: &std::path::Path, args: &[Vec<u8>]) -> Option<&'sta
 }
 
 #[cfg(target_os = "linux")]
-pub(super) struct NativeBindings {
+pub(in crate::chat) struct NativeBindings {
     files: BindingFiles,
 }
 
@@ -125,6 +385,9 @@ impl NativeBindings {
 
 #[cfg(target_os = "linux")]
 impl crate::chat::daemon::BindingValidator for NativeBindings {
+    fn status(&self) -> &'static str {
+        "experimental native validator; native gates incomplete"
+    }
     fn validate(
         &self,
         peer: crate::chat::daemon::PeerIdentity,
@@ -430,9 +693,7 @@ impl NativeBinding {
     }
 
     fn locator(&self) -> anyhow::Result<String> {
-        use sha2::Digest;
-        let input = serde_json::to_vec(&(&self.client, &self.native_id, self.process_start()))?;
-        Ok(format!("{:x}", sha2::Sha256::digest(input)))
+        binding_locator(&self.client, &self.native_id, &self.process)
     }
 
     fn bind(&mut self, session: crate::chat::types::SessionRef) -> anyhow::Result<()> {
@@ -651,6 +912,193 @@ impl BindingFiles {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_socket_request_sends_credentials_and_honors_one_deadline() {
+        use crate::chat::protocol::{self, Operation};
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        use std::time::{Duration, Instant};
+        for delayed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("participant.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let worker = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let auth = protocol::read_frame(&mut stream).unwrap();
+                assert_eq!(
+                    auth,
+                    serde_json::json!({"version":1,"binding":"private-test-credential"})
+                );
+                let request = protocol::read_frame(&mut stream).unwrap();
+                assert_eq!(
+                    request,
+                    serde_json::json!({"version":1,"operation":{"op":"register"}})
+                );
+                if delayed {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                let _ = protocol::write_frame(
+                    &mut stream,
+                    &serde_json::json!({"version":1,"ok":true,"data":{"registered":true}}),
+                );
+            });
+            let result = request(
+                &socket,
+                "private-test-credential",
+                Operation::Register {},
+                Instant::now()
+                    + if delayed {
+                        Duration::from_millis(20)
+                    } else {
+                        Duration::from_secs(1)
+                    },
+            );
+            if delayed {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap(), serde_json::json!({"registered":true}));
+            }
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn issued_private_binding_enrolls_then_sends_through_the_real_store_owner() {
+        use crate::chat::{
+            daemon::{BindingValidator, PeerIdentity, VerifiedContext},
+            protocol::Operation,
+            types::{Draft, Target},
+        };
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        use std::time::{Duration, Instant};
+        struct ObservedBindings(NativeBindings);
+        impl BindingValidator for ObservedBindings {
+            fn validate(
+                &self,
+                peer: PeerIdentity,
+                credential: &str,
+            ) -> anyhow::Result<VerifiedContext> {
+                self.0.validate_with(peer, credential, || {
+                    Ok(NativeRuntime {
+                        client: "codex".into(),
+                        version: "0.153.4".into(),
+                        process: ProcessEvidence::read(std::process::id())?,
+                    })
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let files = BindingFiles::open(&dir.path().join("bindings")).unwrap();
+        let socket = dir.path().join("participant.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let validator =
+            ObservedBindings(NativeBindings::open(&dir.path().join("bindings")).unwrap());
+        let owner = crate::chat::daemon::tests::owned_connections(
+            listener,
+            std::sync::Arc::new(validator),
+            dir.path().join("chat.sqlite3"),
+            9,
+        );
+        let registered = enroll(
+            &files,
+            &socket,
+            binding(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        let session = registered.session.clone().unwrap();
+        let key = registered.locator().unwrap();
+        let mut other = binding();
+        other.native_id = "33333333-3333-4333-8333-333333333333".into();
+        other.name = "owned-recipient".into();
+        let other = enroll(
+            &files,
+            &socket,
+            other,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        let other_session = other.session.clone().unwrap();
+        assert_ne!(session, other_session);
+        let recipient = Participant {
+            binding: other,
+            socket: socket.clone(),
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        let participant = Participant {
+            binding: registered,
+            socket,
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        let sent = participant
+            .request(Operation::Send {
+                draft: Draft {
+                    key: "owned-real-store".into(),
+                    project: participant.project().into(),
+                    to: vec![Target::Agent(other_session)],
+                    body: "authenticated owned message".into(),
+                    reply_to: None,
+                },
+            })
+            .unwrap();
+        assert!(sent["id"].is_string());
+        let shown = recipient
+            .request(Operation::Show {
+                id: sent["id"].as_str().unwrap().into(),
+            })
+            .unwrap();
+        assert_eq!(
+            shown["sender"]["Agent"],
+            serde_json::to_value(&session).unwrap()
+        );
+        assert_eq!(shown["draft"]["body"], "authenticated owned message");
+        let reply = recipient
+            .request(Operation::Reply {
+                id: sent["id"].as_str().unwrap().into(),
+                key: "owned-explicit-reply".into(),
+                body: "explicit reply".into(),
+                all: false,
+            })
+            .unwrap();
+        assert!(reply["id"].is_string());
+        let inbox = participant
+            .request(Operation::Inbox {
+                cursor: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert!(serde_json::to_string(&inbox)
+            .unwrap()
+            .contains("explicit reply"));
+        assert!(
+            participant.request(Operation::End {}).is_err(),
+            "participant cannot end a native registration"
+        );
+        let integration = format!("{}.{}", key, participant.binding.integration_secret);
+        request(
+            &participant.socket,
+            &integration,
+            Operation::End {},
+            participant.deadline,
+        )
+        .unwrap();
+        assert!(
+            request(
+                &participant.socket,
+                &integration,
+                Operation::Register {},
+                participant.deadline
+            )
+            .is_err(),
+            "ended incarnation cannot revive"
+        );
+        owner.join().unwrap();
+        let restored = files.load(&key).unwrap();
+        assert_eq!(restored.session, Some(session));
+        assert!(restored.context(&restored.enrollment_secret).is_err());
+    }
 
     #[test]
     fn validator_requires_private_secret_matching_runtime_and_live_peer() {

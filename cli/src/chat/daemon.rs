@@ -39,10 +39,16 @@ pub struct PeerIdentity {
 /// cannot authorize a context. Participant bindings must never return Observer.
 pub trait BindingValidator: Send + Sync {
     fn validate(&self, peer: PeerIdentity, binding: &str) -> Result<VerifiedContext>;
+    fn status(&self) -> &'static str {
+        "custom validator"
+    }
 }
 
 struct UnavailableBindings;
 impl BindingValidator for UnavailableBindings {
+    fn status(&self) -> &'static str {
+        "disabled"
+    }
     fn validate(&self, _peer: PeerIdentity, _binding: &str) -> Result<VerifiedContext> {
         bail!("Chat native binding validation is unavailable; participant access is disabled until its integration is configured")
     }
@@ -222,6 +228,7 @@ pub fn run_with_validator(paths: &Paths, validator: Arc<dyn BindingValidator>) -
     let _lock = lock_instance(&paths.lock)?;
     let config = Config::load_or_create(&paths.config)?;
     let mut service = Service::open(&paths.database, &config.machine)?;
+    service.participant_auth = validator.status();
     service.limits = config.limits();
     // Register termination handling only for this command. Enabling ctrlc's
     // global termination feature would also change the existing pairing flow.
@@ -310,6 +317,7 @@ fn apply_work(service: &mut Service, work: Work, changes: &Changes) {
         Operation::Send { .. }
             | Operation::Reply { .. }
             | Operation::Register {}
+            | Operation::End {}
             | Operation::SetState { .. }
             | Operation::Delivery { .. }
             | Operation::Finish { .. }
@@ -519,11 +527,14 @@ fn respond(stream: &mut UnixStream, data: Value) -> Result<()> {
 
 /// Socket timeouts alone restart on each syscall. Use an absolute deadline so a
 /// trickling peer cannot keep a connection slot indefinitely.
-struct DeadlineStream<'a> {
+pub(super) struct DeadlineStream<'a> {
     stream: &'a mut UnixStream,
     deadline: Instant,
 }
 impl<'a> DeadlineStream<'a> {
+    pub(super) fn until(stream: &'a mut UnixStream, deadline: Instant) -> Self {
+        Self { stream, deadline }
+    }
     fn new(stream: &'a mut UnixStream, timeout: Duration) -> Self {
         Self {
             stream,
@@ -693,6 +704,7 @@ pub enum VerifiedContext {
 }
 
 struct Service {
+    participant_auth: &'static str,
     store: Store,
     machine: String,
     cursor_key: String,
@@ -717,6 +729,7 @@ impl Service {
         let cursor_key = store.cursor_key()?;
         store.recover_submitting()?;
         Ok(Self {
+            participant_auth: "disabled",
             store,
             machine: machine.into(),
             cursor_key,
@@ -755,6 +768,11 @@ impl Service {
         }
         if let VerifiedContext::Integration(registration) = context {
             return match operation {
+                Operation::End {} => {
+                    self.verify_registration(registration)?;
+                    Registry::new(&mut self.store)?.end(&registration.session)?;
+                    Ok(json!({"ended": registration.session}))
+                }
                 Operation::Register {} => {
                     protocol::validate_session(&registration.session)?;
                     protocol::validate_project(&registration.project)?;
@@ -787,7 +805,7 @@ impl Service {
         }
         match operation {
             Operation::Status {} => Ok(
-                json!({"running": true, "protocol": 1, "machine": self.machine, "participant_auth": "native binding required"}),
+                json!({"running": true, "protocol": 1, "machine": self.machine, "participant_auth": self.participant_auth}),
             ),
             Operation::Send { draft } => {
                 self.check_project(context, &draft.project)?;
@@ -1043,8 +1061,46 @@ fn validate_peer_owner(uid: u32, expected: u32) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+
+    /// Owned local socket fixture using the production connection dispatcher and
+    /// sole Store owner. Only the native observation is supplied by its caller.
+    pub(in crate::chat) fn owned_connections(
+        listener: UnixListener,
+        validator: Arc<dyn BindingValidator>,
+        path: std::path::PathBuf,
+        count: usize,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let service = Service::open(&path, MACHINE).unwrap();
+            let (sender, receiver) = mpsc::sync_channel(WRITER_QUEUE);
+            let changes = Arc::new(Changes::default());
+            let owner_changes = changes.clone();
+            let owner = thread::spawn(move || run_owner(service, receiver, &owner_changes));
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let result = serve_connection(
+                    &mut stream,
+                    false,
+                    validator.as_ref(),
+                    sender.clone(),
+                    &AtomicBool::new(false),
+                    &changes,
+                    &Mutex::new(0),
+                );
+                if let Err(error) = result {
+                    protocol::write_frame(
+                        &mut stream,
+                        &json!({"version":1,"ok":false,"error":error.to_string()}),
+                    )
+                    .unwrap();
+                }
+            }
+            drop(sender);
+            owner.join().unwrap();
+        })
+    }
     use crate::chat::types::{Draft, SessionRef, Target};
 
     const MACHINE: &str = "11111111-1111-4111-8111-111111111111";

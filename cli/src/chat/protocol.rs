@@ -16,6 +16,7 @@ pub struct Request {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Register {},
+    End {},
     Send {
         draft: Draft,
     },
@@ -137,7 +138,7 @@ impl Operation {
                 validate_project(project)?;
                 validate_page(cursor, *limit)?;
             }
-            Self::Status {} | Self::Register {} | Self::SetState { .. } => {}
+            Self::Status {} | Self::Register {} | Self::End {} | Self::SetState { .. } => {}
         }
         Ok(())
     }

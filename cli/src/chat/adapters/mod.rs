@@ -1,5 +1,7 @@
 #[cfg(target_os = "linux")]
 mod binding;
+#[cfg(target_os = "linux")]
+pub(super) use binding::{NativeBindings, Participant};
 pub mod codex;
 
 pub trait Adapter {

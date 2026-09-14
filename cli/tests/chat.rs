@@ -12,6 +12,113 @@ struct Fixture {
 }
 
 #[test]
+fn chat_send_help_is_available_without_cloud_config() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command()
+        .args(["chat", "send", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("--to"));
+    assert!(help.contains("--message"));
+    for args in [
+        vec!["chat", "send", "--to", "owned", "--message", "body"],
+        vec!["inbox", "show", "11111111-1111-4111-8111-111111111111"],
+    ] {
+        let result = fixture
+            .command()
+            .env_remove("CODEX_THREAD_ID")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr)
+            .contains("validated native participant binding"));
+    }
+    let override_sender = fixture
+        .command()
+        .args([
+            "chat",
+            "send",
+            "--to",
+            "owned",
+            "--message",
+            "body",
+            "--sender",
+            "Carlos",
+        ])
+        .output()
+        .unwrap();
+    assert!(!override_sender.status.success());
+    assert!(!fixture.dir.path().join("config/chat.toml").exists());
+    assert!(!fixture.dir.path().join("data/chat.sqlite3").exists());
+}
+
+#[test]
+fn codex_hook_operational_errors_are_silent_and_privately_bounded() {
+    use std::os::unix::fs::MetadataExt;
+    let fixture = Fixture::new();
+    let mut child = fixture
+        .command()
+        .args([
+            "chat",
+            "hook",
+            "--client",
+            "codex",
+            "--event",
+            "PostToolUse",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{invalid private body and credential")
+        .unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(result.status.success());
+    assert!(result.stdout.is_empty());
+    assert!(result.stderr.is_empty());
+    let path = fixture.dir.path().join("data/hook-errors.jsonl");
+    let diagnostic = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        diagnostic,
+        "{\"client\":\"codex\",\"stage\":\"input\",\"status\":\"error\"}\n"
+    );
+    assert_eq!(path.metadata().unwrap().mode() & 0o777, 0o600);
+    assert!(diagnostic.len() < 128);
+}
+
+#[test]
+fn native_validator_is_explicitly_experimental_and_status_distinguishes_it() {
+    let mut fixture = Fixture::new();
+    let help = fixture
+        .command()
+        .args(["chat", "serve", "--help"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--native-bindings"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("unverified"));
+    fixture.start_with_bindings(false);
+    assert_eq!(fixture.status()["participant_auth"], "disabled");
+    let plain = fixture.command().args(["chat", "status"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&plain.stdout).contains("disabled"));
+    fixture.terminate();
+    fixture.start_with_bindings(true);
+    assert_eq!(
+        fixture.status()["participant_auth"],
+        "experimental native validator; native gates incomplete"
+    );
+    fixture.terminate();
+}
+
+#[test]
 fn inbox_retry_is_discoverable_and_fails_closed_without_native_binding() {
     let fixture = Fixture::new();
     let help = fixture
@@ -62,12 +169,19 @@ impl Fixture {
         serde_json::from_slice(&output.stdout).unwrap()
     }
     fn start(&mut self) -> (PathBuf, PathBuf) {
+        self.start_with_bindings(false)
+    }
+    fn start_with_bindings(&mut self, native: bool) -> (PathBuf, PathBuf) {
         let status = self.status();
         let observer = PathBuf::from(status["observer_socket"].as_str().unwrap());
         let participant = PathBuf::from(status["participant_socket"].as_str().unwrap());
+        let mut command = self.command();
+        command.args(["chat", "serve", "--foreground"]);
+        if native {
+            command.arg("--native-bindings");
+        }
         self.child = Some(
-            self.command()
-                .args(["chat", "serve", "--foreground"])
+            command
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .spawn()
