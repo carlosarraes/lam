@@ -105,7 +105,7 @@ fn enroll(
 ) -> anyhow::Result<NativeBinding> {
     candidate.process.validate()?;
     let key = candidate.locator()?;
-    if let Err(error) = files.create(&candidate) {
+    if let Err(error) = files.create(&candidate, deadline) {
         if error
             .downcast_ref::<std::io::Error>()
             .is_none_or(|error| error.kind() != std::io::ErrorKind::AlreadyExists)
@@ -773,36 +773,62 @@ impl BindingFiles {
         })
     }
 
-    fn create(&self, binding: &NativeBinding) -> anyhow::Result<()> {
+    fn create(&self, binding: &NativeBinding, deadline: std::time::Instant) -> anyhow::Result<()> {
+        use std::ffi::CString;
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
         binding.validate_shape()?;
+        let key = binding.locator()?;
+        let _lock = self.lock(&key, deadline)?;
         let encoded = serde_json::to_vec(binding)?;
         anyhow::ensure!(
             encoded.len() <= 16_384,
             "private binding record exceeds its bound"
         );
-        let path = self.directory.join(format!("{}.json", binding.locator()?));
+        let path = self.directory.join(format!("{key}.json"));
+        let temporary = self
+            .directory
+            .join(format!("{key}.{}.tmp", uuid::Uuid::new_v4().simple()));
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
-        file.write_all(&encoded)?;
-        file.sync_all()?;
-        Ok(())
+            .open(&temporary)?;
+        let result = (|| -> anyhow::Result<()> {
+            file.write_all(&encoded)?;
+            file.sync_all()?;
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "native enrollment deadline expired"
+            );
+            let source = CString::new(temporary.as_os_str().as_bytes())?;
+            let target = CString::new(path.as_os_str().as_bytes())?;
+            // Readers never see a partial record. An existing record (including
+            // a symlink) is never replaced, even outside the cooperative lock.
+            if unsafe {
+                libc::renameat2(
+                    libc::AT_FDCWD,
+                    source.as_ptr(),
+                    libc::AT_FDCWD,
+                    target.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            std::fs::File::open(&self.directory)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result
     }
 
-    /// Only the daemon's Store owner assigns the session. Concurrent native
-    /// hooks serialize this handshake, and a bound file is never re-enrolled.
-    fn enroll(
-        &self,
-        key: &str,
-        deadline: std::time::Instant,
-        register: impl FnOnce(&NativeBinding) -> anyhow::Result<(crate::chat::types::SessionRef, bool)>,
-    ) -> anyhow::Result<NativeBinding> {
-        use std::io::Write;
+    /// Initial publication and enrollment share the same private record lock.
+    fn lock(&self, key: &str, deadline: std::time::Instant) -> anyhow::Result<std::fs::File> {
         use std::os::{
             fd::AsRawFd,
             unix::fs::{MetadataExt, OpenOptionsExt},
@@ -826,6 +852,10 @@ impl BindingFiles {
             "invalid private enrollment lock"
         );
         loop {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "native enrollment deadline expired"
+            );
             if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                 break;
             }
@@ -839,6 +869,21 @@ impl BindingFiles {
                 .ok_or_else(|| anyhow::anyhow!("native enrollment deadline expired"))?;
             std::thread::sleep(remaining.min(Duration::from_millis(2)));
         }
+        Ok(lock)
+    }
+
+    /// Only the daemon's Store owner assigns the session. Concurrent native
+    /// hooks serialize this handshake, and a bound file is never re-enrolled.
+    fn enroll(
+        &self,
+        key: &str,
+        deadline: std::time::Instant,
+        register: impl FnOnce(&NativeBinding) -> anyhow::Result<(crate::chat::types::SessionRef, bool)>,
+    ) -> anyhow::Result<NativeBinding> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::time::Instant;
+        let _lock = self.lock(key, deadline)?;
         let mut binding = self.load(key)?;
         if binding.session.is_some() {
             return Ok(binding);
@@ -912,6 +957,7 @@ impl BindingFiles {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn private_socket_request_sends_credentials_and_honors_one_deadline() {
@@ -1108,7 +1154,9 @@ mod tests {
         let binding = binding();
         let key = binding.locator().unwrap();
         let credential = format!("{key}.{}", binding.enrollment_secret);
-        files.create(&binding).unwrap();
+        files
+            .create(&binding, Instant::now() + Duration::from_secs(1))
+            .unwrap();
         let validator = NativeBindings { files };
         let peer = PeerIdentity {
             uid: unsafe { libc::geteuid() },
@@ -1238,13 +1286,139 @@ mod tests {
     }
 
     #[test]
+    fn initial_binding_publication_serializes_with_enrollment() {
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+        use std::sync::{mpsc, Arc, Barrier};
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let directory = dir.path().join("bindings");
+        let files = BindingFiles::open(&directory).unwrap();
+        let key = binding().locator().unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join(format!("{key}.lock")))
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let timed_out = files.create(&binding(), Instant::now() + Duration::from_millis(20));
+        assert!(timed_out.is_err());
+        let start = Arc::new(Barrier::new(3));
+        let (sender, receiver) = mpsc::channel();
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let directory = directory.clone();
+                let start = start.clone();
+                let sender = sender.clone();
+                std::thread::spawn(move || {
+                    let files = BindingFiles::open(&directory).unwrap();
+                    let candidate = binding();
+                    start.wait();
+                    sender
+                        .send(files.create(&candidate, Instant::now() + Duration::from_secs(1)))
+                        .unwrap();
+                })
+            })
+            .collect();
+        start.wait();
+        let premature = receiver.recv_timeout(Duration::from_millis(100));
+        let published_while_locked = directory.join(format!("{key}.json")).exists();
+        drop(lock);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(
+            premature.is_err(),
+            "initial publication ignored enrollment lock"
+        );
+        assert!(!published_while_locked);
+        let results: Vec<_> = (0..2).map(|_| receiver.recv().unwrap()).collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let error = results.into_iter().find_map(Result::err).unwrap();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        files.load(&key).unwrap().validate_shape().unwrap();
+    }
+
+    #[test]
+    fn initial_binding_publication_survives_interrupted_writer() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, Stdio};
+        const DIRECTORY: &str = "LAM_CHAT_TEST_INTERRUPTED_BINDING_DIR";
+        const PARENT: &str = "LAM_CHAT_TEST_INTERRUPTED_BINDING_PARENT";
+        if let Some(directory) = std::env::var_os(DIRECTORY) {
+            let files = BindingFiles::open(std::path::Path::new(&directory)).unwrap();
+            let mut candidate = binding();
+            candidate.process =
+                ProcessEvidence::read(std::env::var(PARENT).unwrap().parse().unwrap()).unwrap();
+            // Only this owned test subprocess is limited/interrupted. No
+            // production failpoint or native client participates in this test.
+            unsafe {
+                assert_eq!(
+                    libc::setrlimit(
+                        libc::RLIMIT_CORE,
+                        &libc::rlimit {
+                            rlim_cur: 0,
+                            rlim_max: 0,
+                        }
+                    ),
+                    0
+                );
+                assert_eq!(
+                    libc::setrlimit(
+                        libc::RLIMIT_FSIZE,
+                        &libc::rlimit {
+                            rlim_cur: 128,
+                            rlim_max: 128,
+                        }
+                    ),
+                    0
+                );
+                libc::signal(libc::SIGXFSZ, libc::SIG_DFL);
+            }
+            let _ = files.create(&candidate, Instant::now() + Duration::from_secs(1));
+            panic!("writer was not interrupted");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let directory = dir.path().join("bindings");
+        let files = BindingFiles::open(&directory).unwrap();
+        let candidate = binding();
+        let key = candidate.locator().unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "chat::adapters::binding::tests::initial_binding_publication_survives_interrupted_writer"])
+            .env(DIRECTORY, &directory)
+            .env(PARENT, std::process::id().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGXFSZ));
+        assert!(
+            !directory.join(format!("{key}.json")).exists(),
+            "interrupted writer left a poisoned final binding"
+        );
+        files
+            .create(&candidate, Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            files.load(&key).unwrap().participant_secret,
+            candidate.participant_secret
+        );
+    }
+
+    #[test]
     fn enrollment_persists_one_owner_assigned_incarnation_and_reuses_it() {
         use std::time::{Duration, Instant};
         let dir = tempfile::tempdir().unwrap();
         let files = BindingFiles::open(&dir.path().join("bindings")).unwrap();
         let binding = binding();
         let key = binding.locator().unwrap();
-        files.create(&binding).unwrap();
+        files
+            .create(&binding, Instant::now() + Duration::from_secs(1))
+            .unwrap();
         let session = crate::chat::types::SessionRef {
             machine: uuid::Uuid::new_v4().to_string(),
             incarnation: uuid::Uuid::new_v4().to_string(),
@@ -1316,8 +1490,12 @@ mod tests {
         let files = BindingFiles::open(&binding_dir).unwrap();
         let binding = binding();
         let key = binding.locator().unwrap();
-        files.create(&binding).unwrap();
-        assert!(files.create(&binding).is_err());
+        files
+            .create(&binding, Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        assert!(files
+            .create(&binding, Instant::now() + Duration::from_secs(1))
+            .is_err());
         let reopened = BindingFiles::open(&binding_dir).unwrap();
         let restored = reopened.load(&key).unwrap();
         assert_eq!(restored.participant_secret, binding.participant_secret);
@@ -1333,6 +1511,17 @@ mod tests {
         let mut wrong_lifetime = binding;
         wrong_lifetime.process.start_ticks += 1;
         assert_ne!(wrong_lifetime.locator().unwrap(), key);
+        let linked_candidate =
+            binding_dir.join(format!("{}.json", wrong_lifetime.locator().unwrap()));
+        std::os::unix::fs::symlink(&path, &linked_candidate).unwrap();
+        assert!(files
+            .create(&wrong_lifetime, Instant::now() + Duration::from_secs(1))
+            .is_err());
+        assert!(linked_candidate.symlink_metadata().unwrap().is_symlink());
+        assert_eq!(
+            reopened.load(&key).unwrap().participant_secret,
+            restored.participant_secret
+        );
     }
 
     #[test]
