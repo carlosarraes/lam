@@ -1,0 +1,9 @@
+{
+  "description": "Owned LAM Task 6 native identity probe; no delivery or permission changes",
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "node /tmp/lam-chat-task6-topology.TwJPU1/hook-identity.mjs", "timeout": 2 }] }],
+    "SubagentStart": [{ "hooks": [{ "type": "command", "command": "node /tmp/lam-chat-task6-topology.TwJPU1/hook-identity.mjs", "timeout": 2 }] }],
+    "PostToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "node /tmp/lam-chat-task6-topology.TwJPU1/hook-identity.mjs", "timeout": 2 }] }],
+    "SubagentStop": [{ "hooks": [{ "type": "command", "command": "node /tmp/lam-chat-task6-topology.TwJPU1/hook-identity.mjs", "timeout": 2 }] }]
+  }
+}
