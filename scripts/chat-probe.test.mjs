@@ -68,11 +68,14 @@ test('tool probe requires a case ID', () => {
   assert.match(result.stderr, /case id required/);
 });
 
-test('tool probe reports readiness then completes after at least twenty seconds', async () => {
-  const child = spawn(process.execPath, [probe.pathname, 'unit-owned-long-tool']);
+test('tool probe reports readiness then completes after at least twenty seconds', { timeout: 35_000 }, async () => {
+  const child = spawn(process.execPath, [probe.pathname, 'unit-owned-long-tool'], { timeout: 30_000 });
   let stdout = '';
   child.stdout.on('data', chunk => { stdout += chunk; });
-  const code = await new Promise(resolve => child.on('exit', resolve));
+  const code = await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', resolve);
+  });
   assert.equal(code, 0);
   const events = stdout.trim().split('\n').map(line => JSON.parse(line));
   assert.deepEqual(events[0], { caseId: 'unit-owned-long-tool', event: 'ready' });

@@ -1,0 +1,70 @@
+{
+  "identity": {
+    "caseId": "codex-hook-disabled",
+    "pid": 2051411,
+    "parentPid": 28534,
+    "codexThread": "01a09e47-adb1-7772-b71f-7288e338d299"
+  },
+  "uiObservation": {
+    "source": "selected values from owned /hooks UI",
+    "event": "PostToolUse",
+    "matcher": "Bash",
+    "installed": 1,
+    "active": 0,
+    "trust": "Trusted",
+    "mode": "Sync",
+    "timeoutSeconds": 2,
+    "command": "node /tmp/lam-chat-gate.Bx9ROj/hook.mjs",
+    "stopInstalled": 0,
+    "stopActive": 0
+  },
+  "events": [
+    {
+      "at": "2026-09-14T04:59:00.721Z",
+      "caseId": "codex-hook-disabled",
+      "event": "ready"
+    },
+    {
+      "at": "2026-09-14T04:59:20.737Z",
+      "caseId": "codex-hook-disabled",
+      "event": "completed",
+      "elapsedMs": 20019
+    }
+  ],
+  "submission": [
+    {
+      "at": "2026-09-14T04:59:00.754Z",
+      "client": "codex",
+      "event": "pending-written",
+      "caseId": "codex-hook-disabled",
+      "payload": {
+        "origin": "agent",
+        "senderId": "owned-lam-probe",
+        "senderName": "Carlos",
+        "nonce": "CODEX_DISABLED_M9K4",
+        "body": "Report nonce CODEX_DISABLED_M9K4 after the current tool completes."
+      }
+    }
+  ],
+  "pendingAtVerification": {
+    "origin": "agent",
+    "senderId": "owned-lam-probe",
+    "senderName": "Carlos",
+    "nonce": "CODEX_DISABLED_M9K4",
+    "body": "Report nonce CODEX_DISABLED_M9K4 after the current tool completes."
+  },
+  "pendingExistsAtVerification": true,
+  "hookInvocationsForOwnedSession": 0,
+  "nonceInNativeTranscript": false,
+  "adapterDeveloperPayloads": 0,
+  "outcome": "not-submitted",
+  "limitation": "Disabled integration respected; no native queue receiver-rejection control was tested.",
+  "cleanup": {
+    "ownedSessionExitCode": 0,
+    "activeHookConfigExists": false,
+    "activePendingFileExists": false,
+    "hookConfiguration": "retained as .codex/hooks.disabled.json",
+    "pendingPayload": "retained as codex-disabled-pending.evidence.json",
+    "stopHook": "never configured or trusted"
+  }
+}
