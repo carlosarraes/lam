@@ -1,0 +1,61 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env LAM_CHAT_CONFIG=/tmp/lam-chat-task6-native.KlGYDF/hook-case-1/chat.toml LAM_CHAT_DATA_DIR=/tmp/lam-chat-task6-native.KlGYDF/hook-case-1/data /tmp/lam-chat-task6-native.KlGYDF/hook-case-1/bin/lam-8bc82a6 chat hook --client codex --event SessionStart --name owned-hook",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env LAM_CHAT_CONFIG=/tmp/lam-chat-task6-native.KlGYDF/hook-case-1/chat.toml LAM_CHAT_DATA_DIR=/tmp/lam-chat-task6-native.KlGYDF/hook-case-1/data /tmp/lam-chat-task6-native.KlGYDF/hook-case-1/bin/lam-8bc82a6 chat hook --client codex --event SubagentStart --name owned-hook",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env LAM_CHAT_CONFIG=/tmp/lam-chat-task6-native.KlGYDF/hook-case-1/chat.toml LAM_CHAT_DATA_DIR=/tmp/lam-chat-task6-native.KlGYDF/hook-case-1/data /tmp/lam-chat-task6-native.KlGYDF/hook-case-1/bin/lam-8bc82a6 chat hook --client codex --event PostToolUse --name owned-hook",
+            "timeout": 2,
+            "additionalContextLimit": 0
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env LAM_CHAT_CONFIG=/tmp/lam-chat-task6-native.KlGYDF/hook-case-1/chat.toml LAM_CHAT_DATA_DIR=/tmp/lam-chat-task6-native.KlGYDF/hook-case-1/data /tmp/lam-chat-task6-native.KlGYDF/hook-case-1/bin/lam-8bc82a6 chat hook --client codex --event SubagentStop --name owned-hook",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env LAM_CHAT_CONFIG=/tmp/lam-chat-task6-native.KlGYDF/hook-case-1/chat.toml LAM_CHAT_DATA_DIR=/tmp/lam-chat-task6-native.KlGYDF/hook-case-1/data /tmp/lam-chat-task6-native.KlGYDF/hook-case-1/bin/lam-8bc82a6 chat hook --client codex --event SessionEnd --name owned-hook",
+            "timeout": 2
+          }
+        ]
+      }
+    ]
+  }
+}

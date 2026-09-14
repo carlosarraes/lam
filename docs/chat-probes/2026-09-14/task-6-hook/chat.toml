@@ -1,0 +1,9 @@
+schema_version = 1
+machine = "3e03dd2d-d8cb-44bf-bb29-dd676cb32abc"
+inline_bytes = 4096
+batch_bytes = 8192
+
+[[projects]]
+id = "773ab59b-bf94-4b34-b949-611857639fca"
+roots = ["/tmp/lam-chat-task6-native.KlGYDF/hook-case-1"]
+

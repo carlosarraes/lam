@@ -1,0 +1,10 @@
+import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+const root="/tmp/lam-chat-task6-native.KlGYDF/hook-case-1";
+if(process.cwd()!==root || !/^[0-9a-f-]{36}\/[0-9a-f-]{36}$/.test(process.argv[2]??'')) throw new Error('exact owned recipient required');
+const file=readFileSync(root+'/payload.txt','utf8');
+const body=file.endsWith('\n') ? file.slice(0,-1) : file;
+if(Buffer.byteLength(body)!==4096) throw new Error('fixture must be exactly 4096 bytes');
+const r=spawnSync(root+'/bin/lam-8bc82a6',['chat','send','--to',process.argv[2],'--message',body],{env:{...process.env,LAM_CHAT_CONFIG:root+'/chat.toml',LAM_CHAT_DATA_DIR:root+'/data'},encoding:'utf8'});
+if(r.status!==0) throw new Error('owned native send failed');
+process.stdout.write(r.stdout);
