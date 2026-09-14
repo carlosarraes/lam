@@ -1,0 +1,29 @@
+{
+  "receiverSession": "8fa8e0cd-e7eb-4ab6-9367-313b1171c37f",
+  "receiverSocket": "/run/user/1000/cc-socks/2056946.sock",
+  "socketExistsAfterExit": false,
+  "receiverSelectedMessages": [
+    {
+      "timestamp": "2026-09-14T05:16:10.147Z",
+      "type": "user",
+      "origin": {
+        "kind": "human"
+      },
+      "content": "Owned isolated LAM refusal receiver. Reply READY, then wait. Do not use tools or contact other sessions."
+    },
+    {
+      "timestamp": "2026-09-14T05:16:11.651Z",
+      "type": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "READY"
+        }
+      ]
+    }
+  ],
+  "nativePeerRows": 0,
+  "receiverTrace": [
+    "2026-09-14T05:18:58.321Z [DEBUG] [cross-session-inbound] refused inbound peer message (uds: dropped before attachment materialization)"
+  ]
+}

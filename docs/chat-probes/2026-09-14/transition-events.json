@@ -1,0 +1,256 @@
+{
+  "session": "01a09e5b-15b7-77f0-9829-e09b5fb61c86",
+  "toolEvents": [
+    {
+      "at": "2026-09-14T05:21:33.351Z",
+      "caseId": "codex-stop-race",
+      "event": "ready"
+    },
+    {
+      "at": "2026-09-14T05:21:53.356Z",
+      "caseId": "codex-stop-race",
+      "event": "completed",
+      "elapsedMs": 20009
+    },
+    {
+      "at": "2026-09-14T05:22:28.724Z",
+      "caseId": "codex-idle-queue-race",
+      "event": "ready"
+    },
+    {
+      "at": "2026-09-14T05:22:48.744Z",
+      "caseId": "codex-idle-queue-race",
+      "event": "completed",
+      "elapsedMs": 20023
+    },
+    {
+      "at": "2026-09-14T05:23:23.238Z",
+      "caseId": "codex-idle-hook-race",
+      "event": "ready"
+    },
+    {
+      "at": "2026-09-14T05:23:43.257Z",
+      "caseId": "codex-idle-hook-race",
+      "event": "completed",
+      "elapsedMs": 20023
+    }
+  ],
+  "hookEvents": [
+    {
+      "at": "2026-09-14T05:21:53.401Z",
+      "session": "01a09e5b-15b7-77f0-9829-e09b5fb61c86",
+      "event": "PostToolUse",
+      "present": false
+    },
+    {
+      "at": "2026-09-14T05:21:57.490Z",
+      "session": "01a09e5b-15b7-77f0-9829-e09b5fb61c86",
+      "event": "Stop",
+      "present": true,
+      "nonce": "CODEX_STOP_P8R6",
+      "exitCode": 0,
+      "stdout": "Queued message 01a09e5d-6aee-7692-9034-c4af975a3b3f for thread 01a09e5b-15b7-77f0-9829-e09b5fb61c86.\n",
+      "stderr": "",
+      "outcome": "native-accepted"
+    },
+    {
+      "at": "2026-09-14T05:22:00.535Z",
+      "session": "01a09e5b-15b7-77f0-9829-e09b5fb61c86",
+      "event": "Stop",
+      "present": false
+    },
+    {
+      "at": "2026-09-14T05:22:48.782Z",
+      "session": "01a09e5b-15b7-77f0-9829-e09b5fb61c86",
+      "event": "PostToolUse",
+      "present": false
+    },
+    {
+      "at": "2026-09-14T05:22:50.553Z",
+      "session": "01a09e5b-15b7-77f0-9829-e09b5fb61c86",
+      "event": "Stop",
+      "present": false
+    },
+    {
+      "at": "2026-09-14T05:22:54.492Z",
+      "session": "01a09e5b-15b7-77f0-9829-e09b5fb61c86",
+      "event": "Stop",
+      "present": false
+    },
+    {
+      "at": "2026-09-14T05:23:43.288Z",
+      "session": "01a09e5b-15b7-77f0-9829-e09b5fb61c86",
+      "event": "PostToolUse",
+      "present": true
+    },
+    {
+      "at": "2026-09-14T05:23:46.350Z",
+      "session": "01a09e5b-15b7-77f0-9829-e09b5fb61c86",
+      "event": "Stop",
+      "present": false
+    }
+  ],
+  "coordinatorEvents": [
+    {
+      "at": "2026-09-14T05:21:33.355Z",
+      "mode": "busy-to-idle",
+      "caseId": "codex-stop-race",
+      "nonce": "CODEX_STOP_P8R6",
+      "event": "observed-busy",
+      "session": "01a09e5b-15b7-77f0-9829-e09b5fb61c86"
+    },
+    {
+      "at": "2026-09-14T05:21:53.403Z",
+      "mode": "busy-to-idle",
+      "caseId": "codex-stop-race",
+      "nonce": "CODEX_STOP_P8R6",
+      "event": "last-tool-check-observed-empty"
+    },
+    {
+      "at": "2026-09-14T05:21:53.403Z",
+      "mode": "busy-to-idle",
+      "caseId": "codex-stop-race",
+      "nonce": "CODEX_STOP_P8R6",
+      "event": "pending-written",
+      "payload": {
+        "origin": "agent",
+        "senderId": "owned-lam-probe",
+        "senderName": "Carlos",
+        "nonce": "CODEX_STOP_P8R6",
+        "body": "Report nonce CODEX_STOP_P8R6; no tools or other actions."
+      }
+    },
+    {
+      "at": "2026-09-14T05:22:21.183Z",
+      "mode": "queue-wins",
+      "caseId": "codex-idle-queue-race",
+      "nonce": "CODEX_ITB_QUEUE_K3V8",
+      "event": "sampled-idle",
+      "session": "01a09e5b-15b7-77f0-9829-e09b5fb61c86",
+      "nativeObservation": {
+        "at": "2026-09-14T05:22:00.535Z",
+        "session": "01a09e5b-15b7-77f0-9829-e09b5fb61c86",
+        "event": "Stop",
+        "present": false
+      }
+    },
+    {
+      "at": "2026-09-14T05:22:28.728Z",
+      "mode": "queue-wins",
+      "caseId": "codex-idle-queue-race",
+      "nonce": "CODEX_ITB_QUEUE_K3V8",
+      "event": "observed-busy",
+      "session": "01a09e5b-15b7-77f0-9829-e09b5fb61c86"
+    },
+    {
+      "at": "2026-09-14T05:22:28.728Z",
+      "mode": "queue-wins",
+      "caseId": "codex-idle-queue-race",
+      "nonce": "CODEX_ITB_QUEUE_K3V8",
+      "event": "pending-written",
+      "payload": {
+        "origin": "agent",
+        "senderId": "owned-lam-probe",
+        "senderName": "Carlos",
+        "nonce": "CODEX_ITB_QUEUE_K3V8",
+        "body": "Report nonce CODEX_ITB_QUEUE_K3V8; no tools or other actions."
+      }
+    },
+    {
+      "at": "2026-09-14T05:22:28.728Z",
+      "mode": "queue-wins",
+      "caseId": "codex-idle-queue-race",
+      "nonce": "CODEX_ITB_QUEUE_K3V8",
+      "event": "idle-claim",
+      "won": true
+    },
+    {
+      "at": "2026-09-14T05:22:28.834Z",
+      "mode": "queue-wins",
+      "caseId": "codex-idle-queue-race",
+      "nonce": "CODEX_ITB_QUEUE_K3V8",
+      "event": "native-queue",
+      "exitCode": 0,
+      "stdout": "Queued message 01a09e5d-e55e-7952-9527-58d7c2853b05 for thread 01a09e5b-15b7-77f0-9829-e09b5fb61c86.\n",
+      "stderr": "",
+      "outcome": "native-accepted"
+    },
+    {
+      "at": "2026-09-14T05:23:17.097Z",
+      "mode": "hook-wins",
+      "caseId": "codex-idle-hook-race",
+      "nonce": "CODEX_ITB_HOOK_F7N2",
+      "event": "sampled-idle",
+      "session": "01a09e5b-15b7-77f0-9829-e09b5fb61c86",
+      "nativeObservation": {
+        "at": "2026-09-14T05:22:54.492Z",
+        "session": "01a09e5b-15b7-77f0-9829-e09b5fb61c86",
+        "event": "Stop",
+        "present": false
+      }
+    },
+    {
+      "at": "2026-09-14T05:23:23.240Z",
+      "mode": "hook-wins",
+      "caseId": "codex-idle-hook-race",
+      "nonce": "CODEX_ITB_HOOK_F7N2",
+      "event": "observed-busy",
+      "session": "01a09e5b-15b7-77f0-9829-e09b5fb61c86"
+    },
+    {
+      "at": "2026-09-14T05:23:23.240Z",
+      "mode": "hook-wins",
+      "caseId": "codex-idle-hook-race",
+      "nonce": "CODEX_ITB_HOOK_F7N2",
+      "event": "pending-written",
+      "payload": {
+        "origin": "agent",
+        "senderId": "owned-lam-probe",
+        "senderName": "Carlos",
+        "nonce": "CODEX_ITB_HOOK_F7N2",
+        "body": "Report nonce CODEX_ITB_HOOK_F7N2; no tools or other actions."
+      }
+    },
+    {
+      "at": "2026-09-14T05:23:43.291Z",
+      "mode": "hook-wins",
+      "caseId": "codex-idle-hook-race",
+      "nonce": "CODEX_ITB_HOOK_F7N2",
+      "event": "idle-claim",
+      "won": false
+    }
+  ],
+  "configuration": {
+    "description": "Owned LAM Chat compatibility probe, no production integration",
+    "hooks": {
+      "PostToolUse": [
+        {
+          "matcher": "Bash",
+          "hooks": [
+            {
+              "type": "command",
+              "command": "node /tmp/lam-chat-gate.Bx9ROj/hook.mjs",
+              "timeout": 2
+            }
+          ]
+        }
+      ],
+      "Stop": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "node /tmp/lam-chat-gate.Bx9ROj/stop-hook.mjs",
+              "timeout": 2
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "cleanup": {
+    "activeHookFileExists": false,
+    "activePendingExists": false,
+    "retainedConfigurationExists": true
+  }
+}

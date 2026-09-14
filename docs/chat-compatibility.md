@@ -2,7 +2,7 @@
 
 These are Linux probes of Claude Code 2.1.270, Codex CLI 0.154.0, and Pi 0.85.1 on 2026-09-14. They do not enable a production integration. The captured gate report is [report.json](chat-probes/2026-09-14/report.json); [the runbook](chat-probes/2026-09-14/README.md) contains the invocation, fixtures, and evidence interpretation.
 
-Three cases remain unpassed: Claude refusal, Codex busy-to-idle, and Codex idle-to-busy. Claude's lack of a response does not prove native refusal. The additional Codex Stop observer remains untested. Passing the checker tests is not a passing compatibility milestone. Run the actual gate with:
+All required native capability cases now have passing evidence, with the limits below. The [approved follow-up](chat-probes/2026-09-14/transition-follow-up.md) closes Claude refusal and both Codex transitions. This is a Linux capability gate, not a production reliability claim. Run the actual gate with:
 
 ```sh
 node scripts/chat-probe-check.mjs docs/chat-probes/2026-09-14/report.json
@@ -21,6 +21,8 @@ Peer bodies contained fake LAM headers, JSON delimiters, embedded system/develop
 The empty Codex hook emitted zero stdout/stderr bytes in a standalone 19 ms sample. This is one measurement, not a benchmark. Empty follow-up tool calls in all three sessions did not add another copy of old messages. Native refusal/unavailable observations must remain distinguishable from acceptance: a connected socket with no acknowledgement is not a delivery receipt.
 
 The [disabled Codex hook follow-up](chat-probes/2026-09-14/codex-disabled-check.json) closes the disabled-integration case. With its single trusted PostToolUse hook inactive in `/hooks`, a nonce written during a 20,019 ms tool remained pending and never appeared in the native transcript; the model reported `NONE`. This means not submitted, not native queue rejection. The owned session exited normally, and the temporary hook configuration and pending evidence were moved out of their active paths.
+
+Claude's native sender returned submission success, then received an explicit refusal notice; the refusing receiver independently logged rejection before attachment materialization. Earlier raw-helper submissions remain unknown. Codex's approved silent Stop observer reevaluated a pending message after the final empty tool hook and queued a new turn. Ordered idle-to-busy tests exercised both queue-first and hook-first ownership of one pending file, with one native exposure per nonce. These do not establish production leases, crash recovery, native deduplication, or exhaustive scheduler safety.
 
 Pi's configured opencode-go/deepseek-v4-flash provider returned a monthly-limit 429. The model probes used its existing openai-codex login with `--provider openai-codex --model gpt-5.6-luna` for those sessions only. Defaults were unchanged. Claude used its installed Opus 5 default; Codex used its installed gpt-6-astra default and existing permission configuration. Mac behavior, production delivery claims, durable receipt reconciliation, and cross-client LAM commands remain later work.
 
