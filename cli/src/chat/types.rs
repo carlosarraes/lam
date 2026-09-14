@@ -4,6 +4,26 @@ pub struct SessionRef {
     pub incarnation: String,
 }
 
+/// Internal adapter contract: native identity and process evidence must already
+/// have been validated by the selected client's adapter, never by caller JSON.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Registration {
+    pub session: SessionRef,
+    pub project: String,
+    pub name: String,
+    pub client: String,
+    pub native_id: String,
+    pub process_start: String,
+    pub eligible: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionState {
+    pub registration: Registration,
+    pub connected: bool,
+    pub ended: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Actor {
     Agent(SessionRef),

@@ -6,9 +6,7 @@ use anyhow::{bail, ensure, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
-use super::registry::{Registration, SessionState};
-use super::types::SessionRef;
-use super::types::{Actor, Draft, Message, Target};
+use super::types::{Actor, Draft, Message, Registration, SessionRef, SessionState, Target};
 
 const SCHEMA_VERSION: u32 = 2;
 const MAX_BODY_BYTES: usize = 64 * 1024;
