@@ -1,0 +1,61 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env LAM_CHAT_CONFIG=/tmp/lam-chat-task6-native.KlGYDF/config/chat.toml LAM_CHAT_DATA_DIR=/tmp/lam-chat-task6-native.KlGYDF/data /tmp/lam-chat-task6-native.KlGYDF/bin/lam-c42ec10 chat hook --client codex --event SessionStart --name owned-codex",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env LAM_CHAT_CONFIG=/tmp/lam-chat-task6-native.KlGYDF/config/chat.toml LAM_CHAT_DATA_DIR=/tmp/lam-chat-task6-native.KlGYDF/data /tmp/lam-chat-task6-native.KlGYDF/bin/lam-c42ec10 chat hook --client codex --event SubagentStart --name owned-codex",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env LAM_CHAT_CONFIG=/tmp/lam-chat-task6-native.KlGYDF/config/chat.toml LAM_CHAT_DATA_DIR=/tmp/lam-chat-task6-native.KlGYDF/data /tmp/lam-chat-task6-native.KlGYDF/bin/lam-c42ec10 chat hook --client codex --event PostToolUse --name owned-codex",
+            "timeout": 2,
+            "additionalContextLimit": 0
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env LAM_CHAT_CONFIG=/tmp/lam-chat-task6-native.KlGYDF/config/chat.toml LAM_CHAT_DATA_DIR=/tmp/lam-chat-task6-native.KlGYDF/data /tmp/lam-chat-task6-native.KlGYDF/bin/lam-c42ec10 chat hook --client codex --event SubagentStop --name owned-codex",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env LAM_CHAT_CONFIG=/tmp/lam-chat-task6-native.KlGYDF/config/chat.toml LAM_CHAT_DATA_DIR=/tmp/lam-chat-task6-native.KlGYDF/data /tmp/lam-chat-task6-native.KlGYDF/bin/lam-c42ec10 chat hook --client codex --event SessionEnd --name owned-codex",
+            "timeout": 2
+          }
+        ]
+      }
+    ]
+  }
+}

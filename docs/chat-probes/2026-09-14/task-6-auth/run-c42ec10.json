@@ -1,0 +1,160 @@
+{
+  "revision": "c42ec10",
+  "approval": {
+    "id": "yxzfm",
+    "choice": "approve",
+    "resolvedAt": "2026-09-14T13:09:44.270Z"
+  },
+  "root": "/tmp/lam-chat-task6-native.KlGYDF",
+  "binary": {
+    "path": "/tmp/lam-chat-task6-native.KlGYDF/bin/lam-c42ec10",
+    "sha256": "e0eb992c0c3a62a90dd030f8a392bd575f500eab02c460da454f550cd6147eac",
+    "build": "debug"
+  },
+  "hookConfig": {
+    "activePath": "/tmp/lam-chat-task6-native.KlGYDF/.codex/hooks.json",
+    "retainedPath": "/tmp/lam-chat-task6-native.KlGYDF/.codex/hooks.c42ec10.disabled.json",
+    "sha256": "8619fa22fab01adf491dc5d7143a31b2aa13da8284d64c7088357863da2334db"
+  },
+  "chatConfigSha256": "9e8b6f373d9ada534303626eb91607e7595275d2ada8b0be943b7eb9a2911d84",
+  "frontendVersion": "0.154.0",
+  "executionBackendVersion": "0.153.4",
+  "sharedBackendPid": 28534,
+  "daemon": {
+    "pid": 2267918,
+    "ptySession": 9002,
+    "argv": [
+      "/tmp/lam-chat-task6-native.KlGYDF/bin/lam-c42ec10",
+      "chat",
+      "serve",
+      "--foreground",
+      "--native-bindings"
+    ],
+    "config": "/tmp/lam-chat-task6-native.KlGYDF/config/chat.toml",
+    "data": "/tmp/lam-chat-task6-native.KlGYDF/data",
+    "exitCode": 0
+  },
+  "setup": {
+    "pid": 2268176,
+    "ptySession": 15781,
+    "nativeThread": "01a0a00e-3738-7e92-b2ff-8180e16118c4",
+    "argv": [
+      "codex",
+      "This is an owned LAM Chat integration setup session only. Do not run tools or create agents. Reply READY and wait."
+    ],
+    "result": "READY; no tools or child",
+    "exitCode": 0
+  },
+  "auth": {
+    "pid": 2270448,
+    "ptySession": 33018,
+    "nativeThread": "01a0a011-4a2c-7350-b1d9-3971020a6299",
+    "childNativeThread": "01a0a011-a51c-7860-bd94-4acfa570a16e",
+    "childTask": "/root/auth_child",
+    "argv": [
+      "codex",
+      "This is an explicitly authorized owned LAM Chat authentication test, not implementation work. Use only the concrete local commands below and exactly one native child test subject; do not read files, transcripts, general environments, credentials, change settings, or delegate implementation. Do not interrupt any tool. Automatic delivery is NOT implemented, so explicit Inbox reads are expected here.\n1. Run: env LAM_CHAT_CONFIG=/tmp/lam-chat-task6-native.KlGYDF/config/chat.toml LAM_CHAT_DATA_DIR=/tmp/lam-chat-task6-native.KlGYDF/data /tmp/lam-chat-task6-native.KlGYDF/bin/lam-c42ec10 chat send --to owned-codex --message AUTH_ROOT_c42ec10\nKeep its JSON message id and sender.Agent machine/incarnation, which are public test identities. If this fails, report the exact error and AUTH_TEST_FAILED, then stop without creating a child.\n2. Create exactly one native child. Tell it to run env LAM_CHAT_CONFIG=/tmp/lam-chat-task6-native.KlGYDF/config/chat.toml LAM_CHAT_DATA_DIR=/tmp/lam-chat-task6-native.KlGYDF/data /tmp/lam-chat-task6-native.KlGYDF/bin/lam-c42ec10 chat send --to MACHINE/INCARNATION --message AUTH_CHILD_c42ec10 using YOUR exact sender.Agent values from step 1. Then it must run sleep 20 without interruption, then env LAM_CHAT_CONFIG=/tmp/lam-chat-task6-native.KlGYDF/config/chat.toml LAM_CHAT_DATA_DIR=/tmp/lam-chat-task6-native.KlGYDF/data /tmp/lam-chat-task6-native.KlGYDF/bin/lam-c42ec10 inbox and report whether AUTH_REPLY_c42ec10 is present, retaining its sent JSON. No other task or child.\n3. While that child is sleeping, poll your own env LAM_CHAT_CONFIG=/tmp/lam-chat-task6-native.KlGYDF/config/chat.toml LAM_CHAT_DATA_DIR=/tmp/lam-chat-task6-native.KlGYDF/data /tmp/lam-chat-task6-native.KlGYDF/bin/lam-c42ec10 inbox at most 15 times, with 1-second sleep between empty checks, until AUTH_CHILD_c42ec10 appears. Read only your own inbox. Extract that message's exact id and run env LAM_CHAT_CONFIG=/tmp/lam-chat-task6-native.KlGYDF/config/chat.toml LAM_CHAT_DATA_DIR=/tmp/lam-chat-task6-native.KlGYDF/data /tmp/lam-chat-task6-native.KlGYDF/bin/lam-c42ec10 chat reply MESSAGE_ID --message AUTH_REPLY_c42ec10. Do not guess an id.\n4. Wait for the owned child to finish normally. Report your initial sent JSON, child native id and sent JSON, explicit reply JSON, and whether the child fetched the reply. End with AUTH_TEST_DONE and wait. Do not send further messages or run more tools."
+    ],
+    "result": "AUTH_TEST_DONE",
+    "childSleepSeconds": 20,
+    "childReportedReplyFetched": true,
+    "childCompletedNormally": true,
+    "exitCode": 0
+  },
+  "trustActions": [
+    "Accepted normal folder trust for exact owned root",
+    "Reviewed and trusted PostToolUse, SessionStart project Hook2, SessionEnd, SubagentStart, SubagentStop individually",
+    "PostToolUse native UI displayed sync2s and Context unlimited",
+    "Preserved preexisting global Herdr SessionStart and native permission defaults"
+  ],
+  "bindings": [
+    {
+      "locator": "5bd88d65808b8f1a032a53a3d240d12f6a544bbcc32c4a39faee2dfa5904f4cb",
+      "mode": 384,
+      "client": "codex",
+      "version": "0.153.4",
+      "native_id": "01a0a011-4a2c-7350-b1d9-3971020a6299",
+      "process": {
+        "pid": 28534,
+        "boot_id": "3cb043eb-f7b1-4588-af7d-c3fe9c530c07",
+        "start_ticks": 76781,
+        "executable": "/home/carraes/.codex/packages/standalone/releases/0.153.4-x86_64-unknown-linux-musl/bin/codex",
+        "uid": 1000
+      },
+      "session": {
+        "machine": "9e3fdab9-63a4-478b-b540-ed0130aa0e98",
+        "incarnation": "db673a6c-436c-4ced-89c7-b938f079d74b"
+      },
+      "name": "owned-codex",
+      "eligible": true,
+      "credentialFieldsDistinct": true,
+      "credentialLengths": [
+        64,
+        64,
+        64
+      ]
+    },
+    {
+      "locator": "e94a786744b15c55673ed413005ca09cf76f36e20aba6ac2c00d012e9bf4f969",
+      "mode": 384,
+      "client": "codex",
+      "version": "0.153.4",
+      "native_id": "01a0a011-a51c-7860-bd94-4acfa570a16e",
+      "process": {
+        "pid": 28534,
+        "boot_id": "3cb043eb-f7b1-4588-af7d-c3fe9c530c07",
+        "start_ticks": 76781,
+        "executable": "/home/carraes/.codex/packages/standalone/releases/0.153.4-x86_64-unknown-linux-musl/bin/codex",
+        "uid": 1000
+      },
+      "session": {
+        "machine": "9e3fdab9-63a4-478b-b540-ed0130aa0e98",
+        "incarnation": "67fec42f-4848-4119-9c41-a476cb68d99e"
+      },
+      "name": "owned-codex",
+      "eligible": true,
+      "credentialFieldsDistinct": true,
+      "credentialLengths": [
+        64,
+        64,
+        64
+      ]
+    }
+  ],
+  "rosterAfterChildCompleted": {
+    "sessions": [
+      {
+        "client": "codex",
+        "eligible": true,
+        "name": "owned-codex",
+        "session": {
+          "incarnation": "db673a6c-436c-4ced-89c7-b938f079d74b",
+          "machine": "9e3fdab9-63a4-478b-b540-ed0130aa0e98"
+        }
+      }
+    ]
+  },
+  "ordering": "Reply was committed and fetched while child was still active, before SubagentStop removed it from roster. End timestamp was not separately captured.",
+  "cleanup": {
+    "checkedAt": "2026-09-14T13:20:57Z",
+    "ownedFrontendPidsAbsent": [
+      2268176,
+      2270448
+    ],
+    "ownedDaemonPidAbsent": 2267918,
+    "normalQuit": "Both frontends used /quit after READY/AUTH_TEST_DONE; native UI reported disconnect, not immediate root SessionEnd",
+    "modelWorkFinished": true,
+    "activeHookRemoved": true,
+    "hookErrorFileAbsent": true,
+    "sharedBackendStillAlive": true
+  },
+  "claims": {
+    "nativeCredentialIssuanceAndCommandBinding": "passed for this owned root/child and version pair",
+    "explicitReplyAndFetch": "passed",
+    "automaticDelivery": "not implemented",
+    "nativeAcceptanceReceipt": "not claimed",
+    "freshLifecycleRotation": "not implemented",
+    "timing100": "not run",
+    "publicationConcurrency": "known review finding, fix follows"
+  }
+}

@@ -1,0 +1,11 @@
+# Native authentication checkpoint
+
+Immutable candidate `c42ec10` ran in the explicitly approved private root `/tmp/lam-chat-task6-native.KlGYDF`. This tested registration and authenticated commands, not automatic delivery.
+
+The 0.154.0 frontend attached to the unchanged 0.153.4 execution backend, PID 28534. Ordinary folder trust and individual project-handler review were used. The existing global Herdr hook and native permission defaults were preserved. [The run record](run-c42ec10.json) retains exact commands, native/Chat identities, binary/config hashes, whitelisted binding metadata and cleanup facts. It contains no binding secret, transcript or general environment dump.
+
+Actual native commands produced root/self message `eccb0f23-a80e-4e6a-ba40-6a0406f88399`, child-to-root message `23a36940-a484-4521-bd5c-556e9ee08822`, and root reply `f32f6054-5884-44b9-836d-db1c4d284158`. [The observer history](history-c42ec10.json) proves distinct Agent origins, exact reply linkage, frozen recipients and three completed fetches. The child fetched the reply after its uninterrupted 20-second sleep, then finished normally. Its subsequent absence from the roster is consistent with the tested SubagentStop End handler; an exact End timestamp was not separately captured.
+
+Both owned frontends returned normally via `/quit` after their model work finished. The UI described disconnect, not immediate root SessionEnd. The owned Chat daemon was stopped with SIGTERM and exited zero. All three owned PIDs were absent afterward; shared backend 28534 remained alive. The active project hook file was removed and its exact bytes retained disabled. The two private credential records and their lock files were deleted after sanitized evidence was captured; those test credentials are not retained in Git. The owned database remains offline as test history.
+
+This is positive evidence for the practical private-record binding approach, including root/child commands sharing one backend. It does not pass native delivery, full-inline provenance, idle wake, timing, races, fresh startup-after-End rotation or other-client/platform gates. Review also found that initial record publication needs an atomic concurrency/interruption fix. This native result remains attributed to the unchanged `c42ec10` candidate; that fix follows separately.

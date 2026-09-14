@@ -1,0 +1,128 @@
+[
+  {
+    "event": {
+      "kind": "message",
+      "message": {
+        "created_at": "2026-09-14T13:18:11.709Z",
+        "draft": {
+          "body": "AUTH_ROOT_c42ec10",
+          "key": "a3d7e820-6df1-42b5-943f-876c9efbfea3",
+          "project": "5288990e-79e1-410f-955e-238085132f36",
+          "reply_to": null,
+          "to": [
+            {
+              "Agent": {
+                "incarnation": "db673a6c-436c-4ced-89c7-b938f079d74b",
+                "machine": "9e3fdab9-63a4-478b-b540-ed0130aa0e98"
+              }
+            }
+          ]
+        },
+        "id": "eccb0f23-a80e-4e6a-ba40-6a0406f88399",
+        "sender": {
+          "Agent": {
+            "incarnation": "db673a6c-436c-4ced-89c7-b938f079d74b",
+            "machine": "9e3fdab9-63a4-478b-b540-ed0130aa0e98"
+          }
+        },
+        "sender_seq": 1
+      }
+    },
+    "sequence": 1
+  },
+  {
+    "event": {
+      "kind": "fetched",
+      "message_id": "eccb0f23-a80e-4e6a-ba40-6a0406f88399",
+      "recipient": {
+        "incarnation": "db673a6c-436c-4ced-89c7-b938f079d74b",
+        "machine": "9e3fdab9-63a4-478b-b540-ed0130aa0e98"
+      }
+    },
+    "sequence": 2
+  },
+  {
+    "event": {
+      "kind": "message",
+      "message": {
+        "created_at": "2026-09-14T13:18:35.381Z",
+        "draft": {
+          "body": "AUTH_CHILD_c42ec10",
+          "key": "8a333b3f-ec94-4d6e-a6a9-a5263267fc1c",
+          "project": "5288990e-79e1-410f-955e-238085132f36",
+          "reply_to": null,
+          "to": [
+            {
+              "Agent": {
+                "incarnation": "db673a6c-436c-4ced-89c7-b938f079d74b",
+                "machine": "9e3fdab9-63a4-478b-b540-ed0130aa0e98"
+              }
+            }
+          ]
+        },
+        "id": "23a36940-a484-4521-bd5c-556e9ee08822",
+        "sender": {
+          "Agent": {
+            "incarnation": "67fec42f-4848-4119-9c41-a476cb68d99e",
+            "machine": "9e3fdab9-63a4-478b-b540-ed0130aa0e98"
+          }
+        },
+        "sender_seq": 1
+      }
+    },
+    "sequence": 3
+  },
+  {
+    "event": {
+      "kind": "fetched",
+      "message_id": "23a36940-a484-4521-bd5c-556e9ee08822",
+      "recipient": {
+        "incarnation": "db673a6c-436c-4ced-89c7-b938f079d74b",
+        "machine": "9e3fdab9-63a4-478b-b540-ed0130aa0e98"
+      }
+    },
+    "sequence": 4
+  },
+  {
+    "event": {
+      "kind": "message",
+      "message": {
+        "created_at": "2026-09-14T13:18:45.303Z",
+        "draft": {
+          "body": "AUTH_REPLY_c42ec10",
+          "key": "51b323b1-ede0-4bec-8dc1-3ebbbd463d47",
+          "project": "5288990e-79e1-410f-955e-238085132f36",
+          "reply_to": "23a36940-a484-4521-bd5c-556e9ee08822",
+          "to": [
+            {
+              "Agent": {
+                "incarnation": "67fec42f-4848-4119-9c41-a476cb68d99e",
+                "machine": "9e3fdab9-63a4-478b-b540-ed0130aa0e98"
+              }
+            }
+          ]
+        },
+        "id": "f32f6054-5884-44b9-836d-db1c4d284158",
+        "sender": {
+          "Agent": {
+            "incarnation": "db673a6c-436c-4ced-89c7-b938f079d74b",
+            "machine": "9e3fdab9-63a4-478b-b540-ed0130aa0e98"
+          }
+        },
+        "sender_seq": 2
+      }
+    },
+    "sequence": 5
+  },
+  {
+    "event": {
+      "kind": "fetched",
+      "message_id": "f32f6054-5884-44b9-836d-db1c4d284158",
+      "recipient": {
+        "incarnation": "67fec42f-4848-4119-9c41-a476cb68d99e",
+        "machine": "9e3fdab9-63a4-478b-b540-ed0130aa0e98"
+      }
+    },
+    "sequence": 6
+  }
+]
