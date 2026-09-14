@@ -61,11 +61,6 @@ pub enum Operation {
     Retry {
         id: String,
     },
-    // Created only after a successful response write, never accepted from JSON.
-    #[serde(skip)]
-    FetchComplete {
-        ids: Vec<String>,
-    },
     SetState {
         eligible: bool,
     },
@@ -126,12 +121,6 @@ impl Operation {
             }
             Self::Delivery { epoch, .. } => {
                 ensure!(*epoch <= i64::MAX as u64, "invalid observation epoch");
-            }
-            Self::FetchComplete { ids } => {
-                ensure!(ids.len() <= 100, "invalid fetched page");
-                for id in ids {
-                    validate_uuid(id)?;
-                }
             }
             Self::Sessions { project } => validate_project(project)?,
             Self::Inbox { cursor, limit } => validate_page(cursor, *limit)?,

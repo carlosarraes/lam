@@ -3,6 +3,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Sha256;
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -20,7 +21,7 @@ use super::config::{Config, Paths};
 use super::protocol::{self, Operation};
 use super::registry::{reply_targets, NativeEvidence, Registry};
 use super::store::Store;
-use super::types::{Actor, Draft, Limits, Message, Registration, SessionRef, Target};
+use super::types::{Actor, ClientEvent, Draft, Limits, Message, Registration, SessionRef, Target};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CONNECTIONS: usize = 32;
@@ -65,13 +66,151 @@ struct Work {
 struct Changes {
     generation: Mutex<u64>,
     changed: Condvar,
+    fetches: Mutex<BTreeMap<String, FetchCompletion>>,
 }
+
+#[derive(Clone)]
+struct FetchCompletion {
+    recipient: SessionRef,
+    ids: Vec<String>,
+    ready: bool,
+    failures: u8,
+    next_retry: Instant,
+}
+
+/// Reserves bounded completion capacity before socket I/O. Dropping an unused
+/// reservation, including during unwinding, cancels it without claiming a fetch.
+struct FetchReservation<'a> {
+    changes: &'a Changes,
+    id: String,
+    completed: bool,
+}
+impl FetchReservation<'_> {
+    fn complete(mut self) {
+        self.changes
+            .fetches
+            .lock()
+            .unwrap()
+            .get_mut(&self.id)
+            .unwrap()
+            .ready = true;
+        self.completed = true;
+    }
+}
+impl Drop for FetchReservation<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.changes.fetches.lock().unwrap().remove(&self.id);
+        }
+    }
+}
+
 impl Changes {
     fn notify(&self) {
         let mut generation = self.generation.lock().unwrap();
         *generation = generation.wrapping_add(1);
         self.changed.notify_all();
     }
+
+    fn reserve_fetch(
+        &self,
+        recipient: &SessionRef,
+        ids: Vec<String>,
+    ) -> Result<FetchReservation<'_>> {
+        let mut fetches = self.fetches.lock().unwrap();
+        ensure!(
+            fetches.len() < MAX_CONNECTIONS,
+            "Chat fetch completion backlog is full; retry the fetch later"
+        );
+        let id = uuid::Uuid::new_v4().to_string();
+        fetches.insert(
+            id.clone(),
+            FetchCompletion {
+                recipient: recipient.clone(),
+                ids,
+                ready: false,
+                failures: 0,
+                next_retry: Instant::now(),
+            },
+        );
+        Ok(FetchReservation {
+            changes: self,
+            id,
+            completed: false,
+        })
+    }
+
+    fn fetch_pending(&self, recipient: &SessionRef) -> bool {
+        self.fetches
+            .lock()
+            .unwrap()
+            .values()
+            .any(|fetch| &fetch.recipient == recipient)
+    }
+
+    fn fetch_status(&self) -> Value {
+        let fetches = self.fetches.lock().unwrap();
+        let failed = fetches.values().filter(|fetch| fetch.failures > 0).count();
+        json!({"unconfirmed": fetches.len(), "failed": failed,
+            "diagnostic": if failed > 0 { Some("Fetch persistence failed; automatic delivery is paused for affected recipients while completion retries") } else { None }})
+    }
+}
+
+/// One due completion per owner turn keeps unrelated recipients responsive.
+/// SQLite work happens after releasing the backlog lock, with bounded backoff on
+/// failure. This is persistence retry, never a native delivery retry.
+fn repair_fetch(service: &mut Service, changes: &Changes, now: Instant) -> bool {
+    let next = changes
+        .fetches
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, fetch)| fetch.ready && fetch.next_retry <= now)
+        .min_by_key(|(_, fetch)| fetch.next_retry)
+        .map(|(id, fetch)| (id.clone(), fetch.clone()));
+    let Some((id, fetch)) = next else {
+        return false;
+    };
+    match service.store.record_fetch(&fetch.recipient, &fetch.ids) {
+        Ok(()) => {
+            changes.fetches.lock().unwrap().remove(&id);
+            changes.notify();
+        }
+        Err(_) => {
+            let mut fetches = changes.fetches.lock().unwrap();
+            let fetch = fetches.get_mut(&id).unwrap();
+            let first_failure = fetch.failures == 0;
+            fetch.failures = fetch.failures.saturating_add(1);
+            fetch.next_retry =
+                now.max(Instant::now()) + Duration::from_millis(100_u64 << fetch.failures.min(8));
+            drop(fetches);
+            if first_failure {
+                eprintln!("Chat fetch completion persistence failed; retaining unconfirmed transfer and pausing automatic delivery for its recipient");
+            }
+        }
+    }
+    true
+}
+
+fn run_owner(mut service: Service, receiver: mpsc::Receiver<Work>, changes: &Changes) -> Service {
+    loop {
+        repair_fetch(&mut service, changes, Instant::now());
+        match receiver.recv_timeout(Duration::from_millis(50)) {
+            Ok(work) => apply_work(&mut service, work, changes),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    // Connection workers have exited and their reservation guards have settled.
+    for _ in 0..MAX_CONNECTIONS {
+        if !repair_fetch(&mut service, changes, Instant::now()) {
+            break;
+        }
+    }
+    if !changes.fetches.lock().unwrap().is_empty() {
+        eprintln!("Chat stopped with unconfirmed fetch completions; fetch transfer persistence is uncertain");
+    }
+    service
 }
 
 pub fn run(paths: &Paths) -> Result<()> {
@@ -93,18 +232,9 @@ pub fn run_with_validator(paths: &Paths, validator: Arc<dyn BindingValidator>) -
     let stop = Arc::new(AtomicBool::new(false));
     let changes = Arc::new(Changes::default());
     let (sender, receiver) = mpsc::sync_channel::<Work>(WRITER_QUEUE);
-    let writer_stop = stop.clone();
     let writer_changes = changes.clone();
     let writer = thread::spawn(move || {
-        let mut service = service;
-        while !writer_stop.load(Ordering::SeqCst) {
-            let work = match receiver.recv_timeout(Duration::from_millis(50)) {
-                Ok(work) => work,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(_) => break,
-            };
-            apply_work(&mut service, work, &writer_changes);
-        }
+        run_owner(service, receiver, &writer_changes);
     });
     let subscriptions = Arc::new(Mutex::new(0_usize));
     let mut clients: Vec<thread::JoinHandle<()>> = Vec::new();
@@ -184,9 +314,21 @@ fn apply_work(service: &mut Service, work: Work, changes: &Changes) {
             | Operation::Delivery { .. }
             | Operation::Finish { .. }
             | Operation::Retry { .. }
-            | Operation::FetchComplete { .. }
     );
-    let result = service.handle(&work.context, work.operation);
+    let status = matches!(work.operation, Operation::Status {});
+    let mut result = match (&work.context, &work.operation) {
+        (VerifiedContext::Integration(registration), Operation::Delivery { event, epoch })
+            if changes.fetch_pending(&registration.session) =>
+        {
+            service.delivery(registration, *event, *epoch, true)
+        }
+        _ => service.handle(&work.context, work.operation),
+    };
+    if status {
+        if let Ok(data) = &mut result {
+            data["fetch_completions"] = changes.fetch_status();
+        }
+    }
     if mutation && result.is_ok() {
         changes.notify();
     }
@@ -309,11 +451,20 @@ fn serve_connection(
                 }
             }
         }
+        let reservation = if let VerifiedContext::Participant(registration) = &context {
+            if ids.is_empty() {
+                None
+            } else {
+                Some(changes.reserve_fetch(&registration.session, ids)?)
+            }
+        } else {
+            None
+        };
         respond(stream, page)?;
         // Every returned message contains its complete body. Only a completed
         // frame records transfer; failed/partial writes leave fetch state alone.
-        if !ids.is_empty() {
-            let _ = dispatch(&sender, &context, Operation::FetchComplete { ids });
+        if let Some(reservation) = reservation {
+            reservation.complete();
         }
         Ok(())
     }
@@ -617,18 +768,7 @@ impl Service {
                     Ok(json!({"eligible": eligible}))
                 }
                 Operation::Delivery { event, epoch } => {
-                    self.verify_registration(registration)?;
-                    let eligible = Registry::new(&mut self.store)?
-                        .state(&registration.session)
-                        .is_some_and(|s| s.registration.eligible && !s.ended);
-                    ensure!(eligible, "Chat recipient is ineligible");
-                    Ok(serde_json::to_value(super::delivery::request(
-                        &mut self.store,
-                        &registration.session,
-                        event,
-                        epoch,
-                        self.limits,
-                    )?)?)
+                    self.delivery(registration, event, epoch, false)
                 }
                 Operation::Finish { attempt, outcome } => {
                     self.verify_registration(registration)?;
@@ -708,15 +848,34 @@ impl Service {
                     json!({"retry": id, "warning": "Duplicate delivery is possible; retry remains bound to the original recipient incarnation"}),
                 )
             }
-            Operation::FetchComplete { ids } => {
-                let VerifiedContext::Participant(registration) = context else {
-                    bail!("Fetch completion requires participant authority");
-                };
-                self.store.record_fetch(&registration.session, &ids)?;
-                Ok(json!({"fetched": ids}))
-            }
             _ => bail!("operation requires integration authority"),
         }
+    }
+
+    fn delivery(
+        &mut self,
+        registration: &Registration,
+        event: ClientEvent,
+        epoch: u64,
+        fetch_pending: bool,
+    ) -> Result<Value> {
+        protocol::Operation::Delivery { event, epoch }.validate()?;
+        self.verify_registration(registration)?;
+        let eligible = Registry::new(&mut self.store)?
+            .state(&registration.session)
+            .is_some_and(|s| s.registration.eligible && !s.ended);
+        ensure!(eligible, "Chat recipient is ineligible");
+        if fetch_pending {
+            self.store.observe(&registration.session, event, epoch)?;
+            return Ok(Value::Null);
+        }
+        Ok(serde_json::to_value(super::delivery::request(
+            &mut self.store,
+            &registration.session,
+            event,
+            epoch,
+            self.limits,
+        )?)?)
     }
 
     fn verify_registration(&mut self, registration: &Registration) -> Result<()> {
@@ -1023,6 +1182,303 @@ mod tests {
     }
 
     #[test]
+    fn completed_fetch_store_failure_is_visible_and_suppresses_delivery_until_recovered() {
+        struct TestBinding(Registration);
+        impl BindingValidator for TestBinding {
+            fn validate(&self, _: PeerIdentity, _: &str) -> Result<VerifiedContext> {
+                Ok(VerifiedContext::Participant(self.0.clone()))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.sqlite3");
+        let mut service = Service::open(&path, MACHINE).unwrap();
+        let recipient = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        let other = registration("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+        service
+            .handle(
+                &VerifiedContext::Integration(recipient.clone()),
+                Operation::Register {},
+            )
+            .unwrap();
+        service
+            .handle(
+                &VerifiedContext::Integration(other.clone()),
+                Operation::Register {},
+            )
+            .unwrap();
+        service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Send {
+                    draft: Draft {
+                        key: "one".into(),
+                        project: PROJECT.into(),
+                        to: vec![Target::Agent(recipient.session.clone())],
+                        body: "full body transferred".into(),
+                        reply_to: None,
+                    },
+                },
+            )
+            .unwrap();
+        service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Send {
+                    draft: Draft {
+                        key: "other".into(),
+                        project: PROJECT.into(),
+                        to: vec![Target::Agent(other.session.clone())],
+                        body: "unaffected".into(),
+                        reply_to: None,
+                    },
+                },
+            )
+            .unwrap();
+        let injector = rusqlite::Connection::open(&path).unwrap();
+        injector.execute_batch("CREATE TRIGGER fail_fetch BEFORE INSERT ON events WHEN NEW.kind = 'fetched' BEGIN SELECT RAISE(ABORT, 'private injected detail'); END;").unwrap();
+        let (sender, receiver) = mpsc::sync_channel(WRITER_QUEUE);
+        let changes = Arc::new(Changes::default());
+        let owner_changes = changes.clone();
+        let owner = thread::spawn(move || run_owner(service, receiver, &owner_changes));
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        protocol::write_frame(
+            &mut client,
+            &json!({"version": 1, "binding": "private-fixture"}),
+        )
+        .unwrap();
+        protocol::write_frame(
+            &mut client,
+            &json!({"version": 1, "operation": {"op": "inbox", "limit": 1}}),
+        )
+        .unwrap();
+        let worker_sender = sender.clone();
+        let worker_changes = changes.clone();
+        let validator = TestBinding(recipient.clone());
+        let worker = thread::spawn(move || {
+            serve_connection(
+                &mut server,
+                false,
+                &validator,
+                worker_sender,
+                &AtomicBool::new(false),
+                &worker_changes,
+                &Mutex::new(0),
+            )
+        });
+        let response = protocol::read_frame(&mut client).unwrap();
+        assert_eq!(response["ok"], true);
+        assert_eq!(
+            response["data"]["events"][0]["event"]["message"]["draft"]["body"],
+            "full body transferred"
+        );
+        worker.join().unwrap().unwrap();
+        assert!(
+            protocol::read_frame(&mut client).is_err(),
+            "response must remain one successful frame"
+        );
+        drop(sender);
+        let mut service = owner.join().unwrap();
+        let status = owner_request(
+            &mut service,
+            &changes,
+            VerifiedContext::Observer,
+            Operation::Status {},
+        )
+        .unwrap();
+        assert_eq!(status["fetch_completions"]["failed"], 1);
+        assert!(!status.to_string().contains("private injected detail"));
+        assert!(!status.to_string().contains("full body transferred"));
+        let before = Instant::now();
+        let blocked = owner_request(
+            &mut service,
+            &changes,
+            VerifiedContext::Integration(recipient.clone()),
+            Operation::Delivery {
+                event: ClientEvent::Hook,
+                epoch: 1,
+            },
+        )
+        .unwrap();
+        assert!(
+            blocked.is_null(),
+            "unconfirmed fetch must suppress automatic handoff"
+        );
+        assert!(before.elapsed() < Duration::from_secs(1));
+        assert!(owner_request(
+            &mut service,
+            &changes,
+            VerifiedContext::Integration(other),
+            Operation::Delivery {
+                event: ClientEvent::Idle,
+                epoch: 1
+            }
+        )
+        .unwrap()
+        .is_object());
+        let events = service
+            .store
+            .feed(PROJECT, Some(&recipient.session), 0, 100, false)
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "failed fetch commit must leave only its original message event"
+        );
+        let retry_at = changes
+            .fetches
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .next_retry;
+        assert!(
+            !repair_fetch(&mut service, &changes, retry_at - Duration::from_nanos(1)),
+            "failed completion must honor backoff"
+        );
+        injector.execute_batch("DROP TRIGGER fail_fetch;").unwrap();
+        assert!(repair_fetch(&mut service, &changes, retry_at));
+        assert!(!repair_fetch(&mut service, &changes, retry_at));
+        assert_eq!(changes.fetch_status()["unconfirmed"], 0);
+        let events = service
+            .store
+            .feed(PROJECT, Some(&recipient.session), 0, 100, false)
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[1].1,
+            super::super::types::FeedEvent::Fetched { .. }
+        ));
+        assert!(service
+            .store
+            .claim(&recipient.session, super::super::config::DEFAULT_LIMITS)
+            .unwrap()
+            .is_none());
+    }
+
+    fn owner_request(
+        service: &mut Service,
+        changes: &Changes,
+        context: VerifiedContext,
+        operation: Operation,
+    ) -> Result<Value> {
+        let (response, result) = mpsc::sync_channel(1);
+        apply_work(
+            service,
+            Work {
+                context,
+                operation,
+                response,
+                deadline: Instant::now() + Duration::from_secs(1),
+            },
+            changes,
+        );
+        result.recv().unwrap()
+    }
+
+    #[test]
+    fn fetch_reservations_bound_capacity_cancel_on_unwind_and_bypass_full_work_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = Service::open(&dir.path().join("chat.sqlite3"), MACHINE).unwrap();
+        let recipient = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        service
+            .handle(
+                &VerifiedContext::Integration(recipient.clone()),
+                Operation::Register {},
+            )
+            .unwrap();
+        let sent = service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Send {
+                    draft: Draft {
+                        key: "one".into(),
+                        project: PROJECT.into(),
+                        to: vec![Target::Agent(recipient.session.clone())],
+                        body: "hello".into(),
+                        reply_to: None,
+                    },
+                },
+            )
+            .unwrap();
+        let ids = vec![sent["id"].as_str().unwrap().to_owned()];
+        let changes = Arc::new(Changes::default());
+        let slots: Vec<_> = (0..MAX_CONNECTIONS)
+            .map(|_| {
+                changes
+                    .reserve_fetch(&recipient.session, ids.clone())
+                    .unwrap()
+            })
+            .collect();
+        assert!(changes
+            .reserve_fetch(&recipient.session, ids.clone())
+            .is_err());
+        assert!(
+            !repair_fetch(&mut service, &changes, Instant::now()),
+            "reserved transfer is not a completed fetch"
+        );
+        assert!(owner_request(
+            &mut service,
+            &changes,
+            VerifiedContext::Integration(recipient.clone()),
+            Operation::Delivery {
+                event: ClientEvent::Hook,
+                epoch: 1
+            }
+        )
+        .unwrap()
+        .is_null());
+        drop(slots);
+        assert!(!changes.fetch_pending(&recipient.session));
+        let worker_changes = changes.clone();
+        let worker_session = recipient.session.clone();
+        let worker_ids = ids.clone();
+        assert!(thread::spawn(move || {
+            let _unused = worker_changes
+                .reserve_fetch(&worker_session, worker_ids)
+                .unwrap();
+            panic!("fixture writer crashed before transfer");
+        })
+        .join()
+        .is_err());
+        assert_eq!(changes.fetch_status()["unconfirmed"], 0);
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let (response, _reply) = mpsc::sync_channel(1);
+        sender
+            .try_send(Work {
+                context: VerifiedContext::Observer,
+                operation: Operation::Status {},
+                response,
+                deadline: Instant::now() + Duration::from_secs(1),
+            })
+            .unwrap();
+        assert!(dispatch(&sender, &VerifiedContext::Observer, Operation::Status {}).is_err());
+        changes
+            .reserve_fetch(&recipient.session, ids.clone())
+            .unwrap()
+            .complete();
+        changes
+            .reserve_fetch(&recipient.session, ids)
+            .unwrap()
+            .complete();
+        assert!(repair_fetch(&mut service, &changes, Instant::now()));
+        assert!(changes.fetch_pending(&recipient.session));
+        assert!(repair_fetch(&mut service, &changes, Instant::now()));
+        assert!(!changes.fetch_pending(&recipient.session));
+        let events = service.store.feed(PROJECT, None, 0, 100, false).unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "duplicate completion produces one Fetched event"
+        );
+        assert!(service
+            .store
+            .claim(&recipient.session, super::super::config::DEFAULT_LIMITS)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn inbox_socket_completion_records_each_full_page_but_failed_write_does_not() {
         use crate::chat::types::FeedEvent;
         struct TestBinding(Registration);
@@ -1065,12 +1521,7 @@ mod tests {
             let (sender, receiver) = mpsc::sync_channel(WRITER_QUEUE);
             let changes = Arc::new(Changes::default());
             let owner_changes = changes.clone();
-            let owner = thread::spawn(move || {
-                while let Ok(work) = receiver.recv() {
-                    apply_work(&mut service, work, &owner_changes);
-                }
-                service
-            });
+            let owner = thread::spawn(move || run_owner(service, receiver, &owner_changes));
             let mut cursor = None;
             for _ in 0..if fail_write { 1 } else { 2 } {
                 let (mut client, mut server) = UnixStream::pair().unwrap();

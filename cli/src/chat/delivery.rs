@@ -226,6 +226,68 @@ mod tests {
     }
 
     #[test]
+    fn explicit_retry_after_full_fetch_selects_unknown_and_refused_handoffs() {
+        use crate::chat::types::FeedEvent;
+        for outcome in [
+            Handoff::Unknown {
+                reason: "lost native response".into(),
+            },
+            Handoff::Refused {
+                reason: "native refused".into(),
+            },
+        ] {
+            let (_dir, mut store, recipient) = fixture();
+            let id = send(&mut store, &recipient, "one", "hello");
+            let original = store.claim(&recipient, DEFAULT_LIMITS).unwrap().unwrap();
+            store.finish(&original.id, outcome).unwrap();
+            store
+                .record_fetch(&recipient, std::slice::from_ref(&id))
+                .unwrap();
+            let other = SessionRef {
+                incarnation: "other".into(),
+                ..recipient.clone()
+            };
+            assert!(store.retry_delivery(&other, &id).is_err());
+            assert!(store.claim(&recipient, DEFAULT_LIMITS).unwrap().is_none());
+            store.retry_delivery(&recipient, &id).unwrap();
+            let retry = store
+                .claim(&recipient, DEFAULT_LIMITS)
+                .unwrap()
+                .expect("explicit retry must override automatic fetch suppression");
+            assert_ne!(retry.id, original.id);
+            assert_eq!(retry.recipient, recipient);
+            assert_eq!(retry.batch.full_ids.as_slice(), std::slice::from_ref(&id));
+            store
+                .finish(
+                    &retry.id,
+                    Handoff::NotSubmitted {
+                        reason: "busy before native I/O".into(),
+                    },
+                )
+                .unwrap();
+            let later = store.claim(&recipient, DEFAULT_LIMITS).unwrap().unwrap();
+            store
+                .finish(
+                    &later.id,
+                    Handoff::Accepted {
+                        receipt: "native accepted explicit retry".into(),
+                    },
+                )
+                .unwrap();
+            assert!(store.claim(&recipient, DEFAULT_LIMITS).unwrap().is_none());
+            store.record_fetch(&recipient, &[id]).unwrap();
+            let events = store.feed("lam", None, 0, 100, false).unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|(_, e)| matches!(e, FeedEvent::Fetched { .. }))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn accepted_preview_does_not_starve_later_messages_or_repeat_reminders() {
         let (_dir, mut store, recipient) = fixture();
         let first = send(&mut store, &recipient, "one", &"long".repeat(4000));

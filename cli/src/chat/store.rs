@@ -11,7 +11,7 @@ use super::types::{
     SessionRef, SessionState, Target,
 };
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
 pub struct Store {
@@ -265,7 +265,8 @@ impl Store {
                     SELECT i.message_id, i.inbox_seq FROM inbox_entries i
                     JOIN delivery_receipts d ON d.message_id = i.message_id AND d.target_key = i.recipient_key
                     JOIN exposures x ON x.message_id = i.message_id AND x.target_key = i.recipient_key
-                    WHERE i.recipient_key = ?1 AND d.state = 'queued' AND x.fetched_at IS NULL
+                    WHERE i.recipient_key = ?1 AND d.state = 'queued'
+                      AND (x.fetched_at IS NULL OR d.explicit_retry = 1)
                  )
                  SELECT m.payload_json, (SELECT COUNT(*) FROM pending)
                  FROM pending i JOIN messages m ON m.id = i.message_id
@@ -361,7 +362,7 @@ impl Store {
         transaction.execute("UPDATE delivery_attempts SET state = ?2, outcome_json = ?3, completed_at = ?4 WHERE id = ?1", params![attempt_id, if state == "queued" { "not_submitted" } else { state }, encoded, now])?;
         let ids = transaction.prepare("SELECT message_id FROM delivery_attempt_messages WHERE attempt_id = ?1 ORDER BY ordinal")?.query_map([attempt_id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         for id in &ids {
-            transaction.execute("UPDATE delivery_receipts SET state = ?3, evidence_json = ?4, updated_at = ?5 WHERE message_id = ?1 AND target_key = ?2", params![id, target, state, encoded, now])?;
+            transaction.execute("UPDATE delivery_receipts SET state = ?3, evidence_json = ?4, updated_at = ?5, explicit_retry = CASE WHEN ?3 = 'queued' THEN explicit_retry ELSE 0 END WHERE message_id = ?1 AND target_key = ?2", params![id, target, state, encoded, now])?;
             append_event(
                 &transaction,
                 id,
@@ -436,7 +437,7 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure!(transaction.execute("UPDATE delivery_receipts SET state = 'queued', updated_at = ?3 WHERE message_id = ?1 AND target_key = ?2 AND state IN ('unknown', 'refused')", params![id, target, Utc::now().to_rfc3339()])? == 1, "only the original recipient may explicitly retry an unknown or refused handoff; duplicate delivery is possible");
+        ensure!(transaction.execute("UPDATE delivery_receipts SET state = 'queued', explicit_retry = 1, updated_at = ?3 WHERE message_id = ?1 AND target_key = ?2 AND state IN ('unknown', 'refused')", params![id, target, Utc::now().to_rfc3339()])? == 1, "only the original recipient may explicitly retry an unknown or refused handoff; duplicate delivery is possible");
         append_event(
             &transaction,
             id,
@@ -631,6 +632,9 @@ fn migrate(connection: &mut Connection, version: u32) -> Result<()> {
     }
     if version < 3 {
         transaction.execute_batch(include_str!("migration-003.sql"))?;
+    }
+    if version < 4 {
+        transaction.execute_batch(include_str!("migration-004.sql"))?;
     }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
