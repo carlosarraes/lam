@@ -62,3 +62,60 @@ pub struct Limits {
     pub inline_bytes: usize,
     pub batch_bytes: usize,
 }
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RenderedBatch {
+    pub text: String,
+    pub full_ids: Vec<String>,
+    pub preview_ids: Vec<String>,
+    pub overflow_count: usize,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Attempt {
+    pub id: String,
+    pub recipient: SessionRef,
+    pub batch: RenderedBatch,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum Handoff {
+    NotSubmitted { reason: String },
+    Accepted { receipt: String },
+    Refused { reason: String },
+    Unknown { reason: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientEvent {
+    Idle,
+    Busy,
+    Hook,
+    Disconnected,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FeedEvent {
+    Message {
+        message: Message,
+    },
+    Receipt {
+        message_id: String,
+        recipient: SessionRef,
+        attempt_id: Option<String>,
+        state: String,
+        outcome: Option<Handoff>,
+    },
+    Exposure {
+        message_id: String,
+        recipient: SessionRef,
+        state: String,
+    },
+    Fetched {
+        message_id: String,
+        recipient: SessionRef,
+    },
+}

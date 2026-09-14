@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 
-use super::types::{Draft, SessionRef, Target};
+use super::types::{ClientEvent, Draft, Handoff, SessionRef, Target};
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -50,9 +50,21 @@ pub enum Operation {
         limit: u16,
     },
     Status {},
-    // Task 5 supplies the delivery state machine; these require integration authority.
     Delivery {
+        event: ClientEvent,
+        epoch: u64,
+    },
+    Finish {
         attempt: String,
+        outcome: Handoff,
+    },
+    Retry {
+        id: String,
+    },
+    // Created only after a successful response write, never accepted from JSON.
+    #[serde(skip)]
+    FetchComplete {
+        ids: Vec<String>,
     },
     SetState {
         eligible: bool,
@@ -98,7 +110,29 @@ impl Operation {
                 );
                 ensure!(body.len() <= 65_536, "Chat body exceeds 64 KiB");
             }
-            Self::Show { id } | Self::Delivery { attempt: id } => validate_uuid(id)?,
+            Self::Show { id } | Self::Retry { id } => validate_uuid(id)?,
+            Self::Finish { attempt, outcome } => {
+                validate_uuid(attempt)?;
+                let evidence = match outcome {
+                    Handoff::Accepted { receipt } => receipt,
+                    Handoff::Unknown { reason }
+                    | Handoff::Refused { reason }
+                    | Handoff::NotSubmitted { reason } => reason,
+                };
+                ensure!(
+                    !evidence.is_empty() && evidence.len() <= 4096,
+                    "invalid native handoff evidence"
+                );
+            }
+            Self::Delivery { epoch, .. } => {
+                ensure!(*epoch <= i64::MAX as u64, "invalid observation epoch");
+            }
+            Self::FetchComplete { ids } => {
+                ensure!(ids.len() <= 100, "invalid fetched page");
+                for id in ids {
+                    validate_uuid(id)?;
+                }
+            }
             Self::Sessions { project } => validate_project(project)?,
             Self::Inbox { cursor, limit } => validate_page(cursor, *limit)?,
             Self::History {
@@ -192,6 +226,15 @@ pub fn write_frame<W: Write>(writer: &mut W, value: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn internal_fetch_completion_cannot_be_forged_on_wire() {
+        assert!(decode_request(
+            serde_json::json!({"version": 1, "operation": {"op": "fetch_complete", "ids": []}})
+        )
+        .is_err());
+        assert!(decode_request(serde_json::json!({"version": 1, "operation": {"op": "finish", "attempt": "11111111-1111-4111-8111-111111111111", "outcome": {"Accepted": {"receipt": ""}}}})).is_err());
+    }
 
     #[test]
     fn typed_requests_reject_versions_authority_fields_and_invalid_ids() {

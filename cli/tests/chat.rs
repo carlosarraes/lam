@@ -10,6 +10,27 @@ struct Fixture {
     dir: tempfile::TempDir,
     child: Option<Child>,
 }
+
+#[test]
+fn inbox_retry_is_discoverable_and_fails_closed_without_native_binding() {
+    let fixture = Fixture::new();
+    let help = fixture
+        .command()
+        .args(["inbox", "retry", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("duplicate delivery"));
+    let retry = fixture
+        .command()
+        .args(["inbox", "retry", "11111111-1111-4111-8111-111111111111"])
+        .output()
+        .unwrap();
+    assert!(!retry.status.success());
+    assert!(String::from_utf8_lossy(&retry.stderr).contains("validated native participant binding"));
+    assert!(!fixture.dir.path().join("config/chat.toml").exists());
+    assert!(!fixture.dir.path().join("data/chat.sqlite3").exists());
+}
 impl Fixture {
     fn new() -> Self {
         Self {
@@ -177,7 +198,10 @@ fn chat_daemon_is_private_single_instance_and_survives_restart() {
         &observer,
         json!({"op": "history", "project": project, "limit": 10}),
     );
-    assert_eq!(history["data"]["messages"][0]["id"], sent["data"]["id"]);
+    assert_eq!(
+        history["data"]["events"][0]["event"]["message"]["id"],
+        sent["data"]["id"]
+    );
     f.terminate();
 }
 
@@ -192,14 +216,14 @@ fn chat_subscription_wakes_on_commit_and_resumes_without_blocking_status() {
         json!({"version": 1, "operation": {"op": "subscribe", "project": project, "limit": 10}}),
     );
     let first = read(&mut subscription);
-    assert_eq!(first["data"]["messages"], json!([]));
+    assert_eq!(first["data"]["events"], json!([]));
     let machine = f.status()["machine"].as_str().unwrap().to_string();
     let sent = request(
         &observer,
         json!({"op": "send", "draft": {"key": "notify", "project": project, "to": [{"Human": {"machine": machine}}], "body": "wake now", "reply_to": null}}),
     );
     assert_eq!(
-        read(&mut subscription)["data"]["messages"][0]["id"],
+        read(&mut subscription)["data"]["events"][0]["event"]["message"]["id"],
         sent["data"]["id"]
     );
     assert_eq!(f.status()["running"], true);
@@ -210,7 +234,7 @@ fn chat_subscription_wakes_on_commit_and_resumes_without_blocking_status() {
         json!({"version": 1, "operation": {"op": "subscribe", "project": project, "limit": 10, "cursor": first["data"]["cursor"]}}),
     );
     assert_eq!(
-        read(&mut resumed)["data"]["messages"][0]["id"],
+        read(&mut resumed)["data"]["events"][0]["event"]["message"]["id"],
         sent["data"]["id"]
     );
     f.terminate();

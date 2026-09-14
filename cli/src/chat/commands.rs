@@ -25,6 +25,14 @@ pub enum ChatCommand {
 pub struct InboxArgs {
     #[arg(long)]
     pub json: bool,
+    #[command(subcommand)]
+    pub command: Option<InboxCommand>,
+}
+
+#[derive(Subcommand)]
+pub enum InboxCommand {
+    /// Retry an unknown or refused handoff to this incarnation. May duplicate delivery.
+    Retry { message_id: String },
 }
 
 pub fn run_chat(args: ChatArgs) -> Result<i32> {

@@ -6,9 +6,12 @@ use anyhow::{bail, ensure, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
-use super::types::{Actor, Draft, Message, Registration, SessionRef, SessionState, Target};
+use super::types::{
+    Actor, Attempt, ClientEvent, Draft, FeedEvent, Handoff, Limits, Message, Registration,
+    SessionRef, SessionState, Target,
+};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
 pub struct Store {
@@ -247,6 +250,228 @@ impl Store {
         Ok(message)
     }
 
+    pub fn claim(&mut self, recipient: &SessionRef, limits: Limits) -> Result<Option<Attempt>> {
+        let target = serde_json::to_string(&Target::Agent(recipient.clone()))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM delivery_attempts WHERE recipient_key = ?1 AND state = 'submitting')", [&target], |r| r.get(0))?;
+        if active {
+            return Ok(None);
+        }
+        let (messages, pending_count) = {
+            let mut statement = transaction.prepare(
+                "WITH pending AS (
+                    SELECT i.message_id, i.inbox_seq FROM inbox_entries i
+                    JOIN delivery_receipts d ON d.message_id = i.message_id AND d.target_key = i.recipient_key
+                    JOIN exposures x ON x.message_id = i.message_id AND x.target_key = i.recipient_key
+                    WHERE i.recipient_key = ?1 AND d.state = 'queued' AND x.fetched_at IS NULL
+                 )
+                 SELECT m.payload_json, (SELECT COUNT(*) FROM pending)
+                 FROM pending i JOIN messages m ON m.id = i.message_id
+                 ORDER BY i.inbox_seq LIMIT 100",
+            )?;
+            let mut rows = statement.query([&target])?;
+            let mut messages = Vec::new();
+            let mut count = 0;
+            while let Some(row) = rows.next()? {
+                let payload: String = row.get(0)?;
+                count = usize::try_from(row.get::<_, i64>(1)?)?;
+                messages.push(serde_json::from_str::<Message>(&payload)?);
+            }
+            (messages, count)
+        };
+        if messages.is_empty() {
+            return Ok(None);
+        }
+        let batch = if pending_count == messages.len() {
+            super::render::render_batch(&messages, limits)?
+        } else {
+            super::render::render_pending(&messages, limits, pending_count)?
+        };
+        let attempt = Attempt {
+            id: uuid::Uuid::new_v4().to_string(),
+            recipient: recipient.clone(),
+            batch,
+        };
+        let now = Utc::now().to_rfc3339();
+        transaction.execute("INSERT INTO delivery_attempts(id, recipient_key, state, payload_json, created_at) VALUES (?1, ?2, 'submitting', ?3, ?4)", params![attempt.id, target, serde_json::to_string(&attempt)?, now])?;
+        for (ordinal, id) in messages
+            .iter()
+            .map(|m| &m.id)
+            .filter(|id| {
+                attempt.batch.full_ids.contains(id) || attempt.batch.preview_ids.contains(id)
+            })
+            .enumerate()
+        {
+            transaction.execute("INSERT INTO delivery_attempt_messages(attempt_id, ordinal, message_id) VALUES (?1, ?2, ?3)", params![attempt.id, ordinal as i64, id])?;
+            transaction.execute("UPDATE delivery_receipts SET state = 'submitting', evidence_json = NULL, updated_at = ?3 WHERE message_id = ?1 AND target_key = ?2", params![id, target, now])?;
+            append_event(
+                &transaction,
+                id,
+                &FeedEvent::Receipt {
+                    message_id: id.clone(),
+                    recipient: recipient.clone(),
+                    attempt_id: Some(attempt.id.clone()),
+                    state: "submitting".into(),
+                    outcome: None,
+                },
+            )?;
+        }
+        transaction.commit()?;
+        Ok(Some(attempt))
+    }
+
+    pub fn finish(&mut self, attempt_id: &str, outcome: Handoff) -> Result<()> {
+        let evidence = match &outcome {
+            Handoff::Accepted { receipt } => receipt,
+            Handoff::NotSubmitted { reason }
+            | Handoff::Refused { reason }
+            | Handoff::Unknown { reason } => reason,
+        };
+        ensure!(
+            !evidence.is_empty() && evidence.len() <= 4096,
+            "handoff evidence must be 1..4096 bytes"
+        );
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (state, payload, previous): (String, String, Option<String>) = transaction
+            .query_row(
+                "SELECT state, payload_json, outcome_json FROM delivery_attempts WHERE id = ?1",
+                [attempt_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+            .context("Chat attempt is unavailable")?;
+        let encoded = serde_json::to_string(&outcome)?;
+        if previous.as_deref() == Some(&encoded) {
+            return Ok(());
+        }
+        ensure!(state == "submitting", "Chat handoff outcome is already final; reconciliation requires separate validated evidence");
+        let attempt: Attempt = serde_json::from_str(&payload)?;
+        let target = serde_json::to_string(&Target::Agent(attempt.recipient.clone()))?;
+        let state = match &outcome {
+            Handoff::NotSubmitted { .. } => "queued",
+            Handoff::Accepted { .. } => "accepted",
+            Handoff::Refused { .. } => "refused",
+            Handoff::Unknown { .. } => "unknown",
+        };
+        let now = Utc::now().to_rfc3339();
+        transaction.execute("UPDATE delivery_attempts SET state = ?2, outcome_json = ?3, completed_at = ?4 WHERE id = ?1", params![attempt_id, if state == "queued" { "not_submitted" } else { state }, encoded, now])?;
+        let ids = transaction.prepare("SELECT message_id FROM delivery_attempt_messages WHERE attempt_id = ?1 ORDER BY ordinal")?.query_map([attempt_id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for id in &ids {
+            transaction.execute("UPDATE delivery_receipts SET state = ?3, evidence_json = ?4, updated_at = ?5 WHERE message_id = ?1 AND target_key = ?2", params![id, target, state, encoded, now])?;
+            append_event(
+                &transaction,
+                id,
+                &FeedEvent::Receipt {
+                    message_id: id.clone(),
+                    recipient: attempt.recipient.clone(),
+                    attempt_id: Some(attempt.id.clone()),
+                    state: state.into(),
+                    outcome: Some(outcome.clone()),
+                },
+            )?;
+            if matches!(outcome, Handoff::Accepted { .. }) {
+                let exposure = if attempt.batch.full_ids.contains(id) {
+                    "full"
+                } else {
+                    "preview"
+                };
+                transaction.execute("UPDATE exposures SET state = ?3, updated_at = ?4 WHERE message_id = ?1 AND target_key = ?2", params![id, target, exposure, now])?;
+                append_event(
+                    &transaction,
+                    id,
+                    &FeedEvent::Exposure {
+                        message_id: id.clone(),
+                        recipient: attempt.recipient.clone(),
+                        state: exposure.into(),
+                    },
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(super) fn attempt_recipient(&self, id: &str) -> Result<SessionRef> {
+        let payload: String = self.connection.query_row(
+            "SELECT payload_json FROM delivery_attempts WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        Ok(serde_json::from_str::<Attempt>(&payload)?.recipient)
+    }
+
+    pub(super) fn recover_submitting(&mut self) -> Result<usize> {
+        let ids = self
+            .connection
+            .prepare("SELECT id FROM delivery_attempts WHERE state = 'submitting'")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for id in &ids {
+            self.finish(
+                id,
+                Handoff::Unknown {
+                    reason: "daemon restarted after claim; native handoff may have occurred".into(),
+                },
+            )?;
+        }
+        Ok(ids.len())
+    }
+
+    pub(super) fn observe(
+        &mut self,
+        recipient: &SessionRef,
+        event: ClientEvent,
+        epoch: u64,
+    ) -> Result<bool> {
+        let target = serde_json::to_string(&Target::Agent(recipient.clone()))?;
+        Ok(self.connection.execute("INSERT INTO delivery_observations(recipient_key, epoch, state) VALUES (?1, ?2, ?3) ON CONFLICT(recipient_key) DO UPDATE SET epoch = excluded.epoch, state = excluded.state WHERE excluded.epoch > delivery_observations.epoch", params![target, to_sql_integer(epoch)?, serde_json::to_string(&event)?])? > 0)
+    }
+
+    pub(super) fn retry_delivery(&mut self, recipient: &SessionRef, id: &str) -> Result<()> {
+        let target = serde_json::to_string(&Target::Agent(recipient.clone()))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure!(transaction.execute("UPDATE delivery_receipts SET state = 'queued', updated_at = ?3 WHERE message_id = ?1 AND target_key = ?2 AND state IN ('unknown', 'refused')", params![id, target, Utc::now().to_rfc3339()])? == 1, "only the original recipient may explicitly retry an unknown or refused handoff; duplicate delivery is possible");
+        append_event(
+            &transaction,
+            id,
+            &FeedEvent::Receipt {
+                message_id: id.into(),
+                recipient: recipient.clone(),
+                attempt_id: None,
+                state: "queued".into(),
+                outcome: None,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(super) fn record_fetch(&mut self, recipient: &SessionRef, ids: &[String]) -> Result<()> {
+        let target = serde_json::to_string(&Target::Agent(recipient.clone()))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for id in ids {
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM exposures WHERE message_id = ?1 AND target_key = ?2)",
+                params![id, target],
+                |r| r.get(0),
+            )?;
+            ensure!(exists, "fetch is outside this recipient binding");
+            if transaction.execute("UPDATE exposures SET fetched_at = ?3 WHERE message_id = ?1 AND target_key = ?2 AND fetched_at IS NULL", params![id, target, Utc::now().to_rfc3339()])? > 0 {
+                append_event(&transaction, id, &FeedEvent::Fetched { message_id: id.clone(), recipient: recipient.clone() })?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub(super) fn cursor_key(&mut self) -> Result<String> {
         let fresh = format!(
             "{}{}",
@@ -298,7 +523,7 @@ impl Store {
         after: u64,
         limit: u16,
         inbox: bool,
-    ) -> Result<Vec<(u64, Message)>> {
+    ) -> Result<Vec<(u64, FeedEvent)>> {
         ensure!((1..=100).contains(&limit), "invalid Chat page limit");
         let sender = viewer
             .map(|s| serde_json::to_string(&Actor::Agent(s.clone())))
@@ -307,9 +532,10 @@ impl Store {
             .map(|s| serde_json::to_string(&Target::Agent(s.clone())))
             .transpose()?;
         let mut statement = self.connection.prepare(
-            "SELECT e.project_seq, e.payload_json FROM events e
-             JOIN messages m ON m.id = json_extract(e.payload_json, '$.id')
+            "SELECT e.project_seq, e.payload_json, e.kind FROM events e
+             JOIN messages m ON m.id = COALESCE(e.message_id, json_extract(e.payload_json, '$.id'))
              WHERE e.project = ?1 AND e.project_seq > ?2
+               AND (?5 = 0 OR e.kind = 'message')
                AND (?3 IS NULL OR (?5 = 0 AND m.sender_key = ?3) OR EXISTS (
                    SELECT 1 FROM recipients r WHERE r.message_id = m.id AND r.target_key = ?4))
              ORDER BY e.project_seq LIMIT ?6",
@@ -331,10 +557,43 @@ impl Store {
                 break;
             }
             bytes += payload.len();
-            page.push((u64::try_from(seq)?, serde_json::from_str(&payload)?));
+            let kind: String = row.get(2)?;
+            let event = if kind == "message" {
+                FeedEvent::Message {
+                    message: serde_json::from_str(&payload)?,
+                }
+            } else {
+                serde_json::from_str(&payload)?
+            };
+            page.push((u64::try_from(seq)?, event));
         }
         Ok(page)
     }
+}
+
+fn append_event(
+    transaction: &rusqlite::Transaction<'_>,
+    id: &str,
+    event: &FeedEvent,
+) -> Result<()> {
+    let project: String = transaction.query_row(
+        "SELECT json_extract(payload_json, '$.draft.project') FROM messages WHERE id = ?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    let sequence = next_sequence(
+        transaction,
+        "SELECT COALESCE(MAX(project_seq), 0) + 1 FROM events WHERE project = ?1",
+        &project,
+    )?;
+    let kind = match event {
+        FeedEvent::Message { .. } => "message",
+        FeedEvent::Receipt { .. } => "receipt",
+        FeedEvent::Exposure { .. } => "exposure",
+        FeedEvent::Fetched { .. } => "fetched",
+    };
+    transaction.execute("INSERT INTO events(event_id, project, project_seq, payload_json, kind, message_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![uuid::Uuid::new_v4().to_string(), project, to_sql_integer(sequence)?, serde_json::to_string(event)?, kind, id])?;
+    Ok(())
 }
 
 fn find_retry(
@@ -369,6 +628,9 @@ fn migrate(connection: &mut Connection, version: u32) -> Result<()> {
     }
     if version < 2 {
         transaction.execute_batch(include_str!("migration-002.sql"))?;
+    }
+    if version < 3 {
+        transaction.execute_batch(include_str!("migration-003.sql"))?;
     }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
@@ -468,6 +730,139 @@ mod tests {
 
     use super::Store;
     use crate::chat::types::{Actor, Draft, SessionRef, Target};
+
+    #[test]
+    fn mixed_preview_and_full_attempt_preserves_inbox_order() {
+        use crate::chat::config::DEFAULT_LIMITS;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("chat.sqlite3")).unwrap();
+        store.set_machine("pc").unwrap();
+        let mut long = draft("long");
+        long.body = "a".repeat(12000);
+        let first = store.send(&sender(), &long).unwrap().id;
+        let second = store.send(&sender(), &draft("short")).unwrap().id;
+        let recipient = SessionRef {
+            machine: "pc".into(),
+            incarnation: "dev-1".into(),
+        };
+        let attempt = store.claim(&recipient, DEFAULT_LIMITS).unwrap().unwrap();
+        assert_eq!(
+            attempt.batch.preview_ids.as_slice(),
+            std::slice::from_ref(&first)
+        );
+        assert_eq!(
+            attempt.batch.full_ids.as_slice(),
+            std::slice::from_ref(&second)
+        );
+        let ids = store
+            .connection
+            .prepare("SELECT message_id FROM delivery_attempt_messages ORDER BY ordinal")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(ids, [first, second]);
+    }
+
+    #[test]
+    fn delivery_transactions_roll_back_at_claim_finish_and_fetch_boundaries() {
+        use crate::chat::{config::DEFAULT_LIMITS, types::Handoff};
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("chat.sqlite3")).unwrap();
+        store.set_machine("pc").unwrap();
+        let id = store.send(&sender(), &draft("one")).unwrap().id;
+        let recipient = SessionRef {
+            machine: "pc".into(),
+            incarnation: "dev-1".into(),
+        };
+        store.connection.execute_batch("CREATE TRIGGER reject_receipt BEFORE INSERT ON events WHEN NEW.kind = 'receipt' BEGIN SELECT RAISE(ABORT, 'interrupted before commit'); END;").unwrap();
+        assert!(store.claim(&recipient, DEFAULT_LIMITS).is_err());
+        let count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM delivery_attempts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_receipt;")
+            .unwrap();
+        let attempt = store.claim(&recipient, DEFAULT_LIMITS).unwrap().unwrap();
+        store.connection.execute_batch("CREATE TRIGGER reject_exposure BEFORE INSERT ON events WHEN NEW.kind = 'exposure' BEGIN SELECT RAISE(ABORT, 'interrupted after handoff'); END;").unwrap();
+        assert!(store
+            .finish(
+                &attempt.id,
+                Handoff::Accepted {
+                    receipt: "native acceptance".into()
+                }
+            )
+            .is_err());
+        let state: String = store
+            .connection
+            .query_row("SELECT state FROM delivery_attempts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "submitting");
+        assert!(store.claim(&recipient, DEFAULT_LIMITS).unwrap().is_none());
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_exposure;")
+            .unwrap();
+        store.recover_submitting().unwrap();
+        assert!(store.claim(&recipient, DEFAULT_LIMITS).unwrap().is_none());
+        store.connection.execute_batch("CREATE TRIGGER reject_fetch BEFORE INSERT ON events WHEN NEW.kind = 'fetched' BEGIN SELECT RAISE(ABORT, 'interrupted fetch commit'); END;").unwrap();
+        assert!(store
+            .record_fetch(&recipient, std::slice::from_ref(&id))
+            .is_err());
+        let fetched: Option<String> = store
+            .connection
+            .query_row("SELECT fetched_at FROM exposures", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fetched, None);
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_fetch;")
+            .unwrap();
+        store.record_fetch(&recipient, &[id]).unwrap();
+    }
+
+    #[test]
+    fn simultaneous_claims_commit_only_one_attempt() {
+        use crate::chat::config::DEFAULT_LIMITS;
+        use std::sync::{Arc, Barrier};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.sqlite3");
+        let mut store = Store::open(&path).unwrap();
+        store.set_machine("pc").unwrap();
+        store.send(&sender(), &draft("one")).unwrap();
+        drop(store);
+        let barrier = Arc::new(Barrier::new(2));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut store = Store::open(&path).unwrap();
+                    barrier.wait();
+                    store
+                        .claim(
+                            &SessionRef {
+                                machine: "pc".into(),
+                                incarnation: "dev-1".into(),
+                            },
+                            DEFAULT_LIMITS,
+                        )
+                        .unwrap()
+                })
+            })
+            .collect();
+        assert_eq!(
+            workers
+                .into_iter()
+                .filter_map(|w| w.join().unwrap())
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn v1_upgrade_preserves_messages_and_initializes_registry() {

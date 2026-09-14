@@ -285,6 +285,14 @@ pub fn validate_limits(limits: Limits) -> Result<()> {
         limits.inline_bytes <= limits.batch_bytes,
         "Chat inline byte limit cannot exceed the batch byte limit"
     );
+    ensure!(
+        limits.batch_bytes <= 8192,
+        "Chat batch byte limit cannot exceed 8 KiB"
+    );
+    ensure!(
+        limits.batch_bytes >= super::render::minimum_batch_bytes()?,
+        "Chat batch byte limit cannot fit the encoded minimum envelope and overflow hint"
+    );
     Ok(())
 }
 
@@ -637,11 +645,11 @@ mod tests {
             batch_bytes: 8192,
         })
         .is_err());
-        validate_limits(Limits {
+        assert!(validate_limits(Limits {
             inline_bytes: 1,
             batch_bytes: 1,
         })
-        .unwrap();
+        .is_err());
     }
 
     #[test]

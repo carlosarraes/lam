@@ -20,7 +20,7 @@ use super::config::{Config, Paths};
 use super::protocol::{self, Operation};
 use super::registry::{reply_targets, NativeEvidence, Registry};
 use super::store::Store;
-use super::types::{Actor, Draft, Message, Registration, SessionRef, Target};
+use super::types::{Actor, Draft, Limits, Message, Registration, SessionRef, Target};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CONNECTIONS: usize = 32;
@@ -82,7 +82,8 @@ pub fn run_with_validator(paths: &Paths, validator: Arc<dyn BindingValidator>) -
     paths.validate()?;
     let _lock = lock_instance(&paths.lock)?;
     let config = Config::load_or_create(&paths.config)?;
-    let service = Service::open(&paths.database, &config.machine)?;
+    let mut service = Service::open(&paths.database, &config.machine)?;
+    service.limits = config.limits();
     // Register termination handling only for this command. Enabling ctrlc's
     // global termination feature would also change the existing pairing flow.
     let mut signals =
@@ -102,22 +103,7 @@ pub fn run_with_validator(paths: &Paths, validator: Arc<dyn BindingValidator>) -
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(_) => break,
             };
-            if work.deadline < Instant::now() {
-                continue;
-            }
-            let mutation = matches!(
-                work.operation,
-                Operation::Send { .. }
-                    | Operation::Reply { .. }
-                    | Operation::Register {}
-                    | Operation::SetState { .. }
-                    | Operation::Delivery { .. }
-            );
-            let result = service.handle(&work.context, work.operation);
-            if mutation && result.is_ok() {
-                writer_changes.notify();
-            }
-            let _ = work.response.try_send(result);
+            apply_work(&mut service, work, &writer_changes);
         }
     });
     let subscriptions = Arc::new(Mutex::new(0_usize));
@@ -185,6 +171,28 @@ pub fn run_with_validator(paths: &Paths, validator: Arc<dyn BindingValidator>) -
     serving
 }
 
+fn apply_work(service: &mut Service, work: Work, changes: &Changes) {
+    if work.deadline < Instant::now() {
+        return;
+    }
+    let mutation = matches!(
+        work.operation,
+        Operation::Send { .. }
+            | Operation::Reply { .. }
+            | Operation::Register {}
+            | Operation::SetState { .. }
+            | Operation::Delivery { .. }
+            | Operation::Finish { .. }
+            | Operation::Retry { .. }
+            | Operation::FetchComplete { .. }
+    );
+    let result = service.handle(&work.context, work.operation);
+    if mutation && result.is_ok() {
+        changes.notify();
+    }
+    let _ = work.response.try_send(result);
+}
+
 fn serve_connection(
     stream: &mut UnixStream,
     observer: bool,
@@ -244,7 +252,7 @@ fn serve_connection(
                     .context("missing feed cursor")?
                     .into(),
             );
-            let has_messages = !page["messages"]
+            let has_messages = !page["events"]
                 .as_array()
                 .context("missing feed page")?
                 .is_empty();
@@ -271,7 +279,43 @@ fn serve_connection(
         }
         Ok(())
     } else {
-        respond(stream, dispatch(&sender, &context, request.operation)?)
+        let fetch = matches!(
+            request.operation,
+            Operation::Inbox { .. } | Operation::Show { .. }
+        );
+        let page = dispatch(&sender, &context, request.operation)?;
+        let mut ids = Vec::new();
+        if fetch {
+            if let VerifiedContext::Participant(registration) = &context {
+                let values: Vec<Value> = page
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .map(|events| {
+                        events
+                            .iter()
+                            .filter_map(|e| e["event"].get("message").cloned())
+                            .collect()
+                    })
+                    .unwrap_or_else(|| vec![page.clone()]);
+                for value in values {
+                    let message: Message = serde_json::from_value(value)?;
+                    if message
+                        .draft
+                        .to
+                        .contains(&Target::Agent(registration.session.clone()))
+                    {
+                        ids.push(message.id);
+                    }
+                }
+            }
+        }
+        respond(stream, page)?;
+        // Every returned message contains its complete body. Only a completed
+        // frame records transfer; failed/partial writes leave fetch state alone.
+        if !ids.is_empty() {
+            let _ = dispatch(&sender, &context, Operation::FetchComplete { ids });
+        }
+        Ok(())
     }
 }
 
@@ -501,6 +545,7 @@ struct Service {
     store: Store,
     machine: String,
     cursor_key: String,
+    limits: Limits,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -519,10 +564,12 @@ impl Service {
         let mut store = Store::open(path)?;
         store.set_machine(machine)?;
         let cursor_key = store.cursor_key()?;
+        store.recover_submitting()?;
         Ok(Self {
             store,
             machine: machine.into(),
             cursor_key,
+            limits: super::config::DEFAULT_LIMITS,
         })
     }
 
@@ -569,8 +616,28 @@ impl Service {
                         .set_eligible(&registration.session, eligible)?;
                     Ok(json!({"eligible": eligible}))
                 }
-                Operation::Delivery { .. } => {
-                    bail!("Chat delivery state machine is not available yet")
+                Operation::Delivery { event, epoch } => {
+                    self.verify_registration(registration)?;
+                    let eligible = Registry::new(&mut self.store)?
+                        .state(&registration.session)
+                        .is_some_and(|s| s.registration.eligible && !s.ended);
+                    ensure!(eligible, "Chat recipient is ineligible");
+                    Ok(serde_json::to_value(super::delivery::request(
+                        &mut self.store,
+                        &registration.session,
+                        event,
+                        epoch,
+                        self.limits,
+                    )?)?)
+                }
+                Operation::Finish { attempt, outcome } => {
+                    self.verify_registration(registration)?;
+                    ensure!(
+                        self.store.attempt_recipient(&attempt)? == registration.session,
+                        "Chat attempt belongs to another recipient"
+                    );
+                    self.store.finish(&attempt, outcome)?;
+                    Ok(json!({"finished": attempt}))
                 }
                 _ => bail!("operation requires participant or observer authority"),
             };
@@ -630,6 +697,23 @@ impl Service {
                     bail!("Inbox requires participant authority");
                 };
                 self.page(context, &registration.project, "inbox", cursor, limit)
+            }
+            Operation::Retry { id } => {
+                let VerifiedContext::Participant(registration) = context else {
+                    bail!("Retry requires participant authority");
+                };
+                self.show(context, &id)?;
+                self.store.retry_delivery(&registration.session, &id)?;
+                Ok(
+                    json!({"retry": id, "warning": "Duplicate delivery is possible; retry remains bound to the original recipient incarnation"}),
+                )
+            }
+            Operation::FetchComplete { ids } => {
+                let VerifiedContext::Participant(registration) = context else {
+                    bail!("Fetch completion requires participant authority");
+                };
+                self.store.record_fetch(&registration.session, &ids)?;
+                Ok(json!({"fetched": ids}))
             }
             _ => bail!("operation requires integration authority"),
         }
@@ -749,12 +833,12 @@ impl Service {
             limit,
             query == "inbox",
         )?;
-        let mut messages = Vec::with_capacity(page.len());
-        for (sequence, message) in page {
+        let mut events = Vec::with_capacity(page.len());
+        for (sequence, event) in page {
             cursor.after = sequence;
-            messages.push(message);
+            events.push(json!({"sequence": sequence, "event": event}));
         }
-        Ok(json!({"messages": messages, "cursor": self.encode_cursor(&cursor)?}))
+        Ok(json!({"events": events, "cursor": self.encode_cursor(&cursor)?}))
     }
 
     fn encode_cursor(&self, cursor: &Cursor) -> Result<String> {
@@ -819,6 +903,242 @@ mod tests {
             native_id: id.into(),
             process_start: format!("boot:1:{id}"),
             eligible: true,
+        }
+    }
+
+    #[test]
+    fn delivery_finish_retry_and_notifications_are_recipient_scoped() {
+        use crate::chat::types::{ClientEvent, Handoff};
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = Service::open(&dir.path().join("chat.sqlite3"), MACHINE).unwrap();
+        let a = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        let b = registration("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+        for r in [&a, &b] {
+            service
+                .handle(
+                    &VerifiedContext::Integration(r.clone()),
+                    Operation::Register {},
+                )
+                .unwrap();
+        }
+        let message = service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Send {
+                    draft: Draft {
+                        key: "one".into(),
+                        project: PROJECT.into(),
+                        to: vec![Target::Agent(a.session.clone())],
+                        body: "hello".into(),
+                        reply_to: None,
+                    },
+                },
+            )
+            .unwrap();
+        let id = message["id"].as_str().unwrap().to_owned();
+        let integration = VerifiedContext::Integration(a.clone());
+        let claimed = service
+            .handle(
+                &integration,
+                Operation::Delivery {
+                    event: ClientEvent::Hook,
+                    epoch: 1,
+                },
+            )
+            .unwrap();
+        let attempt = claimed["id"].as_str().unwrap().to_owned();
+        let finish = Operation::Finish {
+            attempt,
+            outcome: Handoff::Unknown {
+                reason: "hook stdout has no native acknowledgement".into(),
+            },
+        };
+        assert!(service
+            .handle(&VerifiedContext::Integration(b.clone()), finish.clone())
+            .is_err());
+        assert!(service
+            .handle(&VerifiedContext::Participant(a.clone()), finish.clone())
+            .is_err());
+        let changes = Changes::default();
+        let (response, result) = mpsc::sync_channel(1);
+        apply_work(
+            &mut service,
+            Work {
+                context: integration.clone(),
+                operation: finish,
+                response,
+                deadline: Instant::now() + Duration::from_secs(1),
+            },
+            &changes,
+        );
+        result.recv().unwrap().unwrap();
+        assert_eq!(*changes.generation.lock().unwrap(), 1);
+        let feed = service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Subscribe {
+                    project: PROJECT.into(),
+                    cursor: None,
+                    limit: 100,
+                },
+            )
+            .unwrap();
+        assert_eq!(feed["events"][2]["event"]["state"], "unknown");
+        assert!(service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Retry { id: id.clone() }
+            )
+            .is_err());
+        assert!(service
+            .handle(
+                &VerifiedContext::Participant(b),
+                Operation::Retry { id: id.clone() }
+            )
+            .is_err());
+        let retried = service
+            .handle(&VerifiedContext::Participant(a), Operation::Retry { id })
+            .unwrap();
+        assert!(retried["warning"].as_str().unwrap().contains("Duplicate"));
+        assert!(service
+            .handle(
+                &integration,
+                Operation::Delivery {
+                    event: ClientEvent::Idle,
+                    epoch: 1
+                }
+            )
+            .unwrap()
+            .is_null());
+        assert!(service
+            .handle(
+                &integration,
+                Operation::Delivery {
+                    event: ClientEvent::Idle,
+                    epoch: 2
+                }
+            )
+            .unwrap()
+            .is_object());
+    }
+
+    #[test]
+    fn inbox_socket_completion_records_each_full_page_but_failed_write_does_not() {
+        use crate::chat::types::FeedEvent;
+        struct TestBinding(Registration);
+        impl BindingValidator for TestBinding {
+            fn validate(&self, _: PeerIdentity, _: &str) -> Result<VerifiedContext> {
+                Ok(VerifiedContext::Participant(self.0.clone()))
+            }
+        }
+        for fail_after_bytes in [None, Some(0), Some(128)] {
+            let fail_write = fail_after_bytes.is_some();
+            let dir = tempfile::tempdir().unwrap();
+            let mut service = Service::open(&dir.path().join("chat.sqlite3"), MACHINE).unwrap();
+            let recipient = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+            service
+                .handle(
+                    &VerifiedContext::Integration(recipient.clone()),
+                    Operation::Register {},
+                )
+                .unwrap();
+            for key in ["long", "short"] {
+                service
+                    .handle(
+                        &VerifiedContext::Observer,
+                        Operation::Send {
+                            draft: Draft {
+                                key: key.into(),
+                                project: PROJECT.into(),
+                                to: vec![Target::Agent(recipient.session.clone())],
+                                body: if key == "long" {
+                                    "é".repeat(32000)
+                                } else {
+                                    "next".into()
+                                },
+                                reply_to: None,
+                            },
+                        },
+                    )
+                    .unwrap();
+            }
+            let (sender, receiver) = mpsc::sync_channel(WRITER_QUEUE);
+            let changes = Arc::new(Changes::default());
+            let owner_changes = changes.clone();
+            let owner = thread::spawn(move || {
+                while let Ok(work) = receiver.recv() {
+                    apply_work(&mut service, work, &owner_changes);
+                }
+                service
+            });
+            let mut cursor = None;
+            for _ in 0..if fail_write { 1 } else { 2 } {
+                let (mut client, mut server) = UnixStream::pair().unwrap();
+                let buffer_size: libc::c_int = 4096;
+                assert_eq!(
+                    unsafe {
+                        libc::setsockopt(
+                            server.as_raw_fd(),
+                            libc::SOL_SOCKET,
+                            libc::SO_SNDBUF,
+                            (&buffer_size as *const libc::c_int).cast(),
+                            std::mem::size_of_val(&buffer_size) as libc::socklen_t,
+                        )
+                    },
+                    0
+                );
+                protocol::write_frame(
+                    &mut client,
+                    &json!({"version": 1, "binding": "private-fixture"}),
+                )
+                .unwrap();
+                protocol::write_frame(&mut client, &json!({"version": 1, "operation": {"op": "inbox", "cursor": cursor, "limit": 1}})).unwrap();
+                if fail_after_bytes == Some(0) {
+                    client.shutdown(std::net::Shutdown::Read).unwrap();
+                }
+                let sender = sender.clone();
+                let changes = changes.clone();
+                let validator = TestBinding(recipient.clone());
+                let worker = thread::spawn(move || {
+                    serve_connection(
+                        &mut server,
+                        false,
+                        &validator,
+                        sender,
+                        &AtomicBool::new(false),
+                        &changes,
+                        &Mutex::new(0),
+                    )
+                });
+                if !fail_write {
+                    let page = protocol::read_frame(&mut client).unwrap();
+                    assert_eq!(page["data"]["events"].as_array().unwrap().len(), 1);
+                    cursor = page["data"]["cursor"].as_str().map(str::to_owned);
+                }
+                if fail_after_bytes == Some(128) {
+                    use std::io::Read;
+                    client.read_exact(&mut [0_u8; 128]).unwrap();
+                    client.shutdown(std::net::Shutdown::Read).unwrap();
+                }
+                assert_eq!(worker.join().unwrap().is_err(), fail_write);
+            }
+            drop(sender);
+            let mut service = owner.join().unwrap();
+            let events = service.store.feed(PROJECT, None, 0, 100, false).unwrap();
+            let fetched = events
+                .iter()
+                .filter(|(_, event)| matches!(event, FeedEvent::Fetched { .. }))
+                .count();
+            assert_eq!(fetched, if fail_write { 0 } else { 2 });
+            assert_eq!(*changes.generation.lock().unwrap(), fetched as u64);
+            assert_eq!(
+                service
+                    .store
+                    .claim(&recipient.session, super::super::config::DEFAULT_LIMITS)
+                    .unwrap()
+                    .is_none(),
+                !fail_write
+            );
         }
     }
 
@@ -896,7 +1216,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(observed["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(observed["events"].as_array().unwrap().len(), 1);
         let inbox = service
             .handle(
                 &VerifiedContext::Participant(b.clone()),
@@ -906,7 +1226,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(inbox["messages"][0]["id"], id);
+        assert_eq!(inbox["events"][0]["event"]["message"]["id"], id);
         assert!(service
             .handle(
                 &VerifiedContext::Participant(b.clone()),
@@ -925,7 +1245,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(again["messages"], inbox["messages"]);
+        assert_eq!(again["events"], inbox["events"]);
         assert!(service
             .handle(
                 &VerifiedContext::Participant(c.clone()),
@@ -945,7 +1265,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(outsider["messages"], json!([]));
+        assert_eq!(outsider["events"], json!([]));
         let reply = service
             .handle(
                 &VerifiedContext::Participant(b),
@@ -1018,7 +1338,10 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(page["messages"][0]["draft"]["body"], "first");
+        assert_eq!(
+            page["events"][0]["event"]["message"]["draft"]["body"],
+            "first"
+        );
         let cursor = page["cursor"].as_str().unwrap().to_string();
         drop(service);
         let mut service = Service::open(&path, MACHINE).unwrap();
@@ -1032,7 +1355,10 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(page["messages"][0]["draft"]["body"], "second");
+        assert_eq!(
+            page["events"][0]["event"]["message"]["draft"]["body"],
+            "second"
+        );
         assert!(service
             .handle(
                 &VerifiedContext::Observer,
