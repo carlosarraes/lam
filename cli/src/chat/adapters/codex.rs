@@ -166,7 +166,7 @@ fn record_error(stage: &str) -> anyhow::Result<()> {
         "private hook diagnostic unavailable"
     );
     anyhow::ensure!(
-        matches!(stage, "input" | "binding"),
+        matches!(stage, "input" | "binding" | "output"),
         "invalid hook diagnostic stage"
     );
     let mut line =
@@ -229,6 +229,126 @@ impl HookInput {
 mod tests {
     #[cfg(target_os = "linux")]
     use super::write_output;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn output_error_diagnostics_are_private_fixed_and_silent() {
+        use std::{
+            io::Read,
+            os::{
+                fd::AsRawFd,
+                unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+            },
+            process::Command,
+        };
+        const MODE: &str = "LAM_CHAT_TEST_DIAGNOSTIC_MODE";
+        if let Ok(mode) = std::env::var(MODE) {
+            // Only this isolated, single-test subprocess redirects descriptors;
+            // other tests and native clients retain their stdout/stderr.
+            let (mut stdout, stdout_writer) = pipe();
+            let (mut stderr, stderr_writer) = pipe();
+            let saved_stdout = unsafe { libc::dup(libc::STDOUT_FILENO) };
+            let saved_stderr = unsafe { libc::dup(libc::STDERR_FILENO) };
+            assert!(saved_stdout >= 0 && saved_stderr >= 0);
+            assert_eq!(
+                unsafe { libc::dup2(stdout_writer.as_raw_fd(), libc::STDOUT_FILENO) },
+                libc::STDOUT_FILENO
+            );
+            assert_eq!(
+                unsafe { libc::dup2(stderr_writer.as_raw_fd(), libc::STDERR_FILENO) },
+                libc::STDERR_FILENO
+            );
+            let stage = if mode == "invalid" {
+                "arbitrary message/credential sentinel"
+            } else {
+                "output"
+            };
+            let recorded = super::record_error(stage);
+            assert_eq!(
+                unsafe { libc::dup2(saved_stdout, libc::STDOUT_FILENO) },
+                libc::STDOUT_FILENO
+            );
+            assert_eq!(
+                unsafe { libc::dup2(saved_stderr, libc::STDERR_FILENO) },
+                libc::STDERR_FILENO
+            );
+            unsafe {
+                libc::close(saved_stdout);
+                libc::close(saved_stderr);
+            }
+            drop(stdout_writer);
+            drop(stderr_writer);
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            stdout.read_to_end(&mut out).unwrap();
+            stderr.read_to_end(&mut err).unwrap();
+            assert!(
+                out.is_empty() && err.is_empty(),
+                "production diagnostic path wrote to native streams"
+            );
+            assert_eq!(
+                recorded.is_ok(),
+                mode == "output",
+                "fixed output stage must be recordable; unsafe stages/storage must refuse"
+            );
+            return;
+        }
+        for mode in ["output", "invalid", "unavailable"] {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path().join("data");
+            let config = dir.path().join("config");
+            let runtime = dir.path().join("runtime");
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&data)
+                .unwrap();
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&config)
+                .unwrap();
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&runtime)
+                .unwrap();
+            let diagnostic = data.join("hook-errors.jsonl");
+            let untouched = dir.path().join("untouched");
+            if mode == "unavailable" {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&untouched)
+                    .unwrap();
+                std::os::unix::fs::symlink(&untouched, &diagnostic).unwrap();
+            }
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "chat::adapters::codex::tests::output_error_diagnostics_are_private_fixed_and_silent", "--nocapture"])
+                .env(MODE, mode)
+                .env("LAM_CHAT_CONFIG", config.join("chat.toml"))
+                .env("LAM_CHAT_DATA_DIR", &data)
+                .env("XDG_RUNTIME_DIR", &runtime)
+                .output().unwrap();
+            assert!(
+                child.status.success(),
+                "diagnostic fixture {mode} failed: {}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            if mode == "output" {
+                let bytes = std::fs::read(&diagnostic).unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                    serde_json::json!({"client":"codex", "stage":"output", "status":"error"})
+                );
+                assert_eq!(bytes.last(), Some(&b'\n'));
+                assert_eq!(diagnostic.metadata().unwrap().mode() & 0o777, 0o600);
+            } else if mode == "invalid" {
+                assert!(std::fs::read(&diagnostic).unwrap().is_empty());
+            } else {
+                assert!(diagnostic.symlink_metadata().unwrap().is_symlink());
+                assert!(std::fs::read(&untouched).unwrap().is_empty());
+            }
+        }
+    }
     #[test]
     fn hook_identity_uses_observed_child_id_and_validates_event_and_scope() {
         let root = "11111111-1111-4111-8111-111111111111";
