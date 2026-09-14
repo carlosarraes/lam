@@ -16,4 +16,6 @@ Observer history has exactly two messages, each Submitting then Unknown. There i
 
 Setup and probe exited normally, the owned daemon exited zero after SIGTERM, all three owned PIDs were absent, and shared backend 28534 stayed alive. The active hook definition and two private credential records/locks were removed; exact hook bytes remain disabled in the case directory. Test credentials were not preserved. The offline test database remains available.
 
+The exact-root lookup also recovered the single benchmark call's [original native tool result](native-benchmark-8bc82a6.json), without truncation. All fields and all 100 samples exactly equal the final model copy. `node docs/chat-probes/2026-09-14/task-6-hook/check.mjs` asserts that equality as well as body/hash/receipt invariants. The benchmark therefore has direct tool-result evidence, not only a model-reported timing summary.
+
 The native UI warned that weekly allowance was below 10%; no hard quota failure occurred. No model, default or credential change was made. Remaining gates include automatic child reply, idle wake/arrival races, refusal and restart cases, native lifecycle rotation, Claude/Pi adapters, six directed pairs and other platforms. Whole Task 6 is incomplete.

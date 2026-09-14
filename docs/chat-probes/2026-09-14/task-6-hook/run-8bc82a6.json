@@ -154,7 +154,7 @@
   "benchmark": {
     "command": "node /tmp/lam-chat-task6-native.KlGYDF/hook-case-1/empty-checks.mjs",
     "scriptSha256": "2e98081b5635eee61e9005e9b1823aa3ca1e6a516c560eabe96392b6b08644fd",
-    "timingSource": "Exact JSON copied from owned root final output; recomputed quantiles match all 100 retained samples. Native tool-result preview independently displayed count=100, zero stdout/stderr and matching median/p95.",
+    "timingSource": "Exact original native tool result from the single empty-checks.mjs call in this owned root, retained in native-benchmark-8bc82a6.json. All fields and 100 samples exactly match the final model copy; quantiles independently recompute.",
     "rootEpochAfterBootstrap": 1,
     "rootEpochAfterBenchmark": 104,
     "epochExplanation": "Four framework PostToolUse events plus 100 direct CLI PostToolUse checks; child had two separate events. Checks ran under actual native command ancestry and private binding.",
