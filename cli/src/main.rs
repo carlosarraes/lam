@@ -1,4 +1,6 @@
 mod articles;
+#[allow(dead_code)]
+mod chat;
 mod client;
 mod commands;
 mod config;
