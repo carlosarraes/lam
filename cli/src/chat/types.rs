@@ -7,7 +7,8 @@ pub struct SessionRef {
 
 /// Internal adapter contract: native identity and process evidence must already
 /// have been validated by the selected client's adapter, never by caller JSON.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Registration {
     pub session: SessionRef,
     pub project: String,
@@ -18,7 +19,8 @@ pub struct Registration {
     pub eligible: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionState {
     pub registration: Registration,
     pub connected: bool,
@@ -118,4 +120,40 @@ pub enum FeedEvent {
         message_id: String,
         recipient: SessionRef,
     },
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerEvent {
+    pub id: String,
+    pub origin: String,
+    pub seq: u64,
+    pub project: String,
+    pub payload: PeerPayload,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PeerPayload {
+    Message {
+        message: Message,
+    },
+    Receipt {
+        message_id: String,
+        recipient: SessionRef,
+        state: Option<String>,
+        exposure: Option<String>,
+        attempt_id: Option<String>,
+        outcome: Option<Handoff>,
+    },
+    Presence {
+        session: SessionState,
+        epoch: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportResult {
+    Applied { through: u64 },
+    Duplicate { through: u64 },
 }

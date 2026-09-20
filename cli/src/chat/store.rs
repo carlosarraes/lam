@@ -7,11 +7,11 @@ use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
 use super::types::{
-    Actor, Attempt, ClientEvent, Draft, FeedEvent, Handoff, Limits, Message, Registration,
-    SessionRef, SessionState, Target,
+    Actor, Attempt, ClientEvent, Draft, FeedEvent, Handoff, ImportResult, Limits, Message,
+    PeerEvent, PeerPayload, Registration, SessionRef, SessionState, Target,
 };
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
 pub struct Store {
@@ -120,6 +120,21 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    pub(super) fn load_remote_sessions(&self) -> Result<Vec<SessionState>> {
+        if schema_version(&self.connection)? < 6 {
+            return Ok(Vec::new());
+        }
+        let mut statement = self
+            .connection
+            .prepare("SELECT payload_json FROM remote_sessions ORDER BY machine, incarnation")?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|raw| Ok(serde_json::from_str(&raw)?))
+            .collect()
+    }
+
     pub(super) fn save_session(&mut self, entry: &SessionState) -> Result<()> {
         let registration = &entry.registration;
         let transaction = self
@@ -135,6 +150,26 @@ impl Store {
                 registration.name, registration.client, registration.native_id, registration.process_start,
                 registration.eligible, entry.connected, entry.ended],
         )?;
+        if schema_version(&transaction)? >= 6 {
+            let sequence = next_sequence(
+                &transaction,
+                "SELECT COALESCE(MAX(origin_seq), 0) + 1 FROM peer_outbox WHERE project = ?1",
+                &registration.project,
+            )?;
+            transaction.execute(
+                "INSERT INTO peer_outbox(project, origin_seq, event_id, payload_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    registration.project,
+                    to_sql_integer(sequence)?,
+                    uuid::Uuid::new_v4().to_string(),
+                    serde_json::to_string(&PeerPayload::Presence {
+                        session: entry.clone(),
+                        epoch: sequence,
+                    })?
+                ],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -223,28 +258,36 @@ impl Store {
                          VALUES (?1, ?2, ?3)",
                         params![target_key, to_sql_integer(inbox_seq)?, message.id],
                     )?;
-                    transaction.execute(
-                        "INSERT INTO delivery_receipts(message_id, target_key)
-                         VALUES (?1, ?2)",
-                        params![message.id, target_key],
-                    )?;
-                    transaction.execute(
-                        "INSERT INTO exposures(message_id, target_key) VALUES (?1, ?2)",
-                        params![message.id, target_key],
-                    )?;
                 }
+                transaction.execute(
+                    "INSERT INTO delivery_receipts(message_id, target_key) VALUES (?1, ?2)",
+                    params![message.id, target_key],
+                )?;
+                transaction.execute(
+                    "INSERT INTO exposures(message_id, target_key) VALUES (?1, ?2)",
+                    params![message.id, target_key],
+                )?;
             }
         }
 
+        let event_id = uuid::Uuid::new_v4().to_string();
         transaction.execute(
             "INSERT INTO events(event_id, project, project_seq, payload_json)
              VALUES (?1, ?2, ?3, ?4)",
             params![
-                uuid::Uuid::new_v4().to_string(),
+                event_id,
                 message.draft.project,
                 to_sql_integer(project_seq)?,
                 payload,
             ],
+        )?;
+        append_peer_outbox(
+            &transaction,
+            &message.draft.project,
+            &event_id,
+            &PeerPayload::Message {
+                message: message.clone(),
+            },
         )?;
         transaction.commit()?;
         Ok(message)
@@ -547,6 +590,157 @@ impl Store {
         Ok(serde_json::from_str(&payload)?)
     }
 
+    /// Locally originated events use a separate, gapless sequence. Imported
+    /// observer events must never enter this stream or be echoed to a peer.
+    pub fn export_events(&self, project: &str, after: u64, limit: usize) -> Result<Vec<PeerEvent>> {
+        ensure!((1..=100).contains(&limit), "invalid peer page limit");
+        let origin = self.machine()?;
+        let mut statement = self.connection.prepare(
+            "SELECT origin_seq, event_id, payload_json FROM peer_outbox
+             WHERE project = ?1 AND origin_seq > ?2 ORDER BY origin_seq LIMIT ?3",
+        )?;
+        let mut rows = statement.query(params![
+            project,
+            to_sql_integer(after)?,
+            i64::try_from(limit)?
+        ])?;
+        let mut events = Vec::new();
+        let mut bytes = 0;
+        while let Some(row) = rows.next()? {
+            let payload: String = row.get(2)?;
+            if bytes + payload.len() > 768 * 1024 {
+                break;
+            }
+            bytes += payload.len();
+            events.push(PeerEvent {
+                id: row.get(1)?,
+                origin: origin.clone(),
+                seq: u64::try_from(row.get::<_, i64>(0)?)?,
+                project: project.into(),
+                payload: serde_json::from_str(&payload)?,
+            });
+        }
+        Ok(events)
+    }
+
+    /// Applies one peer event and its replay cursor in the same transaction.
+    /// A duplicate is accepted only if every immutable field still matches.
+    pub fn import_event(
+        &mut self,
+        authenticated_peer: &str,
+        event: &PeerEvent,
+        projects: &[String],
+    ) -> Result<ImportResult> {
+        ensure!(
+            event.origin == authenticated_peer,
+            "peer event origin does not match authenticated peer"
+        );
+        ensure!(
+            projects.iter().any(|project| project == &event.project),
+            "peer project is not authorized"
+        );
+        ensure!(event.seq > 0, "peer event sequence must be positive");
+        uuid::Uuid::parse_str(&event.id).context("invalid peer event ID")?;
+        let payload = serde_json::to_string(&event.payload)?;
+        ensure!(
+            payload.len() <= 768 * 1024,
+            "peer event exceeds payload limit"
+        );
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let machine: String = transaction.query_row(
+            "SELECT value FROM metadata WHERE key = 'machine'",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            authenticated_peer != machine,
+            "cannot import own peer events"
+        );
+        let through: i64 = transaction
+            .query_row(
+                "SELECT received_through FROM peer_cursors WHERE peer = ?1 AND project = ?2",
+                params![authenticated_peer, event.project],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let through = u64::try_from(through)?;
+        if event.seq <= through {
+            let stored: Option<(String, String)> = transaction
+                .query_row(
+                    "SELECT event_id, payload_json FROM imported_events
+                 WHERE origin = ?1 AND project = ?2 AND origin_seq = ?3",
+                    params![
+                        authenticated_peer,
+                        event.project,
+                        to_sql_integer(event.seq)?
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            ensure!(
+                matches!(stored, Some((ref id, ref body)) if id == &event.id && body == &payload),
+                "conflicting peer replay"
+            );
+            return Ok(ImportResult::Duplicate { through });
+        }
+        ensure!(event.seq == through + 1, "peer event sequence gap");
+        let reused: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM imported_events WHERE event_id = ?1)",
+            [&event.id],
+            |row| row.get(0),
+        )?;
+        ensure!(!reused, "peer event ID was reused");
+        apply_peer_payload(&transaction, authenticated_peer, &machine, event)?;
+        transaction.execute(
+            "INSERT INTO imported_events(event_id, origin, project, origin_seq, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                event.id,
+                authenticated_peer,
+                event.project,
+                to_sql_integer(event.seq)?,
+                payload
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO peer_cursors(peer, project, received_through) VALUES (?1, ?2, ?3)
+             ON CONFLICT(peer, project) DO UPDATE SET received_through = excluded.received_through",
+            params![
+                authenticated_peer,
+                event.project,
+                to_sql_integer(event.seq)?
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(ImportResult::Applied { through: event.seq })
+    }
+
+    pub fn record_peer_ack(&mut self, peer: &str, project: &str, through: u64) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let latest: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(origin_seq), 0) FROM peer_outbox WHERE project = ?1",
+            [project],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            to_sql_integer(through)? <= latest,
+            "peer acknowledged unseen events"
+        );
+        transaction.execute(
+            "INSERT INTO peer_cursors(peer, project, acknowledged_through) VALUES (?1, ?2, ?3)
+             ON CONFLICT(peer, project) DO UPDATE SET
+             acknowledged_through = MAX(peer_cursors.acknowledged_through, excluded.acknowledged_through)",
+            params![peer, project, to_sql_integer(through)?],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Durable feed sequence, filtered before pagination. Reads never update inbox,
     /// receipt or exposure state. The serialized page is capped below a frame.
     pub(super) fn feed(
@@ -710,7 +904,409 @@ fn append_event(
         FeedEvent::Exposure { .. } => "exposure",
         FeedEvent::Fetched { .. } => "fetched",
     };
-    transaction.execute("INSERT INTO events(event_id, project, project_seq, payload_json, kind, message_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![uuid::Uuid::new_v4().to_string(), project, to_sql_integer(sequence)?, serde_json::to_string(event)?, kind, id])?;
+    let event_id = uuid::Uuid::new_v4().to_string();
+    transaction.execute("INSERT INTO events(event_id, project, project_seq, payload_json, kind, message_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![event_id, project, to_sql_integer(sequence)?, serde_json::to_string(event)?, kind, id])?;
+    append_peer_outbox(transaction, &project, &event_id, &peer_payload(event))?;
+    Ok(())
+}
+
+fn peer_payload(event: &FeedEvent) -> PeerPayload {
+    match event {
+        FeedEvent::Message { message } => PeerPayload::Message {
+            message: message.clone(),
+        },
+        FeedEvent::Receipt {
+            message_id,
+            recipient,
+            attempt_id,
+            state,
+            outcome,
+        } => PeerPayload::Receipt {
+            message_id: message_id.clone(),
+            recipient: recipient.clone(),
+            state: Some(state.clone()),
+            exposure: None,
+            attempt_id: attempt_id.clone(),
+            outcome: outcome.clone(),
+        },
+        FeedEvent::Exposure {
+            message_id,
+            recipient,
+            state,
+        } => PeerPayload::Receipt {
+            message_id: message_id.clone(),
+            recipient: recipient.clone(),
+            state: None,
+            exposure: Some(state.clone()),
+            attempt_id: None,
+            outcome: None,
+        },
+        FeedEvent::Fetched {
+            message_id,
+            recipient,
+        } => PeerPayload::Receipt {
+            message_id: message_id.clone(),
+            recipient: recipient.clone(),
+            state: None,
+            exposure: Some("fetched".into()),
+            attempt_id: None,
+            outcome: None,
+        },
+    }
+}
+
+fn append_peer_outbox(
+    transaction: &rusqlite::Transaction<'_>,
+    project: &str,
+    event_id: &str,
+    payload: &PeerPayload,
+) -> Result<()> {
+    if schema_version(transaction)? < 6 {
+        return Ok(());
+    }
+    let sequence = next_sequence(
+        transaction,
+        "SELECT COALESCE(MAX(origin_seq), 0) + 1 FROM peer_outbox WHERE project = ?1",
+        project,
+    )?;
+    transaction.execute(
+        "INSERT INTO peer_outbox(project, origin_seq, event_id, payload_json) VALUES (?1, ?2, ?3, ?4)",
+        params![project, to_sql_integer(sequence)?, event_id, serde_json::to_string(payload)?],
+    )?;
+    Ok(())
+}
+
+fn backfill_peer_outbox(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    let mut statement = transaction.prepare(
+        "SELECT event_id, project, project_seq, kind, payload_json FROM events ORDER BY project, project_seq",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for (id, project, sequence, kind, raw) in rows {
+        let payload = if kind == "message" {
+            PeerPayload::Message {
+                message: serde_json::from_str(&raw)?,
+            }
+        } else {
+            peer_payload(&serde_json::from_str::<FeedEvent>(&raw)?)
+        };
+        transaction.execute(
+            "INSERT INTO peer_outbox(project, origin_seq, event_id, payload_json) VALUES (?1, ?2, ?3, ?4)",
+            params![project, sequence, id, serde_json::to_string(&payload)?],
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_peer_payload(
+    transaction: &rusqlite::Transaction<'_>,
+    origin: &str,
+    machine: &str,
+    event: &PeerEvent,
+) -> Result<()> {
+    match &event.payload {
+        PeerPayload::Message { message } => {
+            ensure!(
+                actor_machine(&message.sender) == origin,
+                "peer message sender is not origin-owned"
+            );
+            ensure!(
+                message.draft.project == event.project,
+                "peer message project differs from event"
+            );
+            ensure!(
+                message.sender_seq > 0,
+                "peer sender sequence must be positive"
+            );
+            ensure!(!message.draft.key.is_empty(), "peer message key is empty");
+            ensure!(
+                !message.draft.to.is_empty() && message.draft.to.len() <= 128,
+                "invalid peer recipient count"
+            );
+            ensure!(
+                message.draft.body.len() <= MAX_BODY_BYTES,
+                "peer message body exceeds 64 KiB"
+            );
+            uuid::Uuid::parse_str(&message.id).context("invalid peer message ID")?;
+            ensure!(
+                serde_json::to_string(&canonical_draft(&message.draft)?)?
+                    == serde_json::to_string(&message.draft)?,
+                "peer message recipients are not canonical",
+            );
+            let sender_key = serde_json::to_string(&message.sender)?;
+            transaction.execute(
+                "INSERT INTO messages(id, sender_key, sender_seq, idempotency_key, payload_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    message.id,
+                    sender_key,
+                    to_sql_integer(message.sender_seq)?,
+                    message.draft.key,
+                    serde_json::to_string(message)?
+                ],
+            )?;
+            let mut local_recipients = Vec::new();
+            for target in &message.draft.to {
+                let target_key = serde_json::to_string(target)?;
+                transaction.execute(
+                    "INSERT INTO recipients(message_id, target_key) VALUES (?1, ?2)",
+                    params![message.id, target_key],
+                )?;
+                if let Target::Agent(recipient) = target {
+                    if recipient.machine == machine {
+                        let ended: bool = transaction.query_row(
+                            "SELECT ended FROM sessions WHERE machine = ?1 AND incarnation = ?2",
+                            params![machine, recipient.incarnation], |row| row.get(0),
+                        ).optional()?.unwrap_or(false);
+                        if !ended {
+                            let inbox_seq = next_sequence(
+                                transaction,
+                                "SELECT COALESCE(MAX(inbox_seq), 0) + 1 FROM inbox_entries WHERE recipient_key = ?1",
+                                &target_key,
+                            )?;
+                            transaction.execute(
+                                "INSERT INTO inbox_entries(recipient_key, inbox_seq, message_id) VALUES (?1, ?2, ?3)",
+                                params![target_key, to_sql_integer(inbox_seq)?, message.id],
+                            )?;
+                        }
+                        transaction.execute(
+                            "INSERT INTO delivery_receipts(message_id, target_key, state) VALUES (?1, ?2, ?3)",
+                            params![message.id, target_key, if ended { "unavailable" } else { "queued" }],
+                        )?;
+                        transaction.execute(
+                            "INSERT INTO exposures(message_id, target_key) VALUES (?1, ?2)",
+                            params![message.id, target_key],
+                        )?;
+                        local_recipients.push((recipient.clone(), ended));
+                    }
+                }
+            }
+            append_imported_observer(
+                transaction,
+                event,
+                &message.id,
+                &FeedEvent::Message {
+                    message: message.clone(),
+                },
+            )?;
+            for (recipient, ended) in local_recipients {
+                // This receipt is locally originated; the imported message is not.
+                append_event(
+                    transaction,
+                    &message.id,
+                    &FeedEvent::Receipt {
+                        message_id: message.id.clone(),
+                        recipient,
+                        attempt_id: None,
+                        state: if ended {
+                            "unavailable"
+                        } else {
+                            "received_remotely"
+                        }
+                        .into(),
+                        outcome: None,
+                    },
+                )?;
+            }
+        }
+        PeerPayload::Receipt {
+            message_id,
+            recipient,
+            state,
+            exposure,
+            attempt_id,
+            outcome,
+        } => {
+            ensure!(
+                recipient.machine == origin,
+                "peer receipt recipient is not origin-owned"
+            );
+            ensure!(
+                state.is_some() != exposure.is_some(),
+                "peer receipt needs exactly one state field"
+            );
+            uuid::Uuid::parse_str(message_id).context("invalid peer receipt message ID")?;
+            let target = serde_json::to_string(&Target::Agent(recipient.clone()))?;
+            let recorded_project: Option<String> = transaction
+                .query_row(
+                    "SELECT json_extract(m.payload_json, '$.draft.project') FROM messages m
+                 JOIN recipients r ON r.message_id = m.id
+                 WHERE m.id = ?1 AND r.target_key = ?2",
+                    params![message_id, target],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            ensure!(
+                recorded_project.as_deref() == Some(event.project.as_str()),
+                "peer receipt is outside frozen recipients or project"
+            );
+            let now = Utc::now().to_rfc3339();
+            if let Some(state) = state {
+                ensure!(
+                    matches!(
+                        state.as_str(),
+                        "queued"
+                            | "received_remotely"
+                            | "unavailable"
+                            | "submitting"
+                            | "accepted"
+                            | "refused"
+                            | "unknown"
+                    ),
+                    "invalid peer receipt state"
+                );
+                ensure!(exposure.is_none(), "mixed peer receipt fields");
+                transaction.execute(
+                    "UPDATE delivery_receipts SET state = ?3, evidence_json = ?4, updated_at = ?5
+                     WHERE message_id = ?1 AND target_key = ?2",
+                    params![
+                        message_id,
+                        target,
+                        state,
+                        outcome.as_ref().map(serde_json::to_string).transpose()?,
+                        now
+                    ],
+                )?;
+                append_imported_observer(
+                    transaction,
+                    event,
+                    message_id,
+                    &FeedEvent::Receipt {
+                        message_id: message_id.clone(),
+                        recipient: recipient.clone(),
+                        attempt_id: attempt_id.clone(),
+                        state: state.clone(),
+                        outcome: outcome.clone(),
+                    },
+                )?;
+            } else if let Some(exposure) = exposure {
+                ensure!(
+                    matches!(exposure.as_str(), "unseen" | "preview" | "full" | "fetched"),
+                    "invalid peer exposure state"
+                );
+                if exposure == "fetched" {
+                    transaction.execute(
+                        "UPDATE exposures SET fetched_at = ?3 WHERE message_id = ?1 AND target_key = ?2",
+                        params![message_id, target, now],
+                    )?;
+                    append_imported_observer(
+                        transaction,
+                        event,
+                        message_id,
+                        &FeedEvent::Fetched {
+                            message_id: message_id.clone(),
+                            recipient: recipient.clone(),
+                        },
+                    )?;
+                } else {
+                    transaction.execute(
+                        "UPDATE exposures SET state = ?3, updated_at = ?4 WHERE message_id = ?1 AND target_key = ?2",
+                        params![message_id, target, exposure, now],
+                    )?;
+                    append_imported_observer(
+                        transaction,
+                        event,
+                        message_id,
+                        &FeedEvent::Exposure {
+                            message_id: message_id.clone(),
+                            recipient: recipient.clone(),
+                            state: exposure.clone(),
+                        },
+                    )?;
+                }
+            }
+        }
+        PeerPayload::Presence { session, epoch } => {
+            ensure!(
+                session.registration.session.machine == origin,
+                "peer presence is not origin-owned"
+            );
+            ensure!(
+                session.registration.project == event.project,
+                "peer presence project differs from event"
+            );
+            ensure!(*epoch > 0, "peer presence epoch must be positive");
+            ensure!(
+                !session.ended || (!session.connected && !session.registration.eligible),
+                "ended peer session cannot be active"
+            );
+            let previous: Option<(String, i64)> = transaction.query_row(
+                "SELECT payload_json, epoch FROM remote_sessions WHERE machine = ?1 AND incarnation = ?2",
+                params![origin, session.registration.session.incarnation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            if let Some((raw, old_epoch)) = &previous {
+                let old: SessionState = serde_json::from_str(raw)?;
+                ensure!(
+                    !old.ended || session.ended,
+                    "ended peer incarnation cannot revive"
+                );
+                ensure!(
+                    *epoch > u64::try_from(*old_epoch)?,
+                    "peer presence epoch did not advance"
+                );
+                ensure!(
+                    old.registration.project == event.project,
+                    "peer incarnation changed project"
+                );
+            }
+            transaction.execute(
+                "INSERT INTO remote_sessions(machine, incarnation, project, payload_json, epoch)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(machine, incarnation) DO UPDATE SET
+                 payload_json = excluded.payload_json, epoch = excluded.epoch",
+                params![
+                    origin,
+                    session.registration.session.incarnation,
+                    event.project,
+                    serde_json::to_string(session)?,
+                    to_sql_integer(*epoch)?
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn append_imported_observer(
+    transaction: &rusqlite::Transaction<'_>,
+    event: &PeerEvent,
+    message_id: &str,
+    feed: &FeedEvent,
+) -> Result<()> {
+    let sequence = next_sequence(
+        transaction,
+        "SELECT COALESCE(MAX(project_seq), 0) + 1 FROM events WHERE project = ?1",
+        &event.project,
+    )?;
+    let (kind, payload) = match feed {
+        FeedEvent::Message { message } => ("message", serde_json::to_string(message)?),
+        FeedEvent::Receipt { .. } => ("receipt", serde_json::to_string(feed)?),
+        FeedEvent::Exposure { .. } => ("exposure", serde_json::to_string(feed)?),
+        FeedEvent::Fetched { .. } => ("fetched", serde_json::to_string(feed)?),
+    };
+    transaction.execute(
+        "INSERT INTO events(event_id, project, project_seq, payload_json, kind, message_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            event.id,
+            event.project,
+            to_sql_integer(sequence)?,
+            payload,
+            kind,
+            message_id
+        ],
+    )?;
     Ok(())
 }
 
@@ -756,6 +1352,10 @@ fn migrate(connection: &mut Connection, version: u32) -> Result<()> {
     if version < 5 {
         transaction.execute_batch(include_str!("migration-005.sql"))?;
     }
+    if version < 6 {
+        transaction.execute_batch(include_str!("migration-006.sql"))?;
+        backfill_peer_outbox(&transaction)?;
+    }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -789,6 +1389,10 @@ fn next_sequence(transaction: &rusqlite::Transaction<'_>, query: &str, scope: &s
 
 fn to_sql_integer(value: u64) -> Result<i64> {
     i64::try_from(value).context("Chat sequence is outside SQLite's integer range")
+}
+
+fn schema_version(connection: &Connection) -> Result<u32> {
+    Ok(connection.pragma_query_value(None, "user_version", |row| row.get(0))?)
 }
 
 #[cfg(unix)]
@@ -850,10 +1454,13 @@ fn validate_database_file(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use chrono::DateTime;
-    use rusqlite::Connection;
+    use rusqlite::{params, Connection};
 
     use super::Store;
-    use crate::chat::types::{Actor, Draft, SessionRef, Target};
+    use crate::chat::types::{
+        Actor, Draft, ImportResult, PeerEvent, PeerPayload, Registration, SessionRef, SessionState,
+        Target,
+    };
 
     #[test]
     fn mixed_preview_and_full_attempt_preserves_inbox_order() {
@@ -1200,6 +1807,275 @@ mod tests {
         assert!(store.send(&sender, &draft).is_err());
         draft.key = "intentional-new-send".into();
         assert_ne!(first.id, store.send(&sender, &draft).unwrap().id);
+    }
+
+    #[test]
+    fn imported_message_is_durable_and_never_reexported() {
+        let dir = tempfile::tempdir().unwrap();
+        let pc_id = "11111111-1111-4111-8111-111111111111";
+        let mac_id = "22222222-2222-4222-8222-222222222222";
+        let project = "33333333-3333-4333-8333-333333333333";
+        let mut pc = Store::open(&dir.path().join("pc.sqlite3")).unwrap();
+        let mut mac = Store::open(&dir.path().join("mac.sqlite3")).unwrap();
+        pc.set_machine(pc_id).unwrap();
+        mac.set_machine(mac_id).unwrap();
+        let sender = Actor::Agent(SessionRef {
+            machine: pc_id.into(),
+            incarnation: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+        });
+        let recipient = SessionRef {
+            machine: mac_id.into(),
+            incarnation: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
+        };
+        let message = pc
+            .send(
+                &sender,
+                &Draft {
+                    key: "one".into(),
+                    project: project.into(),
+                    to: vec![Target::Agent(recipient.clone())],
+                    body: "Pause after the tool".into(),
+                    reply_to: None,
+                },
+            )
+            .unwrap();
+        let event = pc.export_events(project, 0, 10).unwrap().remove(0);
+        let allowed = vec![project.to_owned()];
+        assert!(matches!(
+            mac.import_event(pc_id, &event, &allowed).unwrap(),
+            ImportResult::Applied { through: 1 }
+        ));
+        assert!(matches!(
+            mac.import_event(pc_id, &event, &allowed).unwrap(),
+            ImportResult::Duplicate { through: 1 }
+        ));
+        assert_eq!(
+            mac.message(&message.id).unwrap().draft.body,
+            "Pause after the tool"
+        );
+        let outbound = mac.export_events(project, 0, 10).unwrap();
+        assert!(!outbound
+            .iter()
+            .any(|event| matches!(event.payload, PeerPayload::Message { .. })));
+        assert_eq!(
+            outbound
+                .iter()
+                .filter(|event| matches!(event.payload, PeerPayload::Receipt { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn peer_import_rejects_conflicts_gaps_and_unauthorized_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let pc_id = "11111111-1111-4111-8111-111111111111";
+        let mac_id = "22222222-2222-4222-8222-222222222222";
+        let project = "33333333-3333-4333-8333-333333333333";
+        let recipient = SessionRef {
+            machine: mac_id.into(),
+            incarnation: uuid::Uuid::new_v4().to_string(),
+        };
+        let mut pc = Store::open(&dir.path().join("pc.sqlite3")).unwrap();
+        let mut mac = Store::open(&dir.path().join("mac.sqlite3")).unwrap();
+        pc.set_machine(pc_id).unwrap();
+        mac.set_machine(mac_id).unwrap();
+        pc.send(
+            &Actor::Human {
+                machine: pc_id.into(),
+            },
+            &Draft {
+                key: "k".into(),
+                project: project.into(),
+                to: vec![Target::Agent(recipient)],
+                body: "first".into(),
+                reply_to: None,
+            },
+        )
+        .unwrap();
+        let event = pc.export_events(project, 0, 10).unwrap().remove(0);
+        let allowed = vec![project.to_owned()];
+        assert!(mac.import_event(mac_id, &event, &allowed).is_err());
+        assert!(mac.import_event(pc_id, &event, &[]).is_err());
+        let mut gap = event.clone();
+        gap.seq = 2;
+        assert!(mac.import_event(pc_id, &gap, &allowed).is_err());
+        assert!(matches!(
+            mac.import_event(pc_id, &event, &allowed).unwrap(),
+            ImportResult::Applied { through: 1 }
+        ));
+        let mut changed = event.clone();
+        if let PeerPayload::Message { message } = &mut changed.payload {
+            message.draft.body = "changed".into();
+        }
+        assert!(mac.import_event(pc_id, &changed, &allowed).is_err());
+        let mut reused = event.clone();
+        reused.seq = 2;
+        assert!(mac.import_event(pc_id, &reused, &allowed).is_err());
+        assert_eq!(
+            mac.connection
+                .query_row("SELECT COUNT(*) FROM imported_events", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn peer_import_and_receipt_replay_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let pc_id = "11111111-1111-4111-8111-111111111111";
+        let mac_id = "22222222-2222-4222-8222-222222222222";
+        let project = "33333333-3333-4333-8333-333333333333";
+        let path = dir.path().join("mac.sqlite3");
+        let recipient = SessionRef {
+            machine: mac_id.into(),
+            incarnation: uuid::Uuid::new_v4().to_string(),
+        };
+        let mut pc = Store::open(&dir.path().join("pc.sqlite3")).unwrap();
+        let mut mac = Store::open(&path).unwrap();
+        pc.set_machine(pc_id).unwrap();
+        mac.set_machine(mac_id).unwrap();
+        let message = pc
+            .send(
+                &Actor::Human {
+                    machine: pc_id.into(),
+                },
+                &Draft {
+                    key: "k".into(),
+                    project: project.into(),
+                    to: vec![Target::Agent(recipient.clone())],
+                    body: "first".into(),
+                    reply_to: None,
+                },
+            )
+            .unwrap();
+        let event = pc.export_events(project, 0, 10).unwrap().remove(0);
+        let allowed = vec![project.to_owned()];
+        mac.import_event(pc_id, &event, &allowed).unwrap();
+        drop(mac);
+        let mut mac = Store::open(&path).unwrap();
+        assert!(matches!(
+            mac.import_event(pc_id, &event, &allowed).unwrap(),
+            ImportResult::Duplicate { through: 1 }
+        ));
+        let receipt = mac.export_events(project, 0, 10).unwrap().remove(0);
+        assert!(matches!(
+            pc.import_event(mac_id, &receipt, &allowed).unwrap(),
+            ImportResult::Applied { through: 1 }
+        ));
+        let target = serde_json::to_string(&Target::Agent(recipient)).unwrap();
+        let state: String = pc
+            .connection
+            .query_row(
+                "SELECT state FROM delivery_receipts WHERE message_id = ?1 AND target_key = ?2",
+                params![message.id, target],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "received_remotely");
+        pc.record_peer_ack(mac_id, project, 1).unwrap();
+        assert!(pc.record_peer_ack(mac_id, project, 2).is_err());
+    }
+
+    #[test]
+    fn peer_import_rollback_leaves_no_message_or_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let pc_id = "11111111-1111-4111-8111-111111111111";
+        let mac_id = "22222222-2222-4222-8222-222222222222";
+        let project = "33333333-3333-4333-8333-333333333333";
+        let mut pc = Store::open(&dir.path().join("pc.sqlite3")).unwrap();
+        let mut mac = Store::open(&dir.path().join("mac.sqlite3")).unwrap();
+        pc.set_machine(pc_id).unwrap();
+        mac.set_machine(mac_id).unwrap();
+        let message = pc
+            .send(
+                &Actor::Human {
+                    machine: pc_id.into(),
+                },
+                &Draft {
+                    key: "one".into(),
+                    project: project.into(),
+                    to: vec![Target::Agent(SessionRef {
+                        machine: mac_id.into(),
+                        incarnation: uuid::Uuid::new_v4().to_string(),
+                    })],
+                    body: "atomic".into(),
+                    reply_to: None,
+                },
+            )
+            .unwrap();
+        let event = pc.export_events(project, 0, 10).unwrap().remove(0);
+        mac.connection
+            .execute_batch(
+                "CREATE TRIGGER fail_import BEFORE INSERT ON imported_events
+             BEGIN SELECT RAISE(ABORT, 'interrupted import'); END;",
+            )
+            .unwrap();
+        assert!(mac.import_event(pc_id, &event, &[project.into()]).is_err());
+        assert!(mac.message(&message.id).is_err());
+        assert!(mac.export_events(project, 0, 10).unwrap().is_empty());
+        mac.connection
+            .execute_batch("DROP TRIGGER fail_import")
+            .unwrap();
+        assert!(matches!(
+            mac.import_event(pc_id, &event, &[project.into()]).unwrap(),
+            ImportResult::Applied { through: 1 }
+        ));
+    }
+
+    #[test]
+    fn ended_remote_presence_cannot_reopen_incarnation() {
+        let dir = tempfile::tempdir().unwrap();
+        let pc_id = "11111111-1111-4111-8111-111111111111";
+        let mac_id = "22222222-2222-4222-8222-222222222222";
+        let project = "33333333-3333-4333-8333-333333333333";
+        let mut mac = Store::open(&dir.path().join("mac.sqlite3")).unwrap();
+        mac.set_machine(mac_id).unwrap();
+        let mut state = SessionState {
+            registration: Registration {
+                session: SessionRef {
+                    machine: pc_id.into(),
+                    incarnation: uuid::Uuid::new_v4().to_string(),
+                },
+                project: project.into(),
+                name: "pm".into(),
+                client: "codex".into(),
+                native_id: "native".into(),
+                process_start: "boot:42".into(),
+                eligible: false,
+            },
+            connected: false,
+            ended: true,
+        };
+        let event = PeerEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            origin: pc_id.into(),
+            seq: 1,
+            project: project.into(),
+            payload: PeerPayload::Presence {
+                session: state.clone(),
+                epoch: 1,
+            },
+        };
+        mac.import_event(pc_id, &event, &[project.into()]).unwrap();
+        state.ended = false;
+        state.connected = true;
+        state.registration.eligible = true;
+        let revived = PeerEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            seq: 2,
+            payload: PeerPayload::Presence {
+                session: state,
+                epoch: 2,
+            },
+            ..event
+        };
+        assert!(mac
+            .import_event(pc_id, &revived, &[project.into()])
+            .is_err());
+        assert_eq!(mac.load_remote_sessions().unwrap().len(), 1);
+        assert!(mac.load_remote_sessions().unwrap()[0].ended);
     }
 
     #[test]

@@ -66,7 +66,8 @@ pub struct Registry<'a> {
 impl<'a> Registry<'a> {
     pub fn new(store: &'a mut Store) -> Result<Self> {
         let machine = store.machine()?;
-        let entries = store.load_sessions()?;
+        let mut entries = store.load_sessions()?;
+        entries.extend(store.load_remote_sessions()?);
         Ok(Self {
             store,
             machine,
