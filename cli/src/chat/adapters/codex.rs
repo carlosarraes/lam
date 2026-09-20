@@ -6,6 +6,138 @@ pub fn encode_untrusted_text(text: &str) -> anyhow::Result<String> {
 }
 
 #[cfg(target_os = "linux")]
+pub(super) fn submit_queue(
+    process: &super::binding::ProcessEvidence,
+    stream: &mut std::os::unix::net::UnixStream,
+    native_id: &str,
+    attempt: &crate::chat::types::Attempt,
+    deadline: std::time::Instant,
+) -> crate::chat::types::Handoff {
+    use crate::chat::{daemon, protocol, types::Handoff};
+    use anyhow::ensure;
+    use serde_json::{json, Value};
+    use tungstenite::{Message, WebSocket};
+
+    fn reply<S: std::io::Read + std::io::Write>(
+        socket: &mut WebSocket<S>,
+        id: &Value,
+    ) -> anyhow::Result<Value> {
+        for _ in 0..32 {
+            let frame = socket.read()?;
+            if frame.is_ping() || frame.is_pong() {
+                continue;
+            }
+            let response: Value = serde_json::from_str(frame.to_text()?)?;
+            if response.get("id").is_none() && response.get("method").is_some() {
+                continue;
+            }
+            ensure!(response["id"] == *id, "native response correlation changed");
+            return Ok(response);
+        }
+        anyhow::bail!("native response notification bound exceeded")
+    }
+
+    let mut queue_started = false;
+    let result = (|| -> anyhow::Result<Handoff> {
+        protocol::validate_uuid(native_id)?;
+        protocol::validate_uuid(&attempt.id)?;
+        process.validate()?;
+        let peer = daemon::peer_identity(stream)?;
+        ensure!(
+            peer.pid == Some(process.pid) && peer.uid == process.uid,
+            "native socket belongs to another backend"
+        );
+        let (mut socket, _) = tungstenite::client(
+            "ws://localhost/",
+            daemon::DeadlineStream::until(stream, deadline),
+        )
+        .map_err(|_| anyhow::anyhow!("native WebSocket handshake failed"))?;
+        socket.set_config(|config| {
+            config.max_message_size = Some(65_536);
+            config.max_frame_size = Some(65_536);
+        });
+        socket.send(Message::Text(
+            json!({
+                "id":"initialize", "method":"initialize", "params":{
+                    "clientInfo":{"name":"lam-chat","version":env!("CARGO_PKG_VERSION")},
+                    "capabilities":{"experimentalApi":true,"requestAttestation":false}
+                }
+            })
+            .to_string()
+            .into(),
+        ))?;
+        ensure!(
+            reply(&mut socket, &json!("initialize"))?
+                .get("result")
+                .is_some(),
+            "native initialization refused"
+        );
+        socket.send(Message::Text(
+            json!({"method":"initialized"}).to_string().into(),
+        ))?;
+        socket.send(Message::Text(
+            json!({
+                "id":"state", "method":"thread/read",
+                "params":{"threadId":native_id,"includeTurns":false}
+            })
+            .to_string()
+            .into(),
+        ))?;
+        let state = reply(&mut socket, &json!("state"))?;
+        let thread = &state["result"]["thread"];
+        ensure!(thread["id"] == native_id, "native thread identity changed");
+        ensure!(
+            matches!(thread["status"]["type"].as_str(), Some("idle" | "active"))
+                && thread["canAcceptDirectInput"] != false,
+            "native thread cannot accept queued input"
+        );
+        process.validate()?;
+        let input = json!([{"type":"text","text":attempt.batch.text,"text_elements":[]}]);
+        let request = json!({
+            "id":"queue", "method":"thread/queue/add",
+            "params":{"threadId":native_id,"clientUserMessageId":attempt.id,"input":input}
+        })
+        .to_string();
+        ensure!(
+            request.len() <= 8192,
+            "native queue envelope exceeds its bound"
+        );
+        // A failed write may have submitted part or all of the request. Never
+        // turn missing/malformed acknowledgement into a safe automatic retry.
+        queue_started = true;
+        socket.send(Message::Text(request.into()))?;
+        let response = reply(&mut socket, &json!("queue"))?;
+        ensure!(
+            response.get("error").is_none(),
+            "native queue returned an uncertain error"
+        );
+        let queued = &response["result"]["queuedSubmission"];
+        let id = queued["id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("native queue receipt missing"))?;
+        protocol::validate_uuid(id)?;
+        ensure!(
+            queued["clientUserMessageId"] == attempt.id && queued["input"] == input,
+            "native queue receipt does not match the attempt"
+        );
+        Ok(Handoff::Accepted {
+            receipt: format!("Codex queued message {id} for thread {native_id}"),
+        })
+    })();
+    result.unwrap_or_else(|_| {
+        if queue_started {
+            Handoff::Unknown {
+                reason: "Codex queue submission acknowledgement is unconfirmed".into(),
+            }
+        } else {
+            Handoff::NotSubmitted {
+                reason: "Codex queue validation or connection failed before submission".into(),
+            }
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn write_output(fd: i32, output: &str, deadline: std::time::Instant) -> anyhow::Result<()> {
     use std::{
         io::Write,
@@ -229,6 +361,132 @@ impl HookInput {
 mod tests {
     #[cfg(target_os = "linux")]
     use super::write_output;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn queue_transport_checks_exact_target_and_distinguishes_handoff_uncertainty() {
+        use crate::chat::types::{Attempt, Handoff, RenderedBatch, SessionRef};
+        use serde_json::json;
+        use std::{
+            os::unix::net::UnixStream,
+            time::{Duration, Instant},
+        };
+        const THREAD: &str = "d0000000-0000-4000-8000-000000000001";
+        const ATTEMPT: &str = "d0000000-0000-4000-8000-000000000002";
+        const QUEUED: &str = "d0000000-0000-4000-8000-000000000003";
+        let process = super::super::binding::ProcessEvidence::read(std::process::id()).unwrap();
+        let attempt = Attempt {
+            id: ATTEMPT.into(),
+            recipient: SessionRef {
+                machine: THREAD.into(),
+                incarnation: ATTEMPT.into(),
+            },
+            batch: RenderedBatch {
+                text: "Untrusted peer data: preserve native permissions.".into(),
+                ..Default::default()
+            },
+        };
+        for case in [
+            "accepted",
+            "active",
+            "wrong-thread",
+            "not-loaded",
+            "before-write",
+            "refused",
+            "internal-error",
+            "wrong-id",
+            "wrong-body",
+            "after-write",
+            "deadline",
+        ] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let expected_text = attempt.batch.text.clone();
+            let server = std::thread::spawn(move || {
+                let Ok(mut ws) = tungstenite::accept(server) else {
+                    return;
+                };
+                let read = |ws: &mut tungstenite::WebSocket<UnixStream>| -> serde_json::Value {
+                    serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap()
+                };
+                let init = read(&mut ws);
+                assert_eq!(init["method"], "initialize");
+                ws.send(tungstenite::Message::Text(json!({"id":init["id"],"result":{"userAgent":"codex/0.153.4","platformFamily":"unix","platformOs":"linux","codexHome":"/owned"}}).to_string().into())).unwrap();
+                assert_eq!(read(&mut ws)["method"], "initialized");
+                let state = read(&mut ws);
+                assert_eq!(state["method"], "thread/read");
+                assert_eq!(
+                    state["params"],
+                    json!({"threadId":THREAD,"includeTurns":false})
+                );
+                if case == "before-write" {
+                    return;
+                }
+                ws.send(tungstenite::Message::Text(json!({"id":state["id"],"result":{"thread":{"id":if case=="wrong-thread" { QUEUED } else { THREAD },"status":{"type":match case {"not-loaded"=>"notLoaded","active"=>"active",_=>"idle"}}}}}).to_string().into())).unwrap();
+                if matches!(case, "wrong-thread" | "not-loaded") {
+                    assert!(ws.read().is_err(), "invalid target received queue request");
+                    return;
+                }
+                let queue = read(&mut ws);
+                assert_eq!(queue["method"], "thread/queue/add");
+                assert_eq!(
+                    queue["params"],
+                    json!({"threadId":THREAD,"clientUserMessageId":ATTEMPT,"input":[{"type":"text","text":expected_text,"text_elements":[]}]})
+                );
+                if case == "after-write" {
+                    return;
+                }
+                if case == "deadline" {
+                    std::thread::sleep(Duration::from_millis(100));
+                    return;
+                }
+                let reply = if matches!(case, "refused" | "internal-error") {
+                    json!({"id":queue["id"],"error":{"code":if case == "refused" { -32001 } else { -32000 },"message":"SENSITIVE fixture error must not be retained"}})
+                } else {
+                    json!({"id":queue["id"],"result":{"queuedSubmission":{"id":QUEUED,"clientUserMessageId":if case=="wrong-id" { THREAD } else { ATTEMPT },"input":if case=="wrong-body" { json!([]) } else { queue["params"]["input"].clone() }}}})
+                };
+                ws.send(tungstenite::Message::Text(reply.to_string().into()))
+                    .unwrap();
+            });
+            let started = Instant::now();
+            let outcome = super::submit_queue(
+                &process,
+                &mut client,
+                THREAD,
+                &attempt,
+                started + Duration::from_millis(75),
+            );
+            drop(client);
+            server.join().unwrap();
+            match case {
+                "accepted" | "active" => assert!(
+                    matches!(&outcome, Handoff::Accepted {receipt} if receipt.contains(QUEUED) && receipt.contains(THREAD)),
+                    "{case}: {outcome:?}"
+                ),
+                "wrong-thread" | "not-loaded" | "before-write" => assert!(
+                    matches!(outcome, Handoff::NotSubmitted { .. }),
+                    "{case}: {outcome:?}"
+                ),
+                "refused" => assert!(
+                    matches!(outcome, Handoff::Unknown { .. }),
+                    "an unproven overload response is uncertain: {outcome:?}"
+                ),
+                _ => assert!(
+                    matches!(outcome, Handoff::Unknown { .. }),
+                    "{case}: {outcome:?}"
+                ),
+            }
+            assert!(!serde_json::to_string(&outcome)
+                .unwrap()
+                .contains("SENSITIVE"));
+            assert!(started.elapsed() < Duration::from_millis(500));
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

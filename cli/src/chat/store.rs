@@ -323,6 +323,19 @@ impl Store {
         Ok(Some(attempt))
     }
 
+    pub(super) fn has_pending(&self, recipient: &SessionRef) -> Result<bool> {
+        let target = serde_json::to_string(&Target::Agent(recipient.clone()))?;
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM inbox_entries i
+             JOIN delivery_receipts d ON d.message_id = i.message_id AND d.target_key = i.recipient_key
+             JOIN exposures x ON x.message_id = i.message_id AND x.target_key = i.recipient_key
+             WHERE i.recipient_key = ?1 AND d.state = 'queued'
+               AND (x.fetched_at IS NULL OR d.explicit_retry = 1))",
+            [&target],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn finish(&mut self, attempt_id: &str, outcome: Handoff) -> Result<()> {
         let evidence = match &outcome {
             Handoff::Accepted { receipt } => receipt,

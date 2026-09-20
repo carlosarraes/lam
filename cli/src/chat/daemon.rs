@@ -3,7 +3,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Sha256;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -713,6 +713,16 @@ struct Service {
     cursor_key: String,
     limits: Limits,
     hook_deadlines: BTreeMap<String, Instant>,
+    queue: HashMap<SessionRef, QueueWake>,
+    next_queue_token: u64,
+}
+
+struct QueueWake {
+    registration: Registration,
+    stop_epoch: u64,
+    external_state: ClientEvent,
+    ready: bool,
+    in_flight: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -727,6 +737,107 @@ struct Cursor {
 }
 
 impl Service {
+    fn observe_native(
+        &mut self,
+        registration: &Registration,
+        event: ClientEvent,
+        epoch: u64,
+    ) -> Result<bool> {
+        self.verify_registration(registration)?;
+        if !self.store.observe(&registration.session, event, epoch)? {
+            return Ok(false);
+        }
+        let ready = event == ClientEvent::Idle && self.store.has_pending(&registration.session)?;
+        let wake = self
+            .queue
+            .entry(registration.session.clone())
+            .or_insert_with(|| QueueWake {
+                registration: registration.clone(),
+                stop_epoch: epoch,
+                external_state: event,
+                ready: false,
+                in_flight: None,
+            });
+        wake.registration = registration.clone();
+        wake.external_state = event;
+        // A newer native observation supersedes any worker still holding an
+        // older Stop token. Its late claim or completion cannot own this wake.
+        wake.in_flight = None;
+        if event == ClientEvent::Idle {
+            wake.stop_epoch = epoch;
+            wake.ready = ready;
+        } else {
+            wake.ready = false;
+        }
+        Ok(true)
+    }
+
+    fn next_queue(&mut self) -> Option<(Registration, u64)> {
+        let wake = self
+            .queue
+            .values_mut()
+            .find(|wake| wake.ready && wake.in_flight.is_none())?;
+        self.next_queue_token = self.next_queue_token.wrapping_add(1);
+        let token = self.next_queue_token;
+        wake.ready = false;
+        wake.in_flight = Some(token);
+        Some((wake.registration.clone(), token))
+    }
+
+    fn queue_done(&mut self, session: &SessionRef, token: u64) {
+        if let Some(wake) = self.queue.get_mut(session) {
+            if wake.in_flight == Some(token) {
+                wake.in_flight = None;
+            }
+        }
+    }
+
+    fn note_arrival(&mut self, message: &Message) {
+        for target in &message.draft.to {
+            if let Target::Agent(session) = target {
+                if let Some(wake) = self.queue.get_mut(session) {
+                    if wake.external_state == ClientEvent::Idle && wake.in_flight.is_none() {
+                        wake.ready = true;
+                    }
+                }
+            }
+        }
+    }
+
+    fn queue_claim(
+        &mut self,
+        registration: &Registration,
+        token: u64,
+        event: ClientEvent,
+        epoch: u64,
+        fetch_pending: bool,
+    ) -> Result<Option<super::types::Attempt>> {
+        if fetch_pending || !matches!(event, ClientEvent::Idle | ClientEvent::Busy) {
+            return Ok(None);
+        }
+        let Some(wake) = self.queue.get(&registration.session) else {
+            return Ok(None);
+        };
+        if wake.in_flight != Some(token)
+            || wake.external_state != ClientEvent::Idle
+            || wake.registration != *registration
+            || epoch <= wake.stop_epoch
+        {
+            return Ok(None);
+        }
+        if self.registration_ended(registration)?
+            || !Registry::new(&mut self.store)?
+                .state(&registration.session)
+                .is_some_and(|state| state.registration.eligible)
+        {
+            return Ok(None);
+        }
+        if !self.store.observe(&registration.session, event, epoch)? {
+            return Ok(None);
+        }
+        self.store.claim(&registration.session, self.limits)
+    }
+
     fn open(path: &Path, machine: &str) -> Result<Self> {
         let mut store = Store::open(path)?;
         store.set_machine(machine)?;
@@ -739,6 +850,8 @@ impl Service {
             cursor_key,
             limits: super::config::DEFAULT_LIMITS,
             hook_deadlines: BTreeMap::new(),
+            queue: HashMap::new(),
+            next_queue_token: 0,
         })
     }
 
@@ -780,6 +893,7 @@ impl Service {
                 Operation::End {} => {
                     self.verify_registration(registration)?;
                     Registry::new(&mut self.store)?.end(&registration.session)?;
+                    self.queue.remove(&registration.session);
                     Ok(json!({"ended": registration.session}))
                 }
                 Operation::Register {} => {
@@ -792,6 +906,9 @@ impl Service {
                     self.verify_registration(registration)?;
                     Registry::new(&mut self.store)?
                         .set_eligible(&registration.session, eligible)?;
+                    if !eligible {
+                        self.queue.remove(&registration.session);
+                    }
                     Ok(json!({"eligible": eligible}))
                 }
                 Operation::Delivery { event, epoch } => {
@@ -830,7 +947,9 @@ impl Service {
                     );
                 }
                 self.validate_targets(&draft)?;
-                Ok(serde_json::to_value(self.store.send(&actor, &draft)?)?)
+                let message = self.store.send(&actor, &draft)?;
+                self.note_arrival(&message);
+                Ok(serde_json::to_value(message)?)
             }
             Operation::Reply { id, key, body, all } => {
                 let original = self.show(context, &id)?;
@@ -894,20 +1013,26 @@ impl Service {
             .is_some_and(|s| s.registration.eligible && !s.ended);
         ensure!(eligible, "Chat recipient is ineligible");
         if fetch_pending {
-            self.store.observe(&registration.session, event, epoch)?;
+            self.observe_native(registration, event, epoch)?;
             return Ok(Value::Null);
         }
         ensure!(
             event != ClientEvent::Hook || self.hook_deadlines.len() < MAX_CONNECTIONS,
             "Chat hook handoff capacity is full"
         );
-        let attempt = super::delivery::request(
-            &mut self.store,
-            &registration.session,
-            event,
-            epoch,
-            self.limits,
-        )?;
+        if !self.observe_native(registration, event, epoch)? {
+            return Ok(Value::Null);
+        }
+        // Direct integration delivery consumes this observation. Queue wakes
+        // are reserved for the asynchronous Stop path only.
+        if let Some(wake) = self.queue.get_mut(&registration.session) {
+            wake.ready = false;
+        }
+        let attempt = if matches!(event, ClientEvent::Idle | ClientEvent::Hook) {
+            self.store.claim(&registration.session, self.limits)?
+        } else {
+            None
+        };
         if event == ClientEvent::Hook {
             if let Some(attempt) = &attempt {
                 // Claim happens after hook startup. Its two-second expiry is
@@ -1176,6 +1301,232 @@ pub(super) mod tests {
             process_start: format!("boot:1:{id}"),
             eligible: true,
         }
+    }
+
+    #[test]
+    fn queue_claim_requires_current_stop_token_and_excludes_hook_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = Service::open(&dir.path().join("chat.sqlite3"), MACHINE).unwrap();
+        let recipient = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        let integration = VerifiedContext::Integration(recipient.clone());
+        service
+            .handle(&integration, Operation::Register {})
+            .unwrap();
+        let send = |service: &mut Service, key: &str| {
+            service
+                .handle(
+                    &VerifiedContext::Observer,
+                    Operation::Send {
+                        draft: Draft {
+                            key: key.into(),
+                            project: PROJECT.into(),
+                            to: vec![Target::Agent(recipient.session.clone())],
+                            body: "owned queued message".into(),
+                            reply_to: None,
+                        },
+                    },
+                )
+                .unwrap();
+        };
+        service
+            .observe_native(&recipient, ClientEvent::Busy, 1)
+            .unwrap();
+        send(&mut service, "during-user-turn");
+        assert!(
+            service.next_queue().is_none(),
+            "arrival must not manufacture Stop eligibility"
+        );
+        service
+            .observe_native(&recipient, ClientEvent::Idle, 2)
+            .unwrap();
+        let (scheduled, token) = service.next_queue().unwrap();
+        assert_eq!(scheduled, recipient);
+        service
+            .observe_native(&recipient, ClientEvent::Busy, 3)
+            .unwrap();
+        assert!(service
+            .queue_claim(&recipient, token, ClientEvent::Busy, 4, false)
+            .unwrap()
+            .is_none());
+        service.queue_done(&recipient.session, token);
+        assert!(
+            service.next_queue().is_none(),
+            "stale work must not rearm itself"
+        );
+
+        service
+            .observe_native(&recipient, ClientEvent::Idle, 5)
+            .unwrap();
+        let (_, token) = service.next_queue().unwrap();
+        assert!(
+            service
+                .queue_claim(&recipient, token, ClientEvent::Busy, 5, false)
+                .unwrap()
+                .is_none(),
+            "persisted epoch must be fresh"
+        );
+        let attempt = service
+            .queue_claim(&recipient, token, ClientEvent::Busy, 6, false)
+            .unwrap()
+            .unwrap();
+        // Active is a legitimate queue snapshot while Stop is returning. It is
+        // recorded as Busy, not fabricated Idle, and does not revoke Stop.
+        let db = rusqlite::Connection::open(dir.path().join("chat.sqlite3")).unwrap();
+        let state: String = db
+            .query_row("SELECT state FROM delivery_observations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "\"busy\"");
+        send(&mut service, "during-handoff");
+        assert!(service.next_queue().is_none());
+        assert!(service
+            .delivery(&recipient, ClientEvent::Hook, 7, false)
+            .unwrap()
+            .is_null());
+        service
+            .store
+            .finish(
+                &attempt.id,
+                super::super::types::Handoff::NotSubmitted {
+                    reason: "owned pre-write failure".into(),
+                },
+            )
+            .unwrap();
+        service.queue_done(&recipient.session, token);
+        assert!(
+            service.next_queue().is_none(),
+            "newer Hook revokes queued work including arrival during handoff"
+        );
+
+        service
+            .observe_native(&recipient, ClientEvent::Idle, 8)
+            .unwrap();
+        let (_, token) = service.next_queue().unwrap();
+        let attempt = service
+            .queue_claim(&recipient, token, ClientEvent::Idle, 9, false)
+            .unwrap()
+            .unwrap();
+        service
+            .store
+            .finish(
+                &attempt.id,
+                super::super::types::Handoff::NotSubmitted {
+                    reason: "owned pre-write failure".into(),
+                },
+            )
+            .unwrap();
+        service.queue_done(&recipient.session, token);
+        assert!(
+            service.next_queue().is_none(),
+            "NotSubmitted completion is not an external wake"
+        );
+        send(&mut service, "later-legitimate-arrival");
+        assert!(service.next_queue().is_some());
+    }
+
+    #[test]
+    fn opt_out_revokes_a_pending_queue_wake_before_native_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = Service::open(&dir.path().join("chat.sqlite3"), MACHINE).unwrap();
+        let recipient = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        let integration = VerifiedContext::Integration(recipient.clone());
+        service
+            .handle(&integration, Operation::Register {})
+            .unwrap();
+        service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Send {
+                    draft: Draft {
+                        key: "before-stop".into(),
+                        project: PROJECT.into(),
+                        to: vec![Target::Agent(recipient.session.clone())],
+                        body: "pending".into(),
+                        reply_to: None,
+                    },
+                },
+            )
+            .unwrap();
+        service
+            .observe_native(&recipient, ClientEvent::Idle, 1)
+            .unwrap();
+        service
+            .handle(&integration, Operation::SetState { eligible: false })
+            .unwrap();
+        assert!(service.next_queue().is_none());
+    }
+
+    #[test]
+    fn arrival_after_empty_stop_wakes_once_without_replaying_a_stale_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = Service::open(&dir.path().join("chat.sqlite3"), MACHINE).unwrap();
+        let recipient = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        let integration = VerifiedContext::Integration(recipient.clone());
+        service
+            .handle(&integration, Operation::Register {})
+            .unwrap();
+        service
+            .observe_native(&recipient, ClientEvent::Idle, 1)
+            .unwrap();
+        assert!(service.next_queue().is_none());
+        service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Send {
+                    draft: Draft {
+                        key: "after-empty-stop".into(),
+                        project: PROJECT.into(),
+                        to: vec![Target::Agent(recipient.session.clone())],
+                        body: "new arrival".into(),
+                        reply_to: None,
+                    },
+                },
+            )
+            .unwrap();
+        let (_, token) = service.next_queue().unwrap();
+        assert!(service.next_queue().is_none());
+        service.queue_done(&recipient.session, token);
+        service
+            .observe_native(&recipient, ClientEvent::Idle, 1)
+            .unwrap();
+        assert!(service.next_queue().is_none());
+    }
+
+    #[test]
+    fn newer_stop_revokes_an_older_queue_owner_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = Service::open(&dir.path().join("chat.sqlite3"), MACHINE).unwrap();
+        let recipient = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        let integration = VerifiedContext::Integration(recipient.clone());
+        service
+            .handle(&integration, Operation::Register {})
+            .unwrap();
+        service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Send {
+                    draft: Draft {
+                        key: "before-two-stops".into(),
+                        project: PROJECT.into(),
+                        to: vec![Target::Agent(recipient.session.clone())],
+                        body: "pending".into(),
+                        reply_to: None,
+                    },
+                },
+            )
+            .unwrap();
+        service
+            .observe_native(&recipient, ClientEvent::Idle, 1)
+            .unwrap();
+        let (_, old_token) = service.next_queue().unwrap();
+        service
+            .observe_native(&recipient, ClientEvent::Idle, 2)
+            .unwrap();
+        assert!(service
+            .queue_claim(&recipient, old_token, ClientEvent::Idle, 3, false)
+            .unwrap()
+            .is_none());
+        let (_, new_token) = service.next_queue().unwrap();
+        assert_ne!(old_token, new_token);
     }
 
     #[test]
