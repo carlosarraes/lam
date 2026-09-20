@@ -97,7 +97,13 @@ impl Machine {
                 self.child.as_mut().unwrap().try_wait().unwrap().is_none(),
                 "Chat daemon exited"
             );
-            UnixStream::connect(&self.observer).is_ok()
+            self.command()
+                .args(["chat", "status", "--json"])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| serde_json::from_slice::<Value>(&output.stdout).ok())
+                .is_some_and(|status| status["running"] == true)
         });
     }
 
