@@ -12,9 +12,9 @@ pub struct ChatArgs {
 }
 #[derive(Subcommand)]
 pub enum ChatCommand {
-    /// Run the experimental native-unverified Codex hook. Empty checks are silent; PostToolUse may supply peer context.
+    /// Run an experimental native Chat hook. Empty checks are silent; Codex PostToolUse may supply peer context.
     Hook {
-        #[arg(long, value_parser = ["codex"])]
+        #[arg(long, value_parser = ["codex", "claude"])]
         client: String,
         #[arg(long)]
         event: String,
@@ -71,8 +71,17 @@ pub enum InboxCommand {
 }
 
 pub fn run_chat(args: ChatArgs) -> Result<i32> {
-    if let ChatCommand::Hook { event, name, .. } = args.command {
-        return Ok(super::adapters::codex::run_hook(&event, name));
+    if let ChatCommand::Hook {
+        client,
+        event,
+        name,
+    } = args.command
+    {
+        return Ok(match client.as_str() {
+            "codex" => super::adapters::codex::run_hook(&event, name),
+            "claude" => super::adapters::claude::run_hook(&event, name),
+            _ => unreachable!("client is constrained by Clap"),
+        });
     }
     let paths = Paths::discover()?;
     match args.command {

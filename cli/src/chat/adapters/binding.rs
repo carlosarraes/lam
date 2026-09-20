@@ -298,6 +298,62 @@ pub(super) fn codex_check(
     Ok(())
 }
 
+pub(super) fn claude_check(
+    paths: &crate::chat::config::Paths,
+    input: &super::claude::HookInput,
+    explicit_name: Option<String>,
+    deadline: std::time::Instant,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let runtime = NativeRuntime::discover(std::process::id(), deadline)?;
+    anyhow::ensure!(
+        runtime.client == "claude",
+        "native Claude hook ancestry changed"
+    );
+    let directory = paths
+        .database
+        .parent()
+        .context("missing Chat data directory")?
+        .join("bindings");
+    let files = BindingFiles::open(&directory)?;
+    let binding = if input.hook_event_name == "SessionStart" {
+        let config = crate::chat::config::Config::load_or_create(&paths.config)?;
+        let project = config.project_for_root(&input.cwd)?;
+        let name = crate::name::pick(crate::name::Sources {
+            explicit: explicit_name,
+            lam_name: std::env::var("LAM_NAME").ok(),
+            multiplexer: None,
+        })?;
+        let candidate = NativeBinding::new(
+            "claude",
+            &runtime.version,
+            &input.session_id,
+            runtime.process,
+            &project,
+            &name,
+        )?;
+        enroll(&files, &paths.socket, candidate, deadline)?
+    } else {
+        let key = binding_locator("claude", &input.session_id, &runtime.process)?;
+        let binding = files.load(&key)?;
+        anyhow::ensure!(
+            binding.session.is_some()
+                && binding.version == runtime.version
+                && binding.process == runtime.process,
+            "native Claude hook binding is missing or changed"
+        );
+        binding
+    };
+    let credential = format!("{}.{}", binding.locator()?, binding.integration_secret);
+    let operation = if input.hook_event_name == "SessionEnd" {
+        crate::chat::protocol::Operation::End {}
+    } else {
+        crate::chat::protocol::Operation::Register {}
+    };
+    request(&paths.socket, &credential, operation, deadline)?;
+    Ok(())
+}
+
 impl Participant {
     pub fn current(
         paths: &crate::chat::config::Paths,

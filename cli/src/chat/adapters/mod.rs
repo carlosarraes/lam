@@ -10,7 +10,10 @@ pub(super) use binding::{NativeBindings, Participant};
 pub(in crate::chat) use codex::reserve_queue_epoch as reserve_codex_queue_epoch;
 #[cfg(target_os = "linux")]
 pub(in crate::chat) use codex::submit_queue_owned;
+pub mod claude;
 pub mod codex;
+#[cfg(target_os = "linux")]
+mod hooks;
 
 pub trait Adapter {
     fn validate(&self, session: &crate::chat::types::SessionRef) -> anyhow::Result<()>;
