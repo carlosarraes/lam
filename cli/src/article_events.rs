@@ -137,6 +137,8 @@ mod tests {
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    // Accepted sockets inherit the listener's nonblocking mode on macOS.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(3)))
                         .unwrap();
