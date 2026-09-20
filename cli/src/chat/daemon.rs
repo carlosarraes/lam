@@ -77,6 +77,11 @@ enum QueueAction {
         epoch: u64,
         response: SyncSender<Option<super::types::Attempt>>,
     },
+    DirectClaim {
+        registration: Registration,
+        token: u64,
+        response: SyncSender<Option<super::types::Attempt>>,
+    },
     Finish {
         attempt: String,
         outcome: super::types::Handoff,
@@ -84,6 +89,11 @@ enum QueueAction {
     Done {
         session: SessionRef,
         token: u64,
+    },
+    DirectDone {
+        session: SessionRef,
+        token: u64,
+        processed: bool,
     },
 }
 
@@ -269,6 +279,42 @@ fn run_queue_worker(
 }
 
 #[cfg(target_os = "linux")]
+fn run_direct_worker(
+    directory: std::path::PathBuf,
+    registration: Registration,
+    token: u64,
+    sender: SyncSender<QueueAction>,
+) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let result = super::adapters::claude::submit_owned(&directory, &registration, deadline, || {
+        let (response, receiver) = mpsc::sync_channel(1);
+        sender.try_send(QueueAction::DirectClaim {
+            registration: registration.clone(),
+            token,
+            response,
+        })?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .context("native Claude claim deadline expired")?;
+        Ok(receiver.recv_timeout(remaining)?)
+    });
+    let processed = result
+        .as_ref()
+        .is_some_and(|(_, outcome)| !matches!(outcome, super::types::Handoff::NotSubmitted { .. }));
+    if let Some((attempt, outcome)) = result {
+        let _ = sender.send(QueueAction::Finish {
+            attempt: attempt.id,
+            outcome,
+        });
+    }
+    let _ = sender.send(QueueAction::DirectDone {
+        session: registration.session,
+        token,
+        processed,
+    });
+}
+
+#[cfg(target_os = "linux")]
 fn apply_queue_action(
     service: &mut Service,
     action: QueueAction,
@@ -301,6 +347,27 @@ fn apply_queue_action(
             }
             let _ = response.try_send(attempt);
         }
+        QueueAction::DirectClaim {
+            registration,
+            token,
+            response,
+        } => {
+            let attempt = service
+                .direct_claim(
+                    &registration,
+                    token,
+                    changes.fetch_pending(&registration.session),
+                )
+                .ok()
+                .flatten();
+            if let Some(attempt) = &attempt {
+                service
+                    .queue_deadlines
+                    .insert(attempt.id.clone(), Instant::now() + Duration::from_secs(3));
+                changes.notify();
+            }
+            let _ = response.try_send(attempt);
+        }
         QueueAction::Finish { attempt, outcome } => {
             if service.store.finish(&attempt, outcome).is_ok() {
                 service.queue_deadlines.remove(&attempt);
@@ -309,6 +376,14 @@ fn apply_queue_action(
         }
         QueueAction::Done { session, token } => {
             service.queue_done(&session, token);
+            *running = running.saturating_sub(1);
+        }
+        QueueAction::DirectDone {
+            session,
+            token,
+            processed,
+        } => {
+            service.direct_done(&session, token, processed);
             *running = running.saturating_sub(1);
         }
     }
@@ -335,7 +410,22 @@ fn run_owner(mut service: Service, receiver: mpsc::Receiver<Work>, changes: &Cha
                 apply_queue_action(&mut service, action, changes, &mut queue_running);
             }
             if queue_running < 4 {
-                if let Some((registration, token)) = service.next_queue() {
+                if let Some((registration, token)) = service.next_direct() {
+                    let directory = service.bindings_directory.clone();
+                    let worker_sender = queue_sender.clone();
+                    let session = registration.session.clone();
+                    if thread::Builder::new()
+                        .name("lam-chat-claude-peer".into())
+                        .spawn(move || {
+                            run_direct_worker(directory, registration, token, worker_sender)
+                        })
+                        .is_ok()
+                    {
+                        queue_running += 1;
+                    } else {
+                        service.direct_done(&session, token, false);
+                    }
+                } else if let Some((registration, token)) = service.next_queue() {
                     if let Some(epoch) = service.queue_epoch(&registration.session, token) {
                         let directory = service.bindings_directory.clone();
                         let worker_sender = queue_sender.clone();
@@ -877,7 +967,15 @@ struct Service {
     queue_deadlines: BTreeMap<String, Instant>,
     bindings_directory: std::path::PathBuf,
     queue: HashMap<SessionRef, QueueWake>,
+    direct: HashMap<SessionRef, DirectWake>,
     next_queue_token: u64,
+}
+
+struct DirectWake {
+    registration: Registration,
+    ready: bool,
+    in_flight: Option<u64>,
+    arrival_during_flight: bool,
 }
 
 struct QueueWake {
@@ -902,6 +1000,73 @@ struct Cursor {
 }
 
 impl Service {
+    fn register_direct(&mut self, registration: &Registration) -> Result<()> {
+        if registration.client != "claude" {
+            return Ok(());
+        }
+        let pending = self.store.has_pending(&registration.session)?;
+        let wake = self
+            .direct
+            .entry(registration.session.clone())
+            .or_insert_with(|| DirectWake {
+                registration: registration.clone(),
+                ready: false,
+                in_flight: None,
+                arrival_during_flight: false,
+            });
+        wake.registration = registration.clone();
+        if wake.in_flight.is_none() {
+            wake.ready = pending;
+        }
+        Ok(())
+    }
+
+    fn next_direct(&mut self) -> Option<(Registration, u64)> {
+        let wake = self
+            .direct
+            .values_mut()
+            .find(|wake| wake.ready && wake.in_flight.is_none())?;
+        self.next_queue_token = self.next_queue_token.wrapping_add(1);
+        let token = self.next_queue_token;
+        wake.ready = false;
+        wake.in_flight = Some(token);
+        Some((wake.registration.clone(), token))
+    }
+
+    fn direct_claim(
+        &mut self,
+        registration: &Registration,
+        token: u64,
+        fetch_pending: bool,
+    ) -> Result<Option<super::types::Attempt>> {
+        if fetch_pending
+            || self.direct.get(&registration.session).is_none_or(|wake| {
+                wake.in_flight != Some(token) || wake.registration != *registration
+            })
+        {
+            return Ok(None);
+        }
+        if self.registration_ended(registration)?
+            || !Registry::new(&mut self.store)?
+                .state(&registration.session)
+                .is_some_and(|state| state.registration.eligible)
+        {
+            return Ok(None);
+        }
+        self.store.claim(&registration.session, self.limits)
+    }
+
+    fn direct_done(&mut self, session: &SessionRef, token: u64, processed: bool) {
+        let pending = self.store.has_pending(session).unwrap_or(false);
+        if let Some(wake) = self.direct.get_mut(session) {
+            if wake.in_flight == Some(token) {
+                wake.in_flight = None;
+                wake.ready = pending && (processed || wake.arrival_during_flight);
+                wake.arrival_during_flight = false;
+            }
+        }
+    }
+
     fn observe_native(
         &mut self,
         registration: &Registration,
@@ -975,6 +1140,13 @@ impl Service {
     fn note_arrival(&mut self, message: &Message) {
         for target in &message.draft.to {
             if let Target::Agent(session) = target {
+                if let Some(wake) = self.direct.get_mut(session) {
+                    if wake.in_flight.is_some() {
+                        wake.arrival_during_flight = true;
+                    } else {
+                        wake.ready = true;
+                    }
+                }
                 if let Some(wake) = self.queue.get_mut(session) {
                     if wake.external_state == ClientEvent::Idle && wake.in_flight.is_none() {
                         wake.ready = true;
@@ -1029,6 +1201,25 @@ impl Service {
         store.set_machine(machine)?;
         let cursor_key = store.cursor_key()?;
         store.recover_submitting()?;
+        let mut direct = HashMap::new();
+        for state in store.load_sessions()? {
+            if state.registration.client == "claude"
+                && state.connected
+                && state.registration.eligible
+                && !state.ended
+            {
+                let ready = store.has_pending(&state.registration.session)?;
+                direct.insert(
+                    state.registration.session.clone(),
+                    DirectWake {
+                        registration: state.registration,
+                        ready,
+                        in_flight: None,
+                        arrival_during_flight: false,
+                    },
+                );
+            }
+        }
         Ok(Self {
             participant_auth: "disabled",
             store,
@@ -1042,6 +1233,7 @@ impl Service {
                 .context("Chat database has no parent directory")?
                 .join("bindings"),
             queue: HashMap::new(),
+            direct,
             next_queue_token: 0,
         })
     }
@@ -1085,12 +1277,14 @@ impl Service {
                     self.verify_registration(registration)?;
                     Registry::new(&mut self.store)?.end(&registration.session)?;
                     self.queue.remove(&registration.session);
+                    self.direct.remove(&registration.session);
                     Ok(json!({"ended": registration.session}))
                 }
                 Operation::Register {} => {
                     protocol::validate_session(&registration.session)?;
                     protocol::validate_project(&registration.project)?;
                     Registry::new(&mut self.store)?.register(registration.clone())?;
+                    self.register_direct(registration)?;
                     Ok(json!({"session": registration.session}))
                 }
                 Operation::SetState { eligible } => {
@@ -1099,6 +1293,7 @@ impl Service {
                         .set_eligible(&registration.session, eligible)?;
                     if !eligible {
                         self.queue.remove(&registration.session);
+                        self.direct.remove(&registration.session);
                     }
                     Ok(json!({"eligible": eligible}))
                 }
@@ -1186,6 +1381,13 @@ impl Service {
                 };
                 self.show(context, &id)?;
                 self.store.retry_delivery(&registration.session, &id)?;
+                if let Some(wake) = self.direct.get_mut(&registration.session) {
+                    if wake.in_flight.is_some() {
+                        wake.arrival_during_flight = true;
+                    } else {
+                        wake.ready = true;
+                    }
+                }
                 Ok(
                     json!({"retry": id, "warning": "Duplicate delivery is possible; retry remains bound to the original recipient incarnation"}),
                 )
@@ -1526,6 +1728,148 @@ pub(super) mod tests {
             process_start: format!("boot:1:{id}"),
             eligible: true,
         }
+    }
+
+    #[test]
+    fn claude_arrival_claims_once_without_inventing_an_idle_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = Service::open(&dir.path().join("chat.sqlite3"), MACHINE).unwrap();
+        let mut recipient = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        recipient.client = "claude".into();
+        service
+            .handle(
+                &VerifiedContext::Integration(recipient.clone()),
+                Operation::Register {},
+            )
+            .unwrap();
+        let sent = service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Send {
+                    draft: Draft {
+                        key: "claude-arrival".into(),
+                        project: PROJECT.into(),
+                        to: vec![Target::Agent(recipient.session.clone())],
+                        body: "owned peer body".into(),
+                        reply_to: None,
+                    },
+                },
+            )
+            .unwrap();
+        let (scheduled, token) = service.next_direct().unwrap();
+        assert_eq!(scheduled, recipient);
+        assert!(service.next_direct().is_none());
+        let attempt = service
+            .direct_claim(&recipient, token, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.recipient, recipient.session);
+        let db = rusqlite::Connection::open(dir.path().join("chat.sqlite3")).unwrap();
+        let observations: i64 = db
+            .query_row("SELECT COUNT(*) FROM delivery_observations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(observations, 0);
+        service
+            .store
+            .finish(
+                &attempt.id,
+                super::super::types::Handoff::Unknown {
+                    reason: "native acceptance unconfirmed".into(),
+                },
+            )
+            .unwrap();
+        service.direct_done(&recipient.session, token, true);
+        assert!(service.next_direct().is_none());
+        service
+            .handle(
+                &VerifiedContext::Participant(recipient.clone()),
+                Operation::Retry {
+                    id: sent["id"].as_str().unwrap().into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(service.next_direct().unwrap().0, recipient);
+    }
+
+    #[test]
+    fn claude_pending_wake_survives_owner_restart_for_same_incarnation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.sqlite3");
+        let mut service = Service::open(&path, MACHINE).unwrap();
+        let mut recipient = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        recipient.client = "claude".into();
+        service
+            .handle(
+                &VerifiedContext::Integration(recipient.clone()),
+                Operation::Register {},
+            )
+            .unwrap();
+        service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Send {
+                    draft: Draft {
+                        key: "before-restart".into(),
+                        project: PROJECT.into(),
+                        to: vec![Target::Agent(recipient.session.clone())],
+                        body: "pending across restart".into(),
+                        reply_to: None,
+                    },
+                },
+            )
+            .unwrap();
+        drop(service);
+        let mut reopened = Service::open(&path, MACHINE).unwrap();
+        assert_eq!(reopened.next_direct().unwrap().0, recipient);
+    }
+
+    #[test]
+    fn claude_failed_submission_waits_for_reconnect_without_spinning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = Service::open(&dir.path().join("chat.sqlite3"), MACHINE).unwrap();
+        let mut recipient = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        recipient.client = "claude".into();
+        service
+            .handle(
+                &VerifiedContext::Integration(recipient.clone()),
+                Operation::Register {},
+            )
+            .unwrap();
+        service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Send {
+                    draft: Draft {
+                        key: "claude-failed-handoff".into(),
+                        project: PROJECT.into(),
+                        to: vec![Target::Agent(recipient.session.clone())],
+                        body: "do not spin".into(),
+                        reply_to: None,
+                    },
+                },
+            )
+            .unwrap();
+        let (_, token) = service.next_direct().unwrap();
+        let attempt = service
+            .direct_claim(&recipient, token, false)
+            .unwrap()
+            .unwrap();
+        let outcome = super::super::types::Handoff::NotSubmitted {
+            reason: "native process changed before write".into(),
+        };
+        let processed = !matches!(outcome, super::super::types::Handoff::NotSubmitted { .. });
+        service.store.finish(&attempt.id, outcome).unwrap();
+        service.direct_done(&recipient.session, token, processed);
+        assert!(service.next_direct().is_none());
+        service
+            .handle(
+                &VerifiedContext::Integration(recipient.clone()),
+                Operation::Register {},
+            )
+            .unwrap();
+        assert_eq!(service.next_direct().unwrap().0, recipient);
     }
 
     #[test]

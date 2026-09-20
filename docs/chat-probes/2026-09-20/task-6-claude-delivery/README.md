@@ -1,0 +1,13 @@
+# Owned Claude native delivery probe, 2026-09-20
+
+This probe used Claude Code 2.1.278, an opt-in `--settings` file containing only the LAM Chat SessionStart/SessionEnd hooks, the isolated Chat database under `/tmp/lam-chat-task6-native.KlGYDF/claude-case-20260920`, and a test-only daemon with `--native-bindings`. No global hook, permission setting, shared daemon, or unrelated session was changed.
+
+The production-candidate Rust adapter located the receiver's 0600 Unix socket through the private binding, checked that the exact registered Claude process held the listener, verified peer credentials, then sent a native `type:user` frame with `from:lam-chat`, `priority:next`, and the rendered text in `message.content`. The socket write is recorded as **Unknown**, not Accepted, because this frame has no native acceptance response.
+
+An idle recipient (`0c81f4f2-2730-40c4-b11b-c3d549ac4430`) received `NATIVE_CLAUDE_IDLE_7DE8CC` as a native peer-origin turn. Its transcript recorded `origin.kind=peer`, `origin.from=lam-chat`, the exact attempt `msg_id`, and a verified local sender PID. The model saw the fixed untrusted-data wrapper and body. This proves idle wake and exposure for that attempt, not a general receipt mechanism.
+
+A separate foreground-tool receiver (`5a044343-c4f3-432c-b2bb-fed9ffb1ff3a`) invoked `openssl speed -seconds 5 sha256` with native Bash `timeout=120000`, no background flag, at 17:55:15.962 UTC. LAM persisted the peer attempt as Unknown at 17:56:10.813, while the Bash call was still active. Bash completed normally at 17:56:36.444; the native transcript marked the peer item `absorbed_mid_turn`, and the model's 17:56:40.448 final included `NATIVE_CLAUDE_FOREGROUND_7DE8CC`. Two earlier timing attempts were discarded because the peer arrived after the foreground tool had returned. This is one real busy-boundary pass, not exhaustive race coverage.
+
+An owned receiver launched with `crossSessionInbound=refuse` registered normally. Sending `NATIVE_CLAUDE_REFUSE_7DE8CC` through the same Rust adapter produced a completed socket write and persisted **Unknown**. The refusing receiver did not surface the token. A direct socket probe returned EOF with no acknowledgement. The adapter cannot yet distinguish this explicit native refusal from other unknown outcomes, so the Task 6 refusal gate remains open and Claude delivery remains experimental. A caller must use explicit Inbox retry after an Unknown; the adapter does not replay it automatically.
+
+The private settings files, daemon, and sessions are test fixtures, not installed integration. Transcript paths contain owned test session IDs only; no message bodies, binding credentials, or sockets are committed.

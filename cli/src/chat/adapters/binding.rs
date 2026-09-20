@@ -838,17 +838,7 @@ pub(in crate::chat) fn codex_queue_target(
     anyhow::ensure!(registration.client == "codex", "queue target is not Codex");
     protocol::validate_session(&registration.session)?;
     protocol::validate_uuid(&registration.native_id)?;
-    let mut lifetime = registration.process_start.split(':');
-    let boot = lifetime.next().unwrap_or_default();
-    let pid = lifetime.next().unwrap_or_default().parse::<u32>()?;
-    let ticks = lifetime.next().unwrap_or_default().parse::<u64>()?;
-    anyhow::ensure!(lifetime.next().is_none(), "invalid native process lifetime");
-    protocol::validate_uuid(boot)?;
-    let process = ProcessEvidence::read(pid)?;
-    anyhow::ensure!(
-        process.boot_id == boot && process.start_ticks == ticks,
-        "native process lifetime changed"
-    );
+    let process = registration_process(registration)?;
     let files = BindingFiles::open(directory)?;
     let key = binding_locator("codex", &registration.native_id, &process)?;
     let binding = files.load(&key)?;
@@ -863,6 +853,103 @@ pub(in crate::chat) fn codex_queue_target(
         "native queue binding changed"
     );
     let path = backend_socket_path(&process)?;
+    Ok((process, path))
+}
+
+#[cfg(target_os = "linux")]
+fn registration_process(
+    registration: &crate::chat::types::Registration,
+) -> anyhow::Result<ProcessEvidence> {
+    use crate::chat::protocol;
+    let mut lifetime = registration.process_start.split(':');
+    let boot = lifetime.next().unwrap_or_default();
+    let pid = lifetime.next().unwrap_or_default().parse::<u32>()?;
+    let ticks = lifetime.next().unwrap_or_default().parse::<u64>()?;
+    anyhow::ensure!(lifetime.next().is_none(), "invalid native process lifetime");
+    protocol::validate_uuid(boot)?;
+    let process = ProcessEvidence::read(pid)?;
+    anyhow::ensure!(
+        process.boot_id == boot && process.start_ticks == ticks,
+        "native process lifetime changed"
+    );
+    Ok(process)
+}
+
+#[cfg(target_os = "linux")]
+pub(in crate::chat) fn claude_target(
+    directory: &std::path::Path,
+    registration: &crate::chat::types::Registration,
+) -> anyhow::Result<(ProcessEvidence, std::path::PathBuf)> {
+    use std::{
+        io::Read,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+    };
+    anyhow::ensure!(registration.client == "claude", "peer target is not Claude");
+    crate::chat::protocol::validate_session(&registration.session)?;
+    crate::chat::protocol::validate_uuid(&registration.native_id)?;
+    let process = registration_process(registration)?;
+    let files = BindingFiles::open(directory)?;
+    let key = binding_locator("claude", &registration.native_id, &process)?;
+    let binding = files.load(&key)?;
+    anyhow::ensure!(
+        binding.process == process
+            && binding.client == registration.client
+            && binding.native_id == registration.native_id
+            && binding.session.as_ref() == Some(&registration.session)
+            && binding.project == registration.project
+            && binding.process_start() == registration.process_start
+            && matches!(binding.version.as_str(), "2.1.270" | "2.1.273" | "2.1.278"),
+        "native Claude binding changed"
+    );
+    let path = binding
+        .native_socket
+        .ok_or_else(|| anyhow::anyhow!("native Claude peer socket is unavailable"))?;
+    crate::chat::config::validate_path_components(&path)?;
+    crate::chat::daemon::validate_socket(&path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("missing native socket directory"))?;
+    let metadata = parent.symlink_metadata()?;
+    anyhow::ensure!(
+        metadata.is_dir()
+            && metadata.uid() == process.uid
+            && metadata.permissions().mode() & 0o077 == 0,
+        "native Claude socket directory must be private"
+    );
+    let mut listing = String::new();
+    std::fs::File::open(format!("/proc/{}/net/unix", process.pid))?
+        .take(4_194_305)
+        .read_to_string(&mut listing)?;
+    anyhow::ensure!(
+        listing.len() <= 4_194_304,
+        "native socket table exceeds bound"
+    );
+    let mut inodes = listing.lines().skip(1).filter_map(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        (fields.len() == 8
+            && fields[3] == "00010000"
+            && fields[4] == "0001"
+            && fields[5] == "01"
+            && fields[7] == path.to_str().unwrap_or(""))
+        .then_some(fields[6].to_owned())
+    });
+    let inode = inodes
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("native Claude socket is not listening"))?;
+    anyhow::ensure!(inodes.next().is_none(), "native Claude socket is ambiguous");
+    let expected = format!("socket:[{inode}]");
+    let mut owned = false;
+    for (index, entry) in std::fs::read_dir(format!("/proc/{}/fd", process.pid))?.enumerate() {
+        anyhow::ensure!(index < 2048, "native descriptor search exceeds bound");
+        if std::fs::read_link(entry?.path())
+            .is_ok_and(|link| link == std::path::Path::new(&expected))
+        {
+            owned = true;
+            break;
+        }
+    }
+    anyhow::ensure!(owned, "native Claude process does not own peer listener");
+    process.validate()?;
     Ok((process, path))
 }
 
@@ -2021,6 +2108,44 @@ mod tests {
             "owned-native",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn claude_target_requires_the_exact_live_process_listener() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.path().join("claude.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let directory = dir.path().join("bindings");
+        let files = BindingFiles::open(&directory).unwrap();
+        let mut binding = NativeBinding::new(
+            "claude",
+            "2.1.278",
+            "11111111-1111-4111-8111-111111111111",
+            ProcessEvidence::read(std::process::id()).unwrap(),
+            "22222222-2222-4222-8222-222222222222",
+            "owned-claude",
+        )
+        .unwrap();
+        binding.native_socket = Some(socket.clone());
+        binding
+            .bind(crate::chat::types::SessionRef {
+                machine: "33333333-3333-4333-8333-333333333333".into(),
+                incarnation: "44444444-4444-4444-8444-444444444444".into(),
+            })
+            .unwrap();
+        let registration = match binding.context(&binding.participant_secret).unwrap() {
+            crate::chat::daemon::VerifiedContext::Participant(registration) => registration,
+            _ => panic!("expected participant"),
+        };
+        files
+            .create(&binding, Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(claude_target(&directory, &registration).unwrap().1, socket);
+        drop(listener);
+        assert!(claude_target(&directory, &registration).is_err());
     }
 
     #[test]
