@@ -6,6 +6,35 @@ pub fn encode_untrusted_text(text: &str) -> anyhow::Result<String> {
 }
 
 #[cfg(target_os = "linux")]
+pub(in crate::chat) fn submit_queue_owned(
+    directory: &std::path::Path,
+    registration: &crate::chat::types::Registration,
+    deadline: std::time::Instant,
+    claim: impl FnOnce(
+        crate::chat::types::ClientEvent,
+    ) -> anyhow::Result<Option<crate::chat::types::Attempt>>,
+) -> Option<(crate::chat::types::Attempt, crate::chat::types::Handoff)> {
+    let (process, path) = super::binding::codex_queue_target(directory, registration).ok()?;
+    let mut stream = super::binding::connect_native_socket(&path, deadline).ok()?;
+    submit_queue_with_claim(
+        &process,
+        &mut stream,
+        &registration.native_id,
+        deadline,
+        claim,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(in crate::chat) fn reserve_queue_epoch(
+    directory: &std::path::Path,
+    registration: &crate::chat::types::Registration,
+    deadline: std::time::Instant,
+) -> anyhow::Result<u64> {
+    super::binding::reserve_queue_epoch(directory, registration, deadline)
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn submit_queue(
     process: &super::binding::ProcessEvidence,
     stream: &mut std::os::unix::net::UnixStream,
@@ -13,6 +42,27 @@ pub(super) fn submit_queue(
     attempt: &crate::chat::types::Attempt,
     deadline: std::time::Instant,
 ) -> crate::chat::types::Handoff {
+    submit_queue_with_claim(process, stream, native_id, deadline, |_| {
+        Ok(Some(attempt.clone()))
+    })
+    .map_or_else(
+        || crate::chat::types::Handoff::NotSubmitted {
+            reason: "Codex queue validation or connection failed before submission".into(),
+        },
+        |(_, outcome)| outcome,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn submit_queue_with_claim(
+    process: &super::binding::ProcessEvidence,
+    stream: &mut std::os::unix::net::UnixStream,
+    native_id: &str,
+    deadline: std::time::Instant,
+    claim: impl FnOnce(
+        crate::chat::types::ClientEvent,
+    ) -> anyhow::Result<Option<crate::chat::types::Attempt>>,
+) -> Option<(crate::chat::types::Attempt, crate::chat::types::Handoff)> {
     use crate::chat::{daemon, protocol, types::Handoff};
     use anyhow::ensure;
     use serde_json::{json, Value};
@@ -38,9 +88,9 @@ pub(super) fn submit_queue(
     }
 
     let mut queue_started = false;
+    let mut claimed = None;
     let result = (|| -> anyhow::Result<Handoff> {
         protocol::validate_uuid(native_id)?;
-        protocol::validate_uuid(&attempt.id)?;
         process.validate()?;
         let peer = daemon::peer_identity(stream)?;
         ensure!(
@@ -92,6 +142,17 @@ pub(super) fn submit_queue(
             "native thread cannot accept queued input"
         );
         process.validate()?;
+        let event = if thread["status"]["type"] == "idle" {
+            crate::chat::types::ClientEvent::Idle
+        } else {
+            crate::chat::types::ClientEvent::Busy
+        };
+        let Some(attempt) = claim(event)? else {
+            anyhow::bail!("queue claim was not issued");
+        };
+        claimed = Some(attempt);
+        let attempt = claimed.as_ref().unwrap();
+        protocol::validate_uuid(&attempt.id)?;
         let input = json!([{"type":"text","text":attempt.batch.text,"text_elements":[]}]);
         let request = json!({
             "id":"queue", "method":"thread/queue/add",
@@ -102,6 +163,7 @@ pub(super) fn submit_queue(
             request.len() <= 8192,
             "native queue envelope exceeds its bound"
         );
+        process.validate()?;
         // A failed write may have submitted part or all of the request. Never
         // turn missing/malformed acknowledgement into a safe automatic retry.
         queue_started = true;
@@ -124,7 +186,7 @@ pub(super) fn submit_queue(
             receipt: format!("Codex queued message {id} for thread {native_id}"),
         })
     })();
-    result.unwrap_or_else(|_| {
+    let outcome = result.unwrap_or_else(|_| {
         if queue_started {
             Handoff::Unknown {
                 reason: "Codex queue submission acknowledgement is unconfirmed".into(),
@@ -134,7 +196,8 @@ pub(super) fn submit_queue(
                 reason: "Codex queue validation or connection failed before submission".into(),
             }
         }
-    })
+    });
+    claimed.map(|attempt| (attempt, outcome))
 }
 
 #[cfg(target_os = "linux")]

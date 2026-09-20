@@ -654,6 +654,238 @@ impl ProcessEvidence {
 }
 
 #[cfg(target_os = "linux")]
+fn backend_socket_path(process: &ProcessEvidence) -> anyhow::Result<std::path::PathBuf> {
+    use std::collections::HashSet;
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    process.validate()?;
+    let mut owned_inodes = HashSet::new();
+    for entry in std::fs::read_dir(format!("/proc/{}/fd", process.pid))?.take(2049) {
+        anyhow::ensure!(
+            owned_inodes.len() < 2048,
+            "native descriptor search exceeds bound"
+        );
+        let entry = entry?;
+        if let Ok(link) = std::fs::read_link(entry.path()) {
+            if let Some(inode) = link
+                .to_str()
+                .and_then(|value| value.strip_prefix("socket:["))
+                .and_then(|value| value.strip_suffix(']'))
+            {
+                owned_inodes.insert(inode.to_owned());
+            }
+        }
+    }
+    let mut listing = String::new();
+    std::fs::File::open(format!("/proc/{}/net/unix", process.pid))?
+        .take(4_194_305)
+        .read_to_string(&mut listing)?;
+    anyhow::ensure!(
+        listing.len() <= 4_194_304,
+        "native socket table exceeds bound"
+    );
+    let mut matches = Vec::new();
+    for line in listing.lines().skip(1) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() != 8
+            || fields[3] != "00010000"
+            || fields[4] != "0001"
+            || fields[5] != "01"
+            || !owned_inodes.contains(fields[6])
+        {
+            continue;
+        }
+        let path = std::path::PathBuf::from(fields[7]);
+        if path
+            .file_name()
+            .is_some_and(|name| name == "app-server-control.sock")
+        {
+            crate::chat::daemon::validate_socket(&path)?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("missing native socket directory"))?;
+            let metadata = parent.symlink_metadata()?;
+            anyhow::ensure!(
+                metadata.is_dir()
+                    && metadata.uid() == process.uid
+                    && metadata.permissions().mode() & 0o077 == 0,
+                "native socket directory must be private"
+            );
+            matches.push(path);
+        }
+    }
+    anyhow::ensure!(
+        matches.len() == 1,
+        "native backend has no unique private control socket"
+    );
+    process.validate()?;
+    Ok(matches.remove(0))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(in crate::chat) static BACKEND_SOCKET_TEST_LOCK: std::sync::Mutex<()> =
+    std::sync::Mutex::new(());
+
+#[cfg(target_os = "linux")]
+pub(in crate::chat) fn codex_queue_target(
+    directory: &std::path::Path,
+    registration: &crate::chat::types::Registration,
+) -> anyhow::Result<(ProcessEvidence, std::path::PathBuf)> {
+    use crate::chat::protocol;
+    anyhow::ensure!(registration.client == "codex", "queue target is not Codex");
+    protocol::validate_session(&registration.session)?;
+    protocol::validate_uuid(&registration.native_id)?;
+    let mut lifetime = registration.process_start.split(':');
+    let boot = lifetime.next().unwrap_or_default();
+    let pid = lifetime.next().unwrap_or_default().parse::<u32>()?;
+    let ticks = lifetime.next().unwrap_or_default().parse::<u64>()?;
+    anyhow::ensure!(lifetime.next().is_none(), "invalid native process lifetime");
+    protocol::validate_uuid(boot)?;
+    let process = ProcessEvidence::read(pid)?;
+    anyhow::ensure!(
+        process.boot_id == boot && process.start_ticks == ticks,
+        "native process lifetime changed"
+    );
+    let files = BindingFiles::open(directory)?;
+    let key = binding_locator("codex", &registration.native_id, &process)?;
+    let binding = files.load(&key)?;
+    anyhow::ensure!(
+        binding.process == process
+            && binding.client == registration.client
+            && binding.native_id == registration.native_id
+            && binding.session.as_ref() == Some(&registration.session)
+            && binding.project == registration.project
+            && binding.process_start() == registration.process_start
+            && matches!(binding.version.as_str(), "0.153.4" | "0.154.0"),
+        "native queue binding changed"
+    );
+    let path = backend_socket_path(&process)?;
+    Ok((process, path))
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn reserve_queue_epoch(
+    directory: &std::path::Path,
+    registration: &crate::chat::types::Registration,
+    deadline: std::time::Instant,
+) -> anyhow::Result<u64> {
+    let (process, _) = codex_queue_target(directory, registration)?;
+    let files = BindingFiles::open(directory)?;
+    let key = binding_locator("codex", &registration.native_id, &process)?;
+    let binding = files.load(&key)?;
+    files.next_epoch(&binding, deadline)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(in crate::chat) fn install_test_binding(
+    directory: &std::path::Path,
+    registration: &crate::chat::types::Registration,
+) -> anyhow::Result<()> {
+    let process = ProcessEvidence::read(std::process::id())?;
+    anyhow::ensure!(
+        registration.client == "codex"
+            && registration.process_start
+                == format!(
+                    "{}:{}:{}",
+                    process.boot_id, process.pid, process.start_ticks
+                ),
+        "owned test registration does not match process"
+    );
+    let mut binding = NativeBinding::new(
+        "codex",
+        "0.153.4",
+        &registration.native_id,
+        process,
+        &registration.project,
+        &registration.name,
+    )?;
+    binding.bind(registration.session.clone())?;
+    BindingFiles::open(directory)?.create(
+        &binding,
+        std::time::Instant::now() + std::time::Duration::from_secs(1),
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn connect_native_socket(
+    path: &std::path::Path,
+    deadline: std::time::Instant,
+) -> anyhow::Result<std::os::unix::net::UnixStream> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{ffi::OsStrExt, net::UnixStream},
+    };
+    crate::chat::daemon::validate_socket(path)?;
+    let bytes = path.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    anyhow::ensure!(
+        bytes.len() < address.sun_path.len() && !bytes.contains(&0),
+        "invalid native socket path"
+    );
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (target, source) in address.sun_path.iter_mut().zip(bytes) {
+        *target = *source as libc::c_char;
+    }
+    anyhow::ensure!(
+        std::time::Instant::now() < deadline,
+        "native connection deadline expired"
+    );
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
+    anyhow::ensure!(fd >= 0, "cannot create native connection");
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    let connected = unsafe {
+        libc::connect(
+            fd,
+            (&address as *const libc::sockaddr_un).cast(),
+            (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t,
+        )
+    };
+    if connected != 0 {
+        let error = std::io::Error::last_os_error();
+        anyhow::ensure!(
+            error.raw_os_error() == Some(libc::EINPROGRESS),
+            "native connection failed"
+        );
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| anyhow::anyhow!("native connection deadline expired"))?;
+            let mut poll = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let ready = unsafe {
+                libc::poll(
+                    &mut poll,
+                    1,
+                    remaining.as_millis().min(i32::MAX as u128) as i32,
+                )
+            };
+            if ready < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            anyhow::ensure!(ready > 0, "native connection deadline expired");
+            if let Some(error) = stream.take_error()? {
+                return Err(error.into());
+            }
+            break;
+        }
+    }
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+#[cfg(target_os = "linux")]
 fn parse_process_stat(stat: &str) -> anyhow::Result<(u32, u64)> {
     use anyhow::Context;
     let (_, fields) = stat
@@ -1639,6 +1871,60 @@ mod tests {
         files.create(&record, deadline).unwrap();
         assert_eq!(files.reserve_epochs(&record, 2, deadline).unwrap(), 1);
         assert_eq!(files.next_epoch(&record, deadline).unwrap(), 3);
+    }
+
+    #[test]
+    fn backend_socket_selection_uses_the_pinned_process_listener_inode() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = BACKEND_SOCKET_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("app-server-control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let process = ProcessEvidence::read(std::process::id()).unwrap();
+        assert_eq!(backend_socket_path(&process).unwrap(), path);
+        drop(listener);
+    }
+
+    #[test]
+    fn queue_target_requires_the_exact_private_binding_and_process() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = BACKEND_SOCKET_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.path().join("app-server-control.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let directory = dir.path().join("bindings");
+        let files = BindingFiles::open(&directory).unwrap();
+        let mut record = binding();
+        record
+            .bind(crate::chat::types::SessionRef {
+                machine: "11111111-1111-4111-8111-111111111111".into(),
+                incarnation: "33333333-3333-4333-8333-333333333333".into(),
+            })
+            .unwrap();
+        files
+            .create(
+                &record,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        let crate::chat::daemon::VerifiedContext::Integration(registration) =
+            record.context(&record.integration_secret).unwrap()
+        else {
+            panic!("not integration");
+        };
+        let (process, selected) = codex_queue_target(&directory, &registration).unwrap();
+        assert_eq!(process, record.process);
+        assert_eq!(selected, socket);
+        let mut wrong = registration.clone();
+        wrong.native_id = "44444444-4444-4444-8444-444444444444".into();
+        assert!(codex_queue_target(&directory, &wrong).is_err());
+        wrong = registration;
+        wrong.process_start.push_str(":replacement");
+        assert!(codex_queue_target(&directory, &wrong).is_err());
     }
 
     #[test]

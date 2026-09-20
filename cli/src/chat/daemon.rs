@@ -68,6 +68,25 @@ struct Work {
     deadline: Instant,
 }
 
+#[cfg(target_os = "linux")]
+enum QueueAction {
+    Claim {
+        registration: Registration,
+        token: u64,
+        event: ClientEvent,
+        epoch: u64,
+        response: SyncSender<Option<super::types::Attempt>>,
+    },
+    Finish {
+        attempt: String,
+        outcome: super::types::Handoff,
+    },
+    Done {
+        session: SessionRef,
+        token: u64,
+    },
+}
+
 #[derive(Default)]
 struct Changes {
     generation: Mutex<u64>,
@@ -198,10 +217,151 @@ fn repair_fetch(service: &mut Service, changes: &Changes, now: Instant) -> bool 
     true
 }
 
+#[cfg(target_os = "linux")]
+fn run_queue_worker(
+    directory: std::path::PathBuf,
+    registration: Registration,
+    token: u64,
+    reserved_epoch: Option<u64>,
+    sender: SyncSender<QueueAction>,
+) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let epoch = match reserved_epoch {
+        Some(epoch) => epoch,
+        None => {
+            match super::adapters::reserve_codex_queue_epoch(&directory, &registration, deadline) {
+                Ok(epoch) => epoch,
+                Err(_) => {
+                    let _ = sender.send(QueueAction::Done {
+                        session: registration.session,
+                        token,
+                    });
+                    return;
+                }
+            }
+        }
+    };
+    let result =
+        super::adapters::submit_queue_owned(&directory, &registration, deadline, |event| {
+            let (response, receiver) = mpsc::sync_channel(1);
+            sender.try_send(QueueAction::Claim {
+                registration: registration.clone(),
+                token,
+                event,
+                epoch,
+                response,
+            })?;
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .context("native queue claim deadline expired")?;
+            Ok(receiver.recv_timeout(remaining)?)
+        });
+    if let Some((attempt, outcome)) = result {
+        let _ = sender.send(QueueAction::Finish {
+            attempt: attempt.id,
+            outcome,
+        });
+    }
+    let _ = sender.send(QueueAction::Done {
+        session: registration.session,
+        token,
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn apply_queue_action(
+    service: &mut Service,
+    action: QueueAction,
+    changes: &Changes,
+    running: &mut usize,
+) {
+    match action {
+        QueueAction::Claim {
+            registration,
+            token,
+            event,
+            epoch,
+            response,
+        } => {
+            let attempt = service
+                .queue_claim(
+                    &registration,
+                    token,
+                    event,
+                    epoch,
+                    changes.fetch_pending(&registration.session),
+                )
+                .ok()
+                .flatten();
+            if let Some(attempt) = &attempt {
+                service
+                    .queue_deadlines
+                    .insert(attempt.id.clone(), Instant::now() + Duration::from_secs(3));
+                changes.notify();
+            }
+            let _ = response.try_send(attempt);
+        }
+        QueueAction::Finish { attempt, outcome } => {
+            if service.store.finish(&attempt, outcome).is_ok() {
+                service.queue_deadlines.remove(&attempt);
+                changes.notify();
+            }
+        }
+        QueueAction::Done { session, token } => {
+            service.queue_done(&session, token);
+            *running = running.saturating_sub(1);
+        }
+    }
+}
+
 fn run_owner(mut service: Service, receiver: mpsc::Receiver<Work>, changes: &Changes) -> Service {
+    #[cfg(target_os = "linux")]
+    let (queue_sender, queue_receiver) = mpsc::sync_channel::<QueueAction>(WRITER_QUEUE);
+    #[cfg(target_os = "linux")]
+    let mut queue_running = 0_usize;
     loop {
         if service.expire_hooks(Instant::now()) {
             changes.notify();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if service.expire_queues(Instant::now()) {
+                changes.notify();
+            }
+            for _ in 0..WRITER_QUEUE {
+                let Ok(action) = queue_receiver.try_recv() else {
+                    break;
+                };
+                apply_queue_action(&mut service, action, changes, &mut queue_running);
+            }
+            if queue_running < 4 {
+                if let Some((registration, token)) = service.next_queue() {
+                    if let Some(epoch) = service.queue_epoch(&registration.session, token) {
+                        let directory = service.bindings_directory.clone();
+                        let worker_sender = queue_sender.clone();
+                        let session = registration.session.clone();
+                        if thread::Builder::new()
+                            .name("lam-chat-queue".into())
+                            .spawn(move || {
+                                run_queue_worker(
+                                    directory,
+                                    registration,
+                                    token,
+                                    epoch,
+                                    worker_sender,
+                                )
+                            })
+                            .is_ok()
+                        {
+                            queue_running += 1;
+                        } else {
+                            service.queue_done(&session, token);
+                        }
+                    } else {
+                        service.queue_done(&registration.session, token);
+                    }
+                }
+            }
         }
         repair_fetch(&mut service, changes, Instant::now());
         match receiver.recv_timeout(Duration::from_millis(50)) {
@@ -714,6 +874,8 @@ struct Service {
     cursor_key: String,
     limits: Limits,
     hook_deadlines: BTreeMap<String, Instant>,
+    queue_deadlines: BTreeMap<String, Instant>,
+    bindings_directory: std::path::PathBuf,
     queue: HashMap<SessionRef, QueueWake>,
     next_queue_token: u64,
 }
@@ -721,9 +883,11 @@ struct Service {
 struct QueueWake {
     registration: Registration,
     stop_epoch: u64,
+    claim_epoch: Option<u64>,
     external_state: ClientEvent,
     ready: bool,
     in_flight: Option<u64>,
+    arrival_during_flight: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -755,19 +919,24 @@ impl Service {
             .or_insert_with(|| QueueWake {
                 registration: registration.clone(),
                 stop_epoch: epoch,
+                claim_epoch: None,
                 external_state: event,
                 ready: false,
                 in_flight: None,
+                arrival_during_flight: false,
             });
         wake.registration = registration.clone();
         wake.external_state = event;
         // A newer native observation supersedes any worker still holding an
         // older Stop token. Its late claim or completion cannot own this wake.
         wake.in_flight = None;
+        wake.arrival_during_flight = false;
         if event == ClientEvent::Idle {
             wake.stop_epoch = epoch;
+            wake.claim_epoch = epoch.checked_add(1);
             wake.ready = ready;
         } else {
+            wake.claim_epoch = None;
             wake.ready = false;
         }
         Ok(true)
@@ -789,8 +958,18 @@ impl Service {
         if let Some(wake) = self.queue.get_mut(session) {
             if wake.in_flight == Some(token) {
                 wake.in_flight = None;
+                if wake.arrival_during_flight && wake.external_state == ClientEvent::Idle {
+                    wake.ready = true;
+                    wake.claim_epoch = None;
+                }
+                wake.arrival_during_flight = false;
             }
         }
+    }
+
+    fn queue_epoch(&self, session: &SessionRef, token: u64) -> Option<Option<u64>> {
+        let wake = self.queue.get(session)?;
+        (wake.in_flight == Some(token)).then_some(wake.claim_epoch)
     }
 
     fn note_arrival(&mut self, message: &Message) {
@@ -799,6 +978,11 @@ impl Service {
                 if let Some(wake) = self.queue.get_mut(session) {
                     if wake.external_state == ClientEvent::Idle && wake.in_flight.is_none() {
                         wake.ready = true;
+                        // A new arrival after an earlier queue claim needs its
+                        // own file-reserved native epoch, not the spent Stop+1.
+                        wake.claim_epoch = None;
+                    } else if wake.external_state == ClientEvent::Idle {
+                        wake.arrival_during_flight = true;
                     }
                 }
             }
@@ -822,7 +1006,8 @@ impl Service {
         if wake.in_flight != Some(token)
             || wake.external_state != ClientEvent::Idle
             || wake.registration != *registration
-            || wake.stop_epoch.checked_add(1) != Some(epoch)
+            || wake.claim_epoch.is_some_and(|reserved| reserved != epoch)
+            || epoch <= wake.stop_epoch
         {
             return Ok(None);
         }
@@ -851,6 +1036,11 @@ impl Service {
             cursor_key,
             limits: super::config::DEFAULT_LIMITS,
             hook_deadlines: BTreeMap::new(),
+            queue_deadlines: BTreeMap::new(),
+            bindings_directory: path
+                .parent()
+                .context("Chat database has no parent directory")?
+                .join("bindings"),
             queue: HashMap::new(),
             next_queue_token: 0,
         })
@@ -1070,6 +1260,36 @@ impl Service {
                 // Failed persistence retains durable Submitting and exclusion.
                 // Retry at a bounded cadence, never requeue or expose the body.
                 self.hook_deadlines
+                    .insert(id, now + Duration::from_millis(100));
+            }
+        }
+        changed
+    }
+
+    #[cfg(target_os = "linux")]
+    fn expire_queues(&mut self, now: Instant) -> bool {
+        let expired: Vec<_> = self
+            .queue_deadlines
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut changed = false;
+        for id in expired {
+            if self
+                .store
+                .finish(
+                    &id,
+                    super::types::Handoff::Unknown {
+                        reason: "Codex native queue completion is unconfirmed".into(),
+                    },
+                )
+                .is_ok()
+            {
+                self.queue_deadlines.remove(&id);
+                changed = true;
+            } else {
+                self.queue_deadlines
                     .insert(id, now + Duration::from_millis(100));
             }
         }
@@ -1432,7 +1652,14 @@ pub(super) mod tests {
             "NotSubmitted completion is not an external wake"
         );
         send(&mut service, "later-legitimate-arrival");
-        assert!(service.next_queue().is_some());
+        let (_, arrival_token) = service.next_queue().unwrap();
+        assert!(
+            service
+                .queue_claim(&recipient, arrival_token, ClientEvent::Idle, 10, false)
+                .unwrap()
+                .is_some(),
+            "a later idle arrival can use its separately reserved epoch"
+        );
     }
 
     #[test]
@@ -1583,6 +1810,212 @@ pub(super) mod tests {
             })
             .unwrap();
         assert_eq!(attempts, 0);
+    }
+
+    #[test]
+    fn new_arrival_during_handoff_wakes_after_completion_without_replaying_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = Service::open(&dir.path().join("chat.sqlite3"), MACHINE).unwrap();
+        let recipient = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        let integration = VerifiedContext::Integration(recipient.clone());
+        service
+            .handle(&integration, Operation::Register {})
+            .unwrap();
+        let send = |service: &mut Service, key: &str| {
+            service
+                .handle(
+                    &VerifiedContext::Observer,
+                    Operation::Send {
+                        draft: Draft {
+                            key: key.into(),
+                            project: PROJECT.into(),
+                            to: vec![Target::Agent(recipient.session.clone())],
+                            body: key.into(),
+                            reply_to: None,
+                        },
+                    },
+                )
+                .unwrap();
+        };
+        send(&mut service, "first");
+        service
+            .observe_native(&recipient, ClientEvent::Idle, 1)
+            .unwrap();
+        let (_, token) = service.next_queue().unwrap();
+        let attempt = service
+            .queue_claim(&recipient, token, ClientEvent::Idle, 2, false)
+            .unwrap()
+            .unwrap();
+        send(&mut service, "second");
+        service
+            .store
+            .finish(
+                &attempt.id,
+                super::super::types::Handoff::Accepted {
+                    receipt: "native receipt".into(),
+                },
+            )
+            .unwrap();
+        service.queue_done(&recipient.session, token);
+        let (_, second_token) = service
+            .next_queue()
+            .expect("external arrival must wake after completion");
+        assert_ne!(token, second_token);
+        assert!(service
+            .queue_claim(&recipient, second_token, ClientEvent::Idle, 3, false)
+            .unwrap()
+            .is_some());
+        service.queue_done(&recipient.session, second_token);
+        assert!(
+            service.next_queue().is_none(),
+            "completion alone cannot rearm"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lost_queue_finish_expires_to_unknown_without_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.sqlite3");
+        let mut service = Service::open(&path, MACHINE).unwrap();
+        let recipient = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        let integration = VerifiedContext::Integration(recipient.clone());
+        service
+            .handle(&integration, Operation::Register {})
+            .unwrap();
+        service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Send {
+                    draft: Draft {
+                        key: "unknown-on-expiry".into(),
+                        project: PROJECT.into(),
+                        to: vec![Target::Agent(recipient.session.clone())],
+                        body: "pending".into(),
+                        reply_to: None,
+                    },
+                },
+            )
+            .unwrap();
+        service
+            .observe_native(&recipient, ClientEvent::Idle, 1)
+            .unwrap();
+        let (_, token) = service.next_queue().unwrap();
+        let attempt = service
+            .queue_claim(&recipient, token, ClientEvent::Idle, 2, false)
+            .unwrap()
+            .unwrap();
+        service.queue_deadlines.insert(attempt.id, Instant::now());
+        assert!(service.expire_queues(Instant::now() + Duration::from_millis(1)));
+        service.queue_done(&recipient.session, token);
+        assert!(service.next_queue().is_none());
+        let db = rusqlite::Connection::open(path).unwrap();
+        let state: String = db
+            .query_row("SELECT state FROM delivery_receipts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state, "unknown");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owner_worker_queues_after_stop_and_records_only_the_native_receipt() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = super::super::adapters::BACKEND_SOCKET_TEST_LOCK
+            .lock()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.path().join("app-server-control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let read = |ws: &mut tungstenite::WebSocket<UnixStream>| -> Value {
+                serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap()
+            };
+            let init = read(&mut ws);
+            assert_eq!(init["method"], "initialize");
+            ws.send(tungstenite::Message::Text(
+                json!({"id":init["id"],"result":{}}).to_string().into(),
+            ))
+            .unwrap();
+            assert_eq!(read(&mut ws)["method"], "initialized");
+            let state = read(&mut ws);
+            assert_eq!(state["method"], "thread/read");
+            ws.send(tungstenite::Message::Text(json!({"id":state["id"],"result":{"thread":{"id":state["params"]["threadId"],"status":{"type":"idle"}}}}).to_string().into())).unwrap();
+            let queue = read(&mut ws);
+            assert_eq!(queue["method"], "thread/queue/add");
+            ws.send(tungstenite::Message::Text(
+                json!({"id":queue["id"],"result":{"queuedSubmission":{
+                    "id":"55555555-5555-4555-8555-555555555555",
+                    "clientUserMessageId":queue["params"]["clientUserMessageId"],
+                    "input":queue["params"]["input"]
+                }}})
+                .to_string()
+                .into(),
+            ))
+            .unwrap();
+        });
+        let process = super::super::adapters::ProcessEvidence::read(std::process::id()).unwrap();
+        let mut recipient = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        recipient.native_id = "66666666-6666-4666-8666-666666666666".into();
+        recipient.process_start = format!(
+            "{}:{}:{}",
+            process.boot_id, process.pid, process.start_ticks
+        );
+        super::super::adapters::install_test_binding(&dir.path().join("bindings"), &recipient)
+            .unwrap();
+        let path = dir.path().join("chat.sqlite3");
+        let mut service = Service::open(&path, MACHINE).unwrap();
+        let integration = VerifiedContext::Integration(recipient.clone());
+        service
+            .handle(&integration, Operation::Register {})
+            .unwrap();
+        service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Send {
+                    draft: Draft {
+                        key: "owned-native-stop".into(),
+                        project: PROJECT.into(),
+                        to: vec![Target::Agent(recipient.session.clone())],
+                        body: "native queue body".into(),
+                        reply_to: None,
+                    },
+                },
+            )
+            .unwrap();
+        service
+            .handle(
+                &integration,
+                Operation::Observe {
+                    event: ClientEvent::Idle,
+                    epoch: 1,
+                },
+            )
+            .unwrap();
+        let (sender, receiver) = mpsc::sync_channel(WRITER_QUEUE);
+        let changes = Changes::default();
+        let owner = thread::spawn(move || run_owner(service, receiver, &changes));
+        let started = Instant::now();
+        loop {
+            let db = rusqlite::Connection::open(&path).unwrap();
+            let state: String = db
+                .query_row("SELECT state FROM delivery_receipts", [], |row| row.get(0))
+                .unwrap();
+            if state == "accepted" {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "native queue did not finish: {state}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(sender);
+        owner.join().unwrap();
+        server.join().unwrap();
     }
 
     #[test]
