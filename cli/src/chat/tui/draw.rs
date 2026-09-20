@@ -203,7 +203,7 @@ impl App {
             Focus::Recipients => "@name · ↑↓ choose · Enter pin · Tab write · Backspace remove",
             Focus::Body => "Enter send · Ctrl+J newline · Tab feed · Esc feed",
             Focus::Feed => {
-                "j/k browse · PgUp/PgDn read · r reply · a reply all · G latest · q quit"
+                "j/k browse · PgUp/PgDn read · Home older · r reply · a reply all · G latest · q quit"
             }
         };
         frame.render_widget(Paragraph::new(Span::styled(hints, DIM)), vertical[3]);

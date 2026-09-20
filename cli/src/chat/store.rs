@@ -602,6 +602,91 @@ impl Store {
         }
         Ok(page)
     }
+
+    pub(super) fn latest_project_sequence(&self, project: &str) -> Result<u64> {
+        let latest: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(project_seq), 0) FROM events WHERE project = ?1",
+            [project],
+            |row| row.get(0),
+        )?;
+        u64::try_from(latest).context("Chat event sequence is negative")
+    }
+
+    pub(super) fn feed_before(
+        &self,
+        project: &str,
+        viewer: Option<&SessionRef>,
+        before: Option<u64>,
+        limit: u16,
+    ) -> Result<Vec<(u64, FeedEvent)>> {
+        ensure!((1..=100).contains(&limit), "invalid Chat page limit");
+        let sender = viewer
+            .map(|session| serde_json::to_string(&Actor::Agent(session.clone())))
+            .transpose()?;
+        let target = viewer
+            .map(|session| serde_json::to_string(&Target::Agent(session.clone())))
+            .transpose()?;
+        let mut statement = self.connection.prepare(
+            "SELECT e.project_seq, e.payload_json, e.kind FROM events e
+             JOIN messages m ON m.id = COALESCE(e.message_id, json_extract(e.payload_json, '$.id'))
+             WHERE e.project = ?1 AND (?2 IS NULL OR e.project_seq < ?2)
+               AND (?3 IS NULL OR m.sender_key = ?3 OR EXISTS (
+                   SELECT 1 FROM recipients r WHERE r.message_id = m.id AND r.target_key = ?4))
+             ORDER BY e.project_seq DESC LIMIT ?5",
+        )?;
+        let mut rows = statement.query(params![
+            project,
+            before.map(to_sql_integer).transpose()?,
+            sender,
+            target,
+            limit,
+        ])?;
+        let mut page = Vec::new();
+        let mut bytes = 0;
+        while let Some(row) = rows.next()? {
+            let sequence: i64 = row.get(0)?;
+            let payload: String = row.get(1)?;
+            if bytes + payload.len() > 768 * 1024 {
+                break;
+            }
+            bytes += payload.len();
+            let kind: String = row.get(2)?;
+            let event = if kind == "message" {
+                FeedEvent::Message {
+                    message: serde_json::from_str(&payload)?,
+                }
+            } else {
+                serde_json::from_str(&payload)?
+            };
+            page.push((u64::try_from(sequence)?, event));
+        }
+        page.reverse();
+        Ok(page)
+    }
+
+    pub(super) fn has_feed_before(
+        &self,
+        project: &str,
+        viewer: Option<&SessionRef>,
+        before: u64,
+    ) -> Result<bool> {
+        let sender = viewer
+            .map(|session| serde_json::to_string(&Actor::Agent(session.clone())))
+            .transpose()?;
+        let target = viewer
+            .map(|session| serde_json::to_string(&Target::Agent(session.clone())))
+            .transpose()?;
+        let exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events e
+             JOIN messages m ON m.id = COALESCE(e.message_id, json_extract(e.payload_json, '$.id'))
+             WHERE e.project = ?1 AND e.project_seq < ?2
+               AND (?3 IS NULL OR m.sender_key = ?3 OR EXISTS (
+                   SELECT 1 FROM recipients r WHERE r.message_id = m.id AND r.target_key = ?4)))",
+            params![project, to_sql_integer(before)?, sender, target],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
 }
 
 fn append_event(

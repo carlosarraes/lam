@@ -45,6 +45,12 @@ pub enum Operation {
         cursor: Option<String>,
         limit: u16,
     },
+    HistoryTail {
+        project: String,
+        #[serde(default)]
+        before: Option<u64>,
+        limit: u16,
+    },
     Subscribe {
         project: String,
         #[serde(default)]
@@ -152,6 +158,18 @@ impl Operation {
             } => {
                 validate_project(project)?;
                 validate_page(cursor, *limit)?;
+            }
+            Self::HistoryTail {
+                project,
+                before,
+                limit,
+            } => {
+                validate_project(project)?;
+                ensure!((1..=100).contains(limit), "Chat page limit must be 1..100");
+                ensure!(
+                    before.is_none_or(|value| value > 0 && value <= i64::MAX as u64),
+                    "invalid Chat history boundary"
+                );
             }
             Self::Status {}
             | Self::Register {}

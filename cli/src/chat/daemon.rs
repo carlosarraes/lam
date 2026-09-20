@@ -1381,6 +1381,11 @@ impl Service {
                 cursor,
                 limit,
             } => self.page(context, &project, "history", cursor, limit),
+            Operation::HistoryTail {
+                project,
+                before,
+                limit,
+            } => self.history_tail(context, &project, before, limit),
             Operation::Subscribe {
                 project,
                 cursor,
@@ -1642,6 +1647,53 @@ impl Service {
             events.push(json!({"sequence": sequence, "event": event}));
         }
         Ok(json!({"events": events, "cursor": self.encode_cursor(&cursor)?}))
+    }
+
+    fn history_tail(
+        &self,
+        context: &VerifiedContext,
+        project: &str,
+        before: Option<u64>,
+        limit: u16,
+    ) -> Result<Value> {
+        self.check_project(context, project)?;
+        let session = match context {
+            VerifiedContext::Participant(registration) => Some(registration.session.clone()),
+            _ => None,
+        };
+        let latest = self.store.latest_project_sequence(project)?;
+        let page = self
+            .store
+            .feed_before(project, session.as_ref(), before, limit)?;
+        let oldest = page
+            .first()
+            .map(|(sequence, _)| *sequence)
+            .unwrap_or_else(|| {
+                before.unwrap_or_else(|| latest.saturating_add(1).min(i64::MAX as u64))
+            });
+        let more = self
+            .store
+            .has_feed_before(project, session.as_ref(), oldest)?;
+        let events: Vec<_> = page
+            .into_iter()
+            .map(|(sequence, event)| json!({"sequence": sequence, "event": event}))
+            .collect();
+        let cursor = Cursor {
+            version: 1,
+            role: if session.is_some() {
+                "participant"
+            } else {
+                "observer"
+            }
+            .into(),
+            session,
+            project: project.into(),
+            query: "subscribe".into(),
+            after: latest,
+        };
+        Ok(
+            json!({"events": events, "before": oldest, "more": more, "subscribe_cursor": self.encode_cursor(&cursor)?}),
+        )
     }
 
     fn encode_cursor(&self, cursor: &Cursor) -> Result<String> {
@@ -1913,6 +1965,123 @@ pub(super) mod tests {
             )
             .unwrap();
         assert!(reopened.next_queue().is_none());
+    }
+
+    #[test]
+    fn observer_history_tail_pages_backwards_and_hands_off_a_live_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = Service::open(&dir.path().join("chat.sqlite3"), MACHINE).unwrap();
+        let recipient = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        service
+            .handle(
+                &VerifiedContext::Integration(recipient.clone()),
+                Operation::Register {},
+            )
+            .unwrap();
+        for index in 0..3 {
+            service
+                .handle(
+                    &VerifiedContext::Observer,
+                    Operation::Send {
+                        draft: Draft {
+                            key: format!("tail-{index}"),
+                            project: PROJECT.into(),
+                            to: vec![Target::Agent(recipient.session.clone())],
+                            body: format!("message {index}"),
+                            reply_to: None,
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        let latest = service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::HistoryTail {
+                    project: PROJECT.into(),
+                    before: None,
+                    limit: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(latest["events"].as_array().unwrap().len(), 2);
+        assert_eq!(latest["more"], true);
+        assert_eq!(
+            latest["events"][0]["event"]["message"]["draft"]["body"],
+            "message 1"
+        );
+        assert_eq!(
+            latest["events"][1]["event"]["message"]["draft"]["body"],
+            "message 2"
+        );
+        let before = latest["before"].as_u64().unwrap();
+        let older = service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::HistoryTail {
+                    project: PROJECT.into(),
+                    before: Some(before),
+                    limit: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(older["events"].as_array().unwrap().len(), 1);
+        assert_eq!(older["more"], false);
+        assert_eq!(
+            older["events"][0]["event"]["message"]["draft"]["body"],
+            "message 0"
+        );
+        let cursor = latest["subscribe_cursor"].as_str().unwrap();
+        let live = service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Subscribe {
+                    project: PROJECT.into(),
+                    cursor: Some(cursor.into()),
+                    limit: 100,
+                },
+            )
+            .unwrap();
+        assert!(live["events"].as_array().unwrap().is_empty());
+        service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Send {
+                    draft: Draft {
+                        key: "after-tail".into(),
+                        project: PROJECT.into(),
+                        to: vec![Target::Agent(recipient.session.clone())],
+                        body: "message 3".into(),
+                        reply_to: None,
+                    },
+                },
+            )
+            .unwrap();
+        let next = service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Subscribe {
+                    project: PROJECT.into(),
+                    cursor: Some(cursor.into()),
+                    limit: 100,
+                },
+            )
+            .unwrap();
+        assert_eq!(next["events"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            next["events"][0]["event"]["message"]["draft"]["body"],
+            "message 3"
+        );
+        assert!(service
+            .handle(
+                &VerifiedContext::Participant(recipient),
+                Operation::HistoryTail {
+                    project: "33333333-3333-4333-8333-333333333333".into(),
+                    before: None,
+                    limit: 2,
+                }
+            )
+            .is_err());
     }
 
     #[test]

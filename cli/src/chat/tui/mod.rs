@@ -38,7 +38,14 @@ struct RosterEntry {
 }
 
 struct FeedRow {
+    sequence: u64,
     message: Message,
+    receipts: HashMap<SessionRef, String>,
+    exposure: HashMap<SessionRef, String>,
+}
+
+#[derive(Default)]
+struct PendingState {
     receipts: HashMap<SessionRef, String>,
     exposure: HashMap<SessionRef, String>,
 }
@@ -61,6 +68,10 @@ pub struct App {
     broadcast_pending: bool,
     suggestion: usize,
     messages: Vec<FeedRow>,
+    pending_events: HashMap<String, PendingState>,
+    older_before: Option<u64>,
+    older_end: bool,
+    older_loading: bool,
     selected: usize,
     detail_scroll: u16,
     unseen: usize,
@@ -84,6 +95,10 @@ impl Default for App {
             broadcast_pending: false,
             suggestion: 0,
             messages: Vec::new(),
+            pending_events: HashMap::new(),
+            older_before: None,
+            older_end: false,
+            older_loading: false,
             selected: 0,
             detail_scroll: 0,
             unseen: 0,
@@ -131,64 +146,89 @@ impl App {
     }
 
     fn add_event(&mut self, event: FeedEvent) {
+        let sequence = self
+            .messages
+            .last()
+            .map(|row| row.sequence + 1)
+            .unwrap_or(1);
+        self.add_event_at(sequence, event, false);
+    }
+
+    fn add_event_at(&mut self, sequence: u64, event: FeedEvent, older: bool) {
         match event {
             FeedEvent::Message { message } => {
                 if self.messages.iter().any(|row| row.message.id == message.id) {
                     return;
                 }
-                self.messages.push(FeedRow {
+                let state = self.pending_events.remove(&message.id).unwrap_or_default();
+                let row = FeedRow {
+                    sequence,
                     message,
-                    receipts: HashMap::new(),
-                    exposure: HashMap::new(),
-                });
-                if self.following {
-                    self.selected = self.messages.len().saturating_sub(1);
+                    receipts: state.receipts,
+                    exposure: state.exposure,
+                };
+                let position = self
+                    .messages
+                    .partition_point(|existing| existing.sequence < sequence);
+                self.messages.insert(position, row);
+                if older && position <= self.selected && self.messages.len() > 1 {
+                    self.selected += 1;
+                } else if self.following && position + 1 == self.messages.len() {
+                    self.selected = self.messages.len() - 1;
                     self.detail_scroll = 0;
-                } else {
+                } else if !older {
                     self.unseen += 1;
                 }
-                if self.messages.len() > 500 {
-                    self.messages.remove(0);
-                    self.selected = self.selected.saturating_sub(1);
+                if self.messages.len() > 1000 {
+                    if older {
+                        self.messages.pop();
+                        self.selected = self.selected.min(self.messages.len() - 1);
+                        self.older_end = true;
+                    } else {
+                        self.messages.remove(0);
+                        self.selected = self.selected.saturating_sub(1);
+                    }
                 }
             }
-            FeedEvent::Receipt {
-                message_id,
-                recipient,
-                state,
-                ..
-            } => {
+            event => {
+                let message_id = match &event {
+                    FeedEvent::Receipt { message_id, .. }
+                    | FeedEvent::Exposure { message_id, .. }
+                    | FeedEvent::Fetched { message_id, .. } => message_id,
+                    FeedEvent::Message { .. } => unreachable!(),
+                };
                 if let Some(row) = self
                     .messages
                     .iter_mut()
-                    .find(|row| row.message.id == message_id)
+                    .find(|row| row.message.id == *message_id)
                 {
-                    row.receipts.insert(recipient, state);
+                    row.apply_event(&event);
+                } else if self.pending_events.len() < 1000
+                    || self.pending_events.contains_key(message_id)
+                {
+                    self.pending_events
+                        .entry(message_id.clone())
+                        .or_default()
+                        .apply_event(&event);
                 }
             }
-            FeedEvent::Exposure {
-                message_id,
-                recipient,
-                state,
-            } => {
-                if let Some(row) = self
-                    .messages
-                    .iter_mut()
-                    .find(|row| row.message.id == message_id)
-                {
-                    row.exposure.insert(recipient, state);
-                }
-            }
-            FeedEvent::Fetched {
-                message_id,
-                recipient,
-            } => {
-                if let Some(row) = self
-                    .messages
-                    .iter_mut()
-                    .find(|row| row.message.id == message_id)
-                {
-                    row.exposure.insert(recipient, "fetched".into());
+        }
+    }
+
+    fn add_page(&mut self, page: &serde_json::Value, older: bool) {
+        if older {
+            self.older_loading = false;
+            self.following = false;
+            self.older_before = page["before"].as_u64();
+            self.older_end = page["more"] != true || self.messages.len() >= 1000;
+        }
+        if let Some(events) = page["events"].as_array() {
+            for item in events {
+                if let (Some(sequence), Ok(event)) = (
+                    item["sequence"].as_u64(),
+                    serde_json::from_value::<FeedEvent>(item["event"].clone()),
+                ) {
+                    self.add_event_at(sequence, event, older);
                 }
             }
         }
@@ -379,6 +419,41 @@ impl App {
     }
 }
 
+impl FeedRow {
+    fn apply_event(&mut self, event: &FeedEvent) {
+        apply_delivery_event(&mut self.receipts, &mut self.exposure, event);
+    }
+}
+
+impl PendingState {
+    fn apply_event(&mut self, event: &FeedEvent) {
+        apply_delivery_event(&mut self.receipts, &mut self.exposure, event);
+    }
+}
+
+fn apply_delivery_event(
+    receipts: &mut HashMap<SessionRef, String>,
+    exposure: &mut HashMap<SessionRef, String>,
+    event: &FeedEvent,
+) {
+    match event {
+        FeedEvent::Receipt {
+            recipient, state, ..
+        } => {
+            receipts.insert(recipient.clone(), state.clone());
+        }
+        FeedEvent::Exposure {
+            recipient, state, ..
+        } => {
+            exposure.insert(recipient.clone(), state.clone());
+        }
+        FeedEvent::Fetched { recipient, .. } => {
+            exposure.insert(recipient.clone(), "fetched".into());
+        }
+        FeedEvent::Message { .. } => {}
+    }
+}
+
 fn fuzzy_match(candidate: &str, query: &str) -> bool {
     if query.is_empty() || candidate.contains(query) {
         return true;
@@ -391,6 +466,8 @@ fn fuzzy_match(candidate: &str, query: &str) -> bool {
 
 enum Network {
     Feed(serde_json::Value),
+    Older(serde_json::Value),
+    OlderFailed(String),
     Roster(Vec<RosterEntry>, bool),
     Completed(Action, String, anyhow::Result<()>),
     Status(String),
@@ -399,6 +476,7 @@ enum Network {
 enum Work {
     Send(Action, String),
     RefreshRoster,
+    LoadOlder(u64),
 }
 
 pub fn run(paths: &Paths, project: &str) -> anyhow::Result<()> {
@@ -413,10 +491,30 @@ pub fn run(paths: &Paths, project: &str) -> anyhow::Result<()> {
     let roster: Vec<RosterEntry> =
         serde_json::from_value(initial["sessions"].clone()).context("invalid Chat roster")?;
     app.set_roster(roster, initial["stale"] == true);
+    let tail = super::commands::observer_request(
+        paths,
+        protocol::Operation::HistoryTail {
+            project: project.into(),
+            before: None,
+            limit: 100,
+        },
+    )?;
+    app.older_before = tail["before"].as_u64();
+    app.older_end = tail["more"] != true;
+    app.add_page(&tail, false);
+    let cursor = tail["subscribe_cursor"]
+        .as_str()
+        .context("missing live Chat cursor")?
+        .to_owned();
 
     let (network_tx, network_rx) = mpsc::channel();
     let (work_tx, work_rx) = mpsc::channel();
-    spawn_subscription(paths.clone(), project.to_owned(), network_tx.clone());
+    spawn_subscription(
+        paths.clone(),
+        project.to_owned(),
+        Some(cursor),
+        network_tx.clone(),
+    );
     spawn_worker(paths.clone(), project.to_owned(), work_rx, network_tx);
 
     let mut terminal = ratatui::init();
@@ -436,14 +534,11 @@ fn event_loop(
     loop {
         while let Ok(message) = network.try_recv() {
             match message {
-                Network::Feed(page) => {
-                    if let Some(events) = page["events"].as_array() {
-                        for event in events {
-                            if let Ok(event) = serde_json::from_value(event["event"].clone()) {
-                                app.add_event(event);
-                            }
-                        }
-                    }
+                Network::Feed(page) => app.add_page(&page, false),
+                Network::Older(page) => app.add_page(&page, true),
+                Network::OlderFailed(error) => {
+                    app.older_loading = false;
+                    app.status = format!("older history failed: {error}");
                 }
                 Network::Roster(roster, stale) => app.set_roster(roster, stale),
                 Network::Completed(action, key, result) => {
@@ -479,7 +574,23 @@ fn event_loop(
                                 app.status = "Chat sender stopped".into();
                             }
                         }
-                        Action::LoadOlder => app.status = "Older rows load from the beginning on reconnect; this view keeps the latest 500.".into(),
+                        Action::LoadOlder => {
+                            if app.older_end {
+                                app.status = if app.messages.len() >= 1000 {
+                                    "This view keeps 1000 rows; use chat history for more.".into()
+                                } else {
+                                    "Beginning of retained history.".into()
+                                };
+                            } else if !app.older_loading {
+                                if let Some(before) = app.older_before {
+                                    app.older_loading = true;
+                                    if work.send(Work::LoadOlder(before)).is_err() {
+                                        app.older_loading = false;
+                                        app.status = "Chat history worker stopped".into();
+                                    }
+                                }
+                            }
+                        }
                         Action::JumpLatest => {}
                     }
                 }
@@ -506,6 +617,20 @@ fn spawn_worker(
     std::thread::spawn(move || {
         while let Ok(job) = jobs.recv() {
             match job {
+                Work::LoadOlder(before) => {
+                    let outcome = super::commands::observer_request(
+                        &paths,
+                        protocol::Operation::HistoryTail {
+                            project: project.clone(),
+                            before: Some(before),
+                            limit: 100,
+                        },
+                    );
+                    let _ = output.send(match outcome {
+                        Ok(page) => Network::Older(page),
+                        Err(error) => Network::OlderFailed(error.to_string()),
+                    });
+                }
                 Work::RefreshRoster => {
                     if let Ok(page) = super::commands::observer_request(
                         &paths,
@@ -552,10 +677,14 @@ fn spawn_worker(
 }
 
 #[cfg(unix)]
-fn spawn_subscription(paths: Paths, project: String, output: mpsc::Sender<Network>) {
+fn spawn_subscription(
+    paths: Paths,
+    project: String,
+    mut cursor: Option<String>,
+    output: mpsc::Sender<Network>,
+) {
     use std::os::unix::net::UnixStream;
     std::thread::spawn(move || {
-        let mut cursor: Option<String> = None;
         let mut delay = Duration::from_millis(250);
         loop {
             let connected = (|| -> anyhow::Result<UnixStream> {
@@ -602,7 +731,13 @@ fn spawn_subscription(paths: Paths, project: String, output: mpsc::Sender<Networ
 }
 
 #[cfg(not(unix))]
-fn spawn_subscription(_paths: Paths, _project: String, _output: mpsc::Sender<Network>) {}
+fn spawn_subscription(
+    _paths: Paths,
+    _project: String,
+    _cursor: Option<String>,
+    _output: mpsc::Sender<Network>,
+) {
+}
 
 #[cfg(test)]
 mod tests {
@@ -756,6 +891,39 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
         assert_eq!(app.messages[app.selected].message.id, "third");
         assert_eq!(app.unseen, 0);
+    }
+
+    #[test]
+    fn older_page_preserves_selection_and_applies_later_receipts() {
+        let mut app = App::default();
+        let recipient = SessionRef {
+            machine: "11111111-1111-4111-8111-111111111111".into(),
+            incarnation: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+        };
+        app.add_page(&serde_json::json!({"events": [
+            {"sequence": 2, "event": FeedEvent::Message { message: message("second", "two") }},
+            {"sequence": 3, "event": FeedEvent::Receipt { message_id: "first".into(), recipient: recipient.clone(), attempt_id: None, state: "accepted".into(), outcome: None }},
+        ]}), false);
+        assert_eq!(app.messages[app.selected].message.id, "second");
+        app.add_page(
+            &serde_json::json!({"before":1,"more":false,"events":[
+                {"sequence":1,"event":FeedEvent::Message { message: message("first", "one") }}
+            ]}),
+            true,
+        );
+        assert_eq!(
+            app.messages
+                .iter()
+                .map(|row| row.message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(app.messages[app.selected].message.id, "second");
+        assert_eq!(
+            app.messages[0].receipts.get(&recipient).map(String::as_str),
+            Some("accepted")
+        );
+        assert!(app.older_end);
     }
 
     #[test]
