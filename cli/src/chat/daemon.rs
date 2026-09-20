@@ -323,6 +323,7 @@ fn apply_work(service: &mut Service, work: Work, changes: &Changes) {
             | Operation::End {}
             | Operation::SetState { .. }
             | Operation::Delivery { .. }
+            | Operation::Observe { .. }
             | Operation::Finish { .. }
             | Operation::Retry { .. }
     );
@@ -821,7 +822,7 @@ impl Service {
         if wake.in_flight != Some(token)
             || wake.external_state != ClientEvent::Idle
             || wake.registration != *registration
-            || epoch <= wake.stop_epoch
+            || wake.stop_epoch.checked_add(1) != Some(epoch)
         {
             return Ok(None);
         }
@@ -913,6 +914,10 @@ impl Service {
                 }
                 Operation::Delivery { event, epoch } => {
                     self.delivery(registration, event, epoch, false)
+                }
+                Operation::Observe { event, epoch } => {
+                    self.observe_native(registration, event, epoch)?;
+                    Ok(Value::Null)
                 }
                 Operation::Finish { attempt, outcome } => {
                     self.verify_registration(registration)?;
@@ -1360,6 +1365,13 @@ pub(super) mod tests {
         let (_, token) = service.next_queue().unwrap();
         assert!(
             service
+                .queue_claim(&recipient, token, ClientEvent::Busy, 7, false)
+                .unwrap()
+                .is_none(),
+            "worker cannot invent a later native epoch"
+        );
+        assert!(
+            service
                 .queue_claim(&recipient, token, ClientEvent::Busy, 5, false)
                 .unwrap()
                 .is_none(),
@@ -1527,6 +1539,50 @@ pub(super) mod tests {
             .is_none());
         let (_, new_token) = service.next_queue().unwrap();
         assert_ne!(old_token, new_token);
+    }
+
+    #[test]
+    fn native_stop_records_a_wake_without_claiming_or_model_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = Service::open(&dir.path().join("chat.sqlite3"), MACHINE).unwrap();
+        let recipient = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        let integration = VerifiedContext::Integration(recipient.clone());
+        service
+            .handle(&integration, Operation::Register {})
+            .unwrap();
+        service
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Send {
+                    draft: Draft {
+                        key: "before-stop".into(),
+                        project: PROJECT.into(),
+                        to: vec![Target::Agent(recipient.session.clone())],
+                        body: "pending".into(),
+                        reply_to: None,
+                    },
+                },
+            )
+            .unwrap();
+        let observe = Operation::Observe {
+            event: ClientEvent::Idle,
+            epoch: 1,
+        };
+        assert!(service
+            .handle(
+                &VerifiedContext::Participant(recipient.clone()),
+                observe.clone()
+            )
+            .is_err());
+        assert!(service.handle(&integration, observe).unwrap().is_null());
+        assert!(service.next_queue().is_some());
+        let db = rusqlite::Connection::open(dir.path().join("chat.sqlite3")).unwrap();
+        let attempts: i64 = db
+            .query_row("SELECT COUNT(*) FROM delivery_attempts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(attempts, 0);
     }
 
     #[test]

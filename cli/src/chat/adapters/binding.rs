@@ -268,6 +268,24 @@ pub(super) fn codex_check(
         return deliver_hook(&files, &binding, &paths.socket, deadline, output);
     }
     let credential = format!("{}.{}", binding.locator()?, binding.integration_secret);
+    if matches!(input.hook_event_name.as_str(), "Stop" | "UserPromptSubmit") {
+        use crate::chat::{protocol::Operation, types::ClientEvent};
+        let (event, epoch) = if input.hook_event_name == "Stop" {
+            (
+                ClientEvent::Idle,
+                files.reserve_epochs(&binding, 2, deadline)?,
+            )
+        } else {
+            (ClientEvent::Busy, files.next_epoch(&binding, deadline)?)
+        };
+        request(
+            &paths.socket,
+            &credential,
+            Operation::Observe { event, epoch },
+            deadline,
+        )?;
+        return Ok(());
+    }
     let operation = if matches!(
         input.hook_event_name.as_str(),
         "SessionEnd" | "SubagentStop"
@@ -858,6 +876,16 @@ impl BindingFiles {
         binding: &NativeBinding,
         deadline: std::time::Instant,
     ) -> anyhow::Result<u64> {
+        self.reserve_epochs(binding, 1, deadline)
+    }
+
+    fn reserve_epochs(
+        &self,
+        binding: &NativeBinding,
+        count: u64,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<u64> {
+        anyhow::ensure!((1..=2).contains(&count), "invalid native epoch reservation");
         let key = binding.locator()?;
         let _lock = self.lock(&key, deadline)?;
         let mut current = self.load(&key)?;
@@ -869,11 +897,11 @@ impl BindingFiles {
         );
         current.observation_epoch = current
             .observation_epoch
-            .checked_add(1)
+            .checked_add(count)
             .ok_or_else(|| anyhow::anyhow!("native observation epoch exhausted"))?;
         current.validate_shape()?;
         self.replace(&key, &current)?;
-        Ok(current.observation_epoch)
+        Ok(current.observation_epoch - count + 1)
     }
 
     fn create(&self, binding: &NativeBinding, deadline: std::time::Instant) -> anyhow::Result<()> {
@@ -1594,6 +1622,23 @@ mod tests {
             "owned-native",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn stop_reserves_an_adjacent_claim_epoch_before_other_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = BindingFiles::open(&dir.path().join("bindings")).unwrap();
+        let mut record = binding();
+        record
+            .bind(crate::chat::types::SessionRef {
+                machine: "11111111-1111-4111-8111-111111111111".into(),
+                incarnation: "33333333-3333-4333-8333-333333333333".into(),
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        files.create(&record, deadline).unwrap();
+        assert_eq!(files.reserve_epochs(&record, 2, deadline).unwrap(), 1);
+        assert_eq!(files.next_epoch(&record, deadline).unwrap(), 3);
     }
 
     #[test]

@@ -56,6 +56,10 @@ pub enum Operation {
         event: ClientEvent,
         epoch: u64,
     },
+    Observe {
+        event: ClientEvent,
+        epoch: u64,
+    },
     Finish {
         attempt: String,
         outcome: Handoff,
@@ -123,6 +127,16 @@ impl Operation {
             }
             Self::Delivery { epoch, .. } => {
                 ensure!(*epoch <= i64::MAX as u64, "invalid observation epoch");
+            }
+            Self::Observe { event, epoch } => {
+                ensure!(
+                    matches!(event, ClientEvent::Idle | ClientEvent::Busy),
+                    "only native idle/busy observations may wake queue delivery"
+                );
+                ensure!(
+                    *epoch > 0 && *epoch < i64::MAX as u64,
+                    "invalid queue observation epoch"
+                );
             }
             Self::Sessions { project } => validate_project(project)?,
             Self::Inbox { cursor, limit } => validate_page(cursor, *limit)?,
@@ -221,6 +235,23 @@ pub fn write_frame<W: Write>(writer: &mut W, value: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_observation_accepts_only_bounded_idle_or_busy_epochs() {
+        for (event, epoch, allowed) in [
+            (ClientEvent::Idle, 1, true),
+            (ClientEvent::Busy, 2, true),
+            (ClientEvent::Hook, 3, false),
+            (ClientEvent::Disconnected, 4, false),
+            (ClientEvent::Idle, 0, false),
+            (ClientEvent::Idle, i64::MAX as u64, false),
+        ] {
+            assert_eq!(
+                Operation::Observe { event, epoch }.validate().is_ok(),
+                allowed
+            );
+        }
+    }
 
     #[test]
     fn internal_fetch_completion_cannot_be_forged_on_wire() {
