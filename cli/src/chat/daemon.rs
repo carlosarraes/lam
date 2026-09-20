@@ -1202,12 +1202,12 @@ impl Service {
         let cursor_key = store.cursor_key()?;
         store.recover_submitting()?;
         let mut direct = HashMap::new();
+        let mut queue = HashMap::new();
         for state in store.load_sessions()? {
-            if state.registration.client == "claude"
-                && state.connected
-                && state.registration.eligible
-                && !state.ended
-            {
+            if !state.connected || !state.registration.eligible || state.ended {
+                continue;
+            }
+            if state.registration.client == "claude" {
                 let ready = store.has_pending(&state.registration.session)?;
                 direct.insert(
                     state.registration.session.clone(),
@@ -1218,6 +1218,23 @@ impl Service {
                         arrival_during_flight: false,
                     },
                 );
+            } else if state.registration.client == "codex" {
+                if let Some((event, epoch)) = store.observation(&state.registration.session)? {
+                    let ready = event == ClientEvent::Idle
+                        && store.has_pending(&state.registration.session)?;
+                    queue.insert(
+                        state.registration.session.clone(),
+                        QueueWake {
+                            registration: state.registration,
+                            stop_epoch: epoch,
+                            claim_epoch: None,
+                            external_state: event,
+                            ready,
+                            in_flight: None,
+                            arrival_during_flight: false,
+                        },
+                    );
+                }
             }
         }
         Ok(Self {
@@ -1232,7 +1249,7 @@ impl Service {
                 .parent()
                 .context("Chat database has no parent directory")?
                 .join("bindings"),
-            queue: HashMap::new(),
+            queue,
             direct,
             next_queue_token: 0,
         })
@@ -1823,6 +1840,79 @@ pub(super) mod tests {
         drop(service);
         let mut reopened = Service::open(&path, MACHINE).unwrap();
         assert_eq!(reopened.next_direct().unwrap().0, recipient);
+    }
+
+    #[test]
+    fn codex_idle_observation_survives_owner_restart_without_replaying_a_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.sqlite3");
+        let mut service = Service::open(&path, MACHINE).unwrap();
+        let recipient = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        service
+            .handle(
+                &VerifiedContext::Integration(recipient.clone()),
+                Operation::Register {},
+            )
+            .unwrap();
+        service
+            .observe_native(&recipient, ClientEvent::Idle, 4)
+            .unwrap();
+        drop(service);
+
+        let mut reopened = Service::open(&path, MACHINE).unwrap();
+        assert!(reopened.next_queue().is_none());
+        reopened
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Send {
+                    draft: Draft {
+                        key: "after-restart".into(),
+                        project: PROJECT.into(),
+                        to: vec![Target::Agent(recipient.session.clone())],
+                        body: "new arrival after native Stop".into(),
+                        reply_to: None,
+                    },
+                },
+            )
+            .unwrap();
+        let (scheduled, token) = reopened.next_queue().expect("persisted Stop should wake");
+        assert_eq!(scheduled, recipient);
+        assert_eq!(reopened.queue_epoch(&recipient.session, token), Some(None));
+    }
+
+    #[test]
+    fn codex_busy_observation_does_not_become_idle_on_owner_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.sqlite3");
+        let mut service = Service::open(&path, MACHINE).unwrap();
+        let recipient = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        service
+            .handle(
+                &VerifiedContext::Integration(recipient.clone()),
+                Operation::Register {},
+            )
+            .unwrap();
+        service
+            .observe_native(&recipient, ClientEvent::Busy, 4)
+            .unwrap();
+        drop(service);
+
+        let mut reopened = Service::open(&path, MACHINE).unwrap();
+        reopened
+            .handle(
+                &VerifiedContext::Observer,
+                Operation::Send {
+                    draft: Draft {
+                        key: "busy-after-restart".into(),
+                        project: PROJECT.into(),
+                        to: vec![Target::Agent(recipient.session.clone())],
+                        body: "wait for a real Stop".into(),
+                        reply_to: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert!(reopened.next_queue().is_none());
     }
 
     #[test]

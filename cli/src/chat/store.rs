@@ -445,6 +445,25 @@ impl Store {
         Ok(self.connection.execute("INSERT INTO delivery_observations(recipient_key, epoch, state) VALUES (?1, ?2, ?3) ON CONFLICT(recipient_key) DO UPDATE SET epoch = excluded.epoch, state = excluded.state WHERE excluded.epoch > delivery_observations.epoch", params![target, to_sql_integer(epoch)?, serde_json::to_string(&event)?])? > 0)
     }
 
+    pub(super) fn observation(&self, recipient: &SessionRef) -> Result<Option<(ClientEvent, u64)>> {
+        let target = serde_json::to_string(&Target::Agent(recipient.clone()))?;
+        let row: Option<(i64, String)> = self
+            .connection
+            .query_row(
+                "SELECT epoch, state FROM delivery_observations WHERE recipient_key = ?1",
+                [target],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(epoch, state)| {
+            Ok((
+                serde_json::from_str(&state)?,
+                u64::try_from(epoch).context("Chat observation epoch is negative")?,
+            ))
+        })
+        .transpose()
+    }
+
     pub(super) fn retry_delivery(&mut self, recipient: &SessionRef, id: &str) -> Result<()> {
         let target = serde_json::to_string(&Target::Agent(recipient.clone()))?;
         let transaction = self
