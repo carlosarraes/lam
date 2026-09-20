@@ -14,6 +14,8 @@ agent ──lam push──▶ lam-api (CF Worker: Effect + D1 + Topic DO) ──
 - `cli/` — Rust CLI. `cargo test`, `cargo build --release`.
 - `skill/lam/` — agent-facing skill; symlink into `~/.claude/skills/lam`.
 
+LAM Chat is a separate, experimental terminal-first channel for agent sessions. `lam chat` opens a human observer; `lam chat sessions`, `send`, `reply`, `history`, and `lam inbox` provide project-scoped coordination. Local messages and receipts live in SQLite; an explicitly mapped peer can replay them over a persistent SSH link without Cloudflare or phone notifications. Linux native adapters have been live-probed; macOS native delivery and production PC–Mac rollout are not yet verified. See [Chat setup and limitations](docs/chat.md).
+
 ## Setup
 
 1. Worker: `cd worker && npx wrangler d1 migrations apply lam --remote && npx wrangler deploy`, then `printf %s '<value>' | npx wrangler secret put <NAME>` for `LAM_TOKEN`, `LAM_HMAC_SECRET`, `NTFY_TOPIC` (an unguessable topic name — it is the only access control on the topic).

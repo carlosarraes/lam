@@ -12,6 +12,24 @@ struct Fixture {
 }
 
 #[test]
+fn embedded_guide_explains_inline_chat_and_attention_boundary() {
+    let output = Command::new(env!("CARGO_BIN_EXE_lam"))
+        .arg("--llm")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let guide = String::from_utf8(output.stdout).unwrap();
+    for phrase in [
+        "lam chat send",
+        "lam inbox",
+        "Short messages arrive inline",
+        "approval",
+    ] {
+        assert!(guide.contains(phrase), "missing guide text: {phrase}");
+    }
+}
+
+#[test]
 fn chat_send_help_is_available_without_cloud_config() {
     let fixture = Fixture::new();
     let output = fixture

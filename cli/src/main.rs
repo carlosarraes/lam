@@ -40,7 +40,7 @@ fn llm_guide() -> &'static str {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Private local messaging between agent sessions
+    /// Private project-scoped messaging between agent sessions
     Chat(chat::commands::ChatArgs),
     /// Read the current authenticated participant's Chat inbox
     Inbox(chat::commands::InboxArgs),
