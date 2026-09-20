@@ -24,6 +24,8 @@ pub struct Config {
     pub batch_bytes: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub projects: Vec<ProjectMapping>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<PeerConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,7 +35,20 @@ pub struct ProjectMapping {
     pub roots: Vec<PathBuf>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerConfig {
+    pub machine: String,
+    pub ssh_host: String,
+    pub initiator: bool,
+    pub projects: Vec<String>,
+}
+
 impl Config {
+    pub fn load_existing(path: &Path) -> Result<Self> {
+        Self::load(path)
+    }
+
     pub fn load_or_create(path: &Path) -> Result<Self> {
         if path.exists() {
             return Self::load(path);
@@ -44,6 +59,7 @@ impl Config {
             inline_bytes: DEFAULT_LIMITS.inline_bytes,
             batch_bytes: DEFAULT_LIMITS.batch_bytes,
             projects: Vec::new(),
+            peers: Vec::new(),
         };
         config.create_or_load(path)
     }
@@ -96,6 +112,55 @@ impl Config {
         Ok(roots)
     }
 
+    pub fn peer(&self, machine: &str) -> Option<&PeerConfig> {
+        self.peers.iter().find(|peer| peer.machine == machine)
+    }
+
+    fn validate_peers(&self) -> Result<()> {
+        ensure!(self.peers.len() <= 8, "too many Chat peers");
+        let projects: std::collections::BTreeSet<_> = self
+            .projects
+            .iter()
+            .map(|project| project.id.as_str())
+            .collect();
+        let mut machines = std::collections::BTreeSet::new();
+        for peer in &self.peers {
+            super::protocol::validate_uuid(&peer.machine)?;
+            ensure!(
+                peer.machine != self.machine,
+                "Chat peer cannot be the local machine"
+            );
+            ensure!(
+                machines.insert(&peer.machine),
+                "duplicate Chat peer machine"
+            );
+            ensure!(
+                !peer.projects.is_empty(),
+                "Chat peer needs a shared project"
+            );
+            let mut allowed = std::collections::BTreeSet::new();
+            for project in &peer.projects {
+                super::protocol::validate_uuid(project)?;
+                ensure!(
+                    projects.contains(project.as_str()),
+                    "Chat peer project has no local mapping"
+                );
+                ensure!(allowed.insert(project), "duplicate Chat peer project");
+            }
+            ensure!(
+                !peer.ssh_host.is_empty()
+                    && peer.ssh_host.len() <= 255
+                    && peer
+                        .ssh_host
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"-_.@".contains(&byte))
+                    && !peer.ssh_host.starts_with('-'),
+                "invalid Chat SSH host alias",
+            );
+        }
+        Ok(())
+    }
+
     fn load(path: &Path) -> Result<Self> {
         validate_private_file(path, "Chat config")?;
         let mut raw = String::new();
@@ -112,11 +177,13 @@ impl Config {
         uuid::Uuid::parse_str(&config.machine).context("Chat machine ID is not a UUID")?;
         validate_limits(config.limits())?;
         config.project_roots()?;
+        config.validate_peers()?;
         Ok(config)
     }
 
     fn create_or_load(self, path: &Path) -> Result<Self> {
         validate_limits(self.limits())?;
+        self.validate_peers()?;
         let parent = path
             .parent()
             .context("Chat config path has no parent directory")?;
@@ -153,6 +220,7 @@ pub struct Paths {
     pub database: PathBuf,
     pub socket: PathBuf,
     pub observer_socket: PathBuf,
+    pub peer_socket: PathBuf,
     pub lock: PathBuf,
 }
 
@@ -163,6 +231,7 @@ impl Paths {
             &self.database,
             &self.socket,
             &self.observer_socket,
+            &self.peer_socket,
             &self.lock,
         ] {
             validate_path_components(path)?;
@@ -172,7 +241,8 @@ impl Paths {
             )?;
         }
         validate_socket_path(&self.socket)?;
-        validate_socket_path(&self.observer_socket)
+        validate_socket_path(&self.observer_socket)?;
+        validate_socket_path(&self.peer_socket)
     }
 
     pub fn discover() -> Result<Self> {
@@ -249,14 +319,17 @@ fn build_paths(config: PathBuf, data: PathBuf, runtime_base: PathBuf) -> Result<
     ensure_private_dir(&runtime, "Chat runtime namespace")?;
     let socket = runtime.join("chat.sock");
     let observer_socket = runtime.join("observer.sock");
+    let peer_socket = runtime.join("peer.sock");
     validate_socket_path(&socket)?;
     validate_socket_path(&observer_socket)?;
+    validate_socket_path(&peer_socket)?;
 
     Ok(Paths {
         config,
         database: canonical_data.join("chat.sqlite3"),
         socket,
         observer_socket,
+        peer_socket,
         lock: canonical_data.join("chat.lock"),
     })
 }

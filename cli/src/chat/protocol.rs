@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 
-use super::types::{ClientEvent, Draft, Handoff, SessionRef, Target};
+use super::types::{ClientEvent, Draft, Handoff, PeerEvent, SessionRef, Target};
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -75,6 +75,29 @@ pub enum Operation {
     },
     SetState {
         eligible: bool,
+    },
+    PeerCursor {
+        peer: String,
+        project: String,
+    },
+    PeerExport {
+        peer: String,
+        project: String,
+        after: u64,
+        limit: u16,
+    },
+    PeerImport {
+        peer: String,
+        event: Box<PeerEvent>,
+    },
+    PeerAck {
+        peer: String,
+        project: String,
+        through: u64,
+    },
+    PeerHealth {
+        peer: String,
+        connected: bool,
     },
 }
 
@@ -176,6 +199,43 @@ impl Operation {
             | Self::End {}
             | Self::Lifecycle {}
             | Self::SetState { .. } => {}
+            Self::PeerCursor { peer, project } => {
+                validate_uuid(peer)?;
+                validate_uuid(project)?;
+            }
+            Self::PeerExport {
+                peer,
+                project,
+                after,
+                limit,
+            } => {
+                validate_uuid(peer)?;
+                validate_uuid(project)?;
+                ensure!(
+                    *after <= i64::MAX as u64 && (1..=100).contains(limit),
+                    "invalid peer export boundary"
+                );
+            }
+            Self::PeerImport { peer, event } => {
+                validate_uuid(peer)?;
+                validate_uuid(&event.id)?;
+                validate_uuid(&event.origin)?;
+                validate_uuid(&event.project)?;
+                ensure!(
+                    event.seq > 0 && event.seq <= i64::MAX as u64,
+                    "invalid peer event sequence"
+                );
+            }
+            Self::PeerAck {
+                peer,
+                project,
+                through,
+            } => {
+                validate_uuid(peer)?;
+                validate_uuid(project)?;
+                ensure!(*through <= i64::MAX as u64, "invalid peer ack boundary");
+            }
+            Self::PeerHealth { peer, .. } => validate_uuid(peer)?,
         }
         Ok(())
     }

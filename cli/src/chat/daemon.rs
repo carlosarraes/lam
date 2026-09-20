@@ -481,6 +481,16 @@ pub fn run_with_validator(paths: &Paths, validator: Arc<dyn BindingValidator>) -
     let _lock = lock_instance(&paths.lock)?;
     let config = Config::load_or_create(&paths.config)?;
     let mut service = Service::open(&paths.database, &config.machine)?;
+    service.peer_projects = config
+        .peers
+        .iter()
+        .map(|peer| (peer.machine.clone(), peer.projects.clone()))
+        .collect();
+    service.peer_connected = config
+        .peers
+        .iter()
+        .map(|peer| (peer.machine.clone(), false))
+        .collect();
     service.participant_auth = validator.status();
     service.limits = config.limits();
     // Register termination handling only for this command. Enabling ctrlc's
@@ -489,6 +499,7 @@ pub fn run_with_validator(paths: &Paths, validator: Arc<dyn BindingValidator>) -
         signal_hook::iterator::Signals::new([libc::SIGINT, libc::SIGTERM, libc::SIGHUP])?;
     let (participant, _participant_path) = bind(&paths.socket)?;
     let (observer, _observer_path) = bind(&paths.observer_socket)?;
+    let (peer_listener, _peer_path) = bind(&paths.peer_socket)?;
     let stop = Arc::new(AtomicBool::new(false));
     let changes = Arc::new(Changes::default());
     let (sender, receiver) = mpsc::sync_channel::<Work>(WRITER_QUEUE);
@@ -496,6 +507,27 @@ pub fn run_with_validator(paths: &Paths, validator: Arc<dyn BindingValidator>) -
     let writer = thread::spawn(move || {
         run_owner(service, receiver, &writer_changes);
     });
+    let mut links = Vec::new();
+    for peer in config.peers.iter().filter(|peer| peer.initiator) {
+        let owned = Arc::new(Mutex::new(None));
+        let thread_owned = owned.clone();
+        let thread_paths = paths.clone();
+        let thread_config = config.clone();
+        let thread_peer = peer.clone();
+        let thread_stop = stop.clone();
+        let handle = thread::Builder::new()
+            .name(format!("lam-chat-peer-{}", peer.machine))
+            .spawn(move || {
+                super::peer::run_link(
+                    thread_paths,
+                    thread_config,
+                    thread_peer,
+                    thread_owned,
+                    thread_stop,
+                )
+            })?;
+        links.push((owned, handle));
+    }
     let subscriptions = Arc::new(Mutex::new(0_usize));
     let mut clients: Vec<thread::JoinHandle<()>> = Vec::new();
     let serving = (|| -> Result<()> {
@@ -545,11 +577,32 @@ pub fn run_with_validator(paths: &Paths, validator: Arc<dyn BindingValidator>) -
                     Err(error) => return Err(error.into()),
                 }
             }
+            match peer_listener.accept() {
+                Ok((stream, _)) => {
+                    if clients.len() < MAX_CONNECTIONS {
+                        let sender = sender.clone();
+                        clients.push(thread::spawn(move || {
+                            let mut stream = stream;
+                            if let Err(error) = serve_peer_connection(&mut stream, sender) {
+                                let _ = protocol::write_frame(
+                                    &mut DeadlineStream::new(&mut stream, IO_TIMEOUT),
+                                    &json!({"version": 1, "ok": false, "error": error.to_string()}),
+                                );
+                            }
+                        }));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
             thread::sleep(Duration::from_millis(5));
         }
         Ok(())
     })();
     stop.store(true, Ordering::SeqCst);
+    for (owned, _) in &links {
+        super::peer::stop_owned_child(owned);
+    }
     changes.notify();
     drop(sender);
     for client in clients {
@@ -558,6 +611,9 @@ pub fn run_with_validator(paths: &Paths, validator: Arc<dyn BindingValidator>) -
     writer
         .join()
         .map_err(|_| anyhow::anyhow!("Chat store owner panicked"))?;
+    for (_, link) in links {
+        let _ = link.join();
+    }
     serving
 }
 
@@ -576,6 +632,9 @@ fn apply_work(service: &mut Service, work: Work, changes: &Changes) {
             | Operation::Observe { .. }
             | Operation::Finish { .. }
             | Operation::Retry { .. }
+            | Operation::PeerImport { .. }
+            | Operation::PeerAck { .. }
+            | Operation::PeerHealth { .. }
     );
     let status = matches!(work.operation, Operation::Status {});
     let mut result = match (&work.context, &work.operation) {
@@ -730,6 +789,20 @@ fn serve_connection(
         }
         Ok(())
     }
+}
+
+fn serve_peer_connection(stream: &mut UnixStream, sender: SyncSender<Work>) -> Result<()> {
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    ensure!(
+        peer_identity(stream)?.uid == unsafe { libc::geteuid() },
+        "peer socket requires local owner"
+    );
+    let request = protocol::decode_request(protocol::read_frame(&mut DeadlineStream::new(
+        stream, IO_TIMEOUT,
+    ))?)?;
+    let data = dispatch(&sender, &VerifiedContext::Peer, request.operation)?;
+    respond(stream, data)
 }
 
 struct SubscriptionSlot<'a>(&'a Mutex<usize>);
@@ -947,6 +1020,7 @@ fn bind(path: &Path) -> Result<(UnixListener, SocketPath)> {
 #[derive(Clone, Debug)]
 pub enum VerifiedContext {
     Observer,
+    Peer,
     Participant(Registration),
     Integration(Registration),
     Enrollment {
@@ -969,6 +1043,8 @@ struct Service {
     queue: HashMap<SessionRef, QueueWake>,
     direct: HashMap<SessionRef, DirectWake>,
     next_queue_token: u64,
+    peer_projects: HashMap<String, Vec<String>>,
+    peer_connected: HashMap<String, bool>,
 }
 
 struct DirectWake {
@@ -1252,11 +1328,16 @@ impl Service {
             queue,
             direct,
             next_queue_token: 0,
+            peer_projects: HashMap::new(),
+            peer_connected: HashMap::new(),
         })
     }
 
     fn handle(&mut self, context: &VerifiedContext, operation: Operation) -> Result<Value> {
         operation.validate()?;
+        if matches!(context, VerifiedContext::Peer) {
+            return self.handle_peer(operation);
+        }
         if let VerifiedContext::Enrollment {
             project,
             name,
@@ -1339,7 +1420,8 @@ impl Service {
         }
         match operation {
             Operation::Status {} => Ok(
-                json!({"running": true, "protocol": 1, "machine": self.machine, "participant_auth": self.participant_auth}),
+                json!({"running": true, "protocol": 1, "machine": self.machine, "participant_auth": self.participant_auth,
+                    "peers": self.peer_connected}),
             ),
             Operation::Send { draft } => {
                 self.check_project(context, &draft.project)?;
@@ -1374,7 +1456,11 @@ impl Service {
             Operation::Sessions { project } => {
                 self.check_project(context, &project)?;
                 let sessions: Vec<Value> = Registry::new(&mut self.store)?.snapshot(&project).into_iter().map(|r| json!({"session": r.session, "name": r.name, "client": r.client, "eligible": r.eligible})).collect();
-                Ok(json!({"sessions": sessions}))
+                let stale = self.peer_projects.iter().any(|(peer, projects)| {
+                    projects.contains(&project)
+                        && !self.peer_connected.get(peer).copied().unwrap_or(false)
+                });
+                Ok(json!({"sessions": sessions, "stale": stale}))
             }
             Operation::History {
                 project,
@@ -1415,6 +1501,72 @@ impl Service {
                 )
             }
             _ => bail!("operation requires integration authority"),
+        }
+    }
+
+    fn handle_peer(&mut self, operation: Operation) -> Result<Value> {
+        let allowed = |peer: &str, project: &str| -> Result<Vec<String>> {
+            let projects = self
+                .peer_projects
+                .get(peer)
+                .context("Chat peer is not configured")?;
+            ensure!(
+                projects.iter().any(|item| item == project),
+                "Chat peer project is not allowed"
+            );
+            Ok(projects.clone())
+        };
+        match operation {
+            Operation::PeerCursor { peer, project } => {
+                allowed(&peer, &project)?;
+                let (received, acknowledged) = self.store.peer_cursor(&peer, &project)?;
+                Ok(json!({"received": received, "acknowledged": acknowledged}))
+            }
+            Operation::PeerExport {
+                peer,
+                project,
+                after,
+                limit,
+            } => {
+                allowed(&peer, &project)?;
+                Ok(serde_json::to_value(self.store.export_events(
+                    &project,
+                    after,
+                    limit.into(),
+                )?)?)
+            }
+            Operation::PeerImport { peer, event } => {
+                let projects = allowed(&peer, &event.project)?;
+                let result = self.store.import_event(&peer, &event, &projects)?;
+                if matches!(result, super::types::ImportResult::Applied { .. }) {
+                    if let super::types::PeerPayload::Message { message } = &event.payload {
+                        self.note_arrival(message);
+                    }
+                }
+                Ok(serde_json::to_value(result.through())?)
+            }
+            Operation::PeerAck {
+                peer,
+                project,
+                through,
+            } => {
+                allowed(&peer, &project)?;
+                self.store.record_peer_ack(&peer, &project, through)?;
+                Ok(json!({"acknowledged": through}))
+            }
+            Operation::PeerHealth { peer, connected } => {
+                ensure!(
+                    self.peer_projects.contains_key(&peer),
+                    "Chat peer is not configured"
+                );
+                ensure!(
+                    !connected || !self.peer_connected.get(&peer).copied().unwrap_or(false),
+                    "Chat peer link is already active"
+                );
+                self.peer_connected.insert(peer, connected);
+                Ok(json!({"connected": connected}))
+            }
+            _ => bail!("operation requires private peer authority"),
         }
     }
 

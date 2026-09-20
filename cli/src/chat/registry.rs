@@ -88,6 +88,7 @@ impl<'a> Registry<'a> {
         let existing = self.entries.iter().find(|entry| {
             let registration = &entry.registration;
             !entry.ended
+                && registration.session.machine == self.machine
                 && registration.client == evidence.client.as_str()
                 && registration.native_id == evidence.native_id
                 && registration.process_start == evidence.process_start
@@ -360,6 +361,53 @@ mod tests {
         let mut rebound = first.clone();
         rebound.process_start = "boot:42:101".into();
         assert!(registry.register(rebound).is_err());
+    }
+
+    #[test]
+    fn remote_presence_cannot_rebind_local_native_identity() {
+        use crate::chat::types::{PeerEvent, PeerPayload};
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = store(&dir.path().join("chat.sqlite3"));
+        let peer = "22222222-2222-4222-8222-222222222222";
+        let project = "33333333-3333-4333-8333-333333333333";
+        let remote = Registration {
+            session: SessionRef {
+                machine: peer.into(),
+                incarnation: uuid::Uuid::new_v4().to_string(),
+            },
+            project: project.into(),
+            name: "remote".into(),
+            client: "codex".into(),
+            native_id: "conversation".into(),
+            process_start: "boot:42:100".into(),
+            eligible: true,
+        };
+        store
+            .import_event(
+                peer,
+                &PeerEvent {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    origin: peer.into(),
+                    seq: 1,
+                    project: project.into(),
+                    payload: PeerPayload::Presence {
+                        session: SessionState {
+                            registration: remote.clone(),
+                            connected: true,
+                            ended: false,
+                        },
+                        epoch: 1,
+                    },
+                },
+                &[project.into()],
+            )
+            .unwrap();
+        let local = Registry::new(&mut store)
+            .unwrap()
+            .connect(project, name("local"), evidence("boot:42:100"), true)
+            .unwrap();
+        assert_eq!(local.session.machine, "pc");
+        assert_ne!(local.session.incarnation, remote.session.incarnation);
     }
 
     #[test]

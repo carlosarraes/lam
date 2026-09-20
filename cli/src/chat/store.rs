@@ -594,6 +594,15 @@ impl Store {
     /// observer events must never enter this stream or be echoed to a peer.
     pub fn export_events(&self, project: &str, after: u64, limit: usize) -> Result<Vec<PeerEvent>> {
         ensure!((1..=100).contains(&limit), "invalid peer page limit");
+        let latest: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(origin_seq), 0) FROM peer_outbox WHERE project = ?1",
+            [project],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            to_sql_integer(after)? <= latest,
+            "peer replay cursor is newer than origin history"
+        );
         let origin = self.machine()?;
         let mut statement = self.connection.prepare(
             "SELECT origin_seq, event_id, payload_json FROM peer_outbox
@@ -640,7 +649,9 @@ impl Store {
             "peer project is not authorized"
         );
         ensure!(event.seq > 0, "peer event sequence must be positive");
-        uuid::Uuid::parse_str(&event.id).context("invalid peer event ID")?;
+        super::protocol::validate_uuid(&event.id)?;
+        super::protocol::validate_uuid(&event.origin)?;
+        super::protocol::validate_uuid(&event.project)?;
         let payload = serde_json::to_string(&event.payload)?;
         ensure!(
             payload.len() <= 768 * 1024,
@@ -739,6 +750,20 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn peer_cursor(&self, peer: &str, project: &str) -> Result<(u64, u64)> {
+        let pair: Option<(i64, i64)> = self
+            .connection
+            .query_row(
+                "SELECT received_through, acknowledged_through FROM peer_cursors
+             WHERE peer = ?1 AND project = ?2",
+                params![peer, project],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (received, acknowledged) = pair.unwrap_or((0, 0));
+        Ok((u64::try_from(received)?, u64::try_from(acknowledged)?))
     }
 
     /// Durable feed sequence, filtered before pagination. Reads never update inbox,
@@ -1005,6 +1030,43 @@ fn backfill_peer_outbox(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
             params![project, sequence, id, serde_json::to_string(&payload)?],
         )?;
     }
+    let sessions = transaction
+        .prepare(
+            "SELECT machine, incarnation, project, name, client, native_id, process_start,
+                eligible, connected, ended FROM sessions ORDER BY project, machine, incarnation",
+        )?
+        .query_map([], |row| {
+            Ok(SessionState {
+                registration: Registration {
+                    session: SessionRef {
+                        machine: row.get(0)?,
+                        incarnation: row.get(1)?,
+                    },
+                    project: row.get(2)?,
+                    name: row.get(3)?,
+                    client: row.get(4)?,
+                    native_id: row.get(5)?,
+                    process_start: row.get(6)?,
+                    eligible: row.get(7)?,
+                },
+                connected: row.get(8)?,
+                ended: row.get(9)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for session in sessions {
+        let project = session.registration.project.clone();
+        let sequence = next_sequence(
+            transaction,
+            "SELECT COALESCE(MAX(origin_seq), 0) + 1 FROM peer_outbox WHERE project = ?1",
+            &project,
+        )?;
+        transaction.execute(
+            "INSERT INTO peer_outbox(project, origin_seq, event_id, payload_json) VALUES (?1, ?2, ?3, ?4)",
+            params![project, to_sql_integer(sequence)?, uuid::Uuid::new_v4().to_string(),
+                serde_json::to_string(&PeerPayload::Presence { session, epoch: sequence })?],
+        )?;
+    }
     Ok(())
 }
 
@@ -1028,7 +1090,10 @@ fn apply_peer_payload(
                 message.sender_seq > 0,
                 "peer sender sequence must be positive"
             );
-            ensure!(!message.draft.key.is_empty(), "peer message key is empty");
+            ensure!(
+                !message.draft.key.is_empty() && message.draft.key.len() <= 128,
+                "invalid peer message key"
+            );
             ensure!(
                 !message.draft.to.is_empty() && message.draft.to.len() <= 128,
                 "invalid peer recipient count"
@@ -1037,7 +1102,20 @@ fn apply_peer_payload(
                 message.draft.body.len() <= MAX_BODY_BYTES,
                 "peer message body exceeds 64 KiB"
             );
-            uuid::Uuid::parse_str(&message.id).context("invalid peer message ID")?;
+            super::protocol::validate_uuid(&message.id)?;
+            match &message.sender {
+                Actor::Agent(session) => super::protocol::validate_session(session)?,
+                Actor::Human { machine } => super::protocol::validate_uuid(machine)?,
+            }
+            for target in &message.draft.to {
+                match target {
+                    Target::Agent(session) => super::protocol::validate_session(session)?,
+                    Target::Human { machine } => super::protocol::validate_uuid(machine)?,
+                }
+            }
+            if let Some(reply_to) = &message.draft.reply_to {
+                super::protocol::validate_uuid(reply_to)?;
+            }
             ensure!(
                 serde_json::to_string(&canonical_draft(&message.draft)?)?
                     == serde_json::to_string(&message.draft)?,
@@ -1135,7 +1213,11 @@ fn apply_peer_payload(
                 state.is_some() != exposure.is_some(),
                 "peer receipt needs exactly one state field"
             );
-            uuid::Uuid::parse_str(message_id).context("invalid peer receipt message ID")?;
+            super::protocol::validate_uuid(message_id)?;
+            super::protocol::validate_session(recipient)?;
+            if let Some(attempt_id) = attempt_id {
+                super::protocol::validate_uuid(attempt_id)?;
+            }
             let target = serde_json::to_string(&Target::Agent(recipient.clone()))?;
             let recorded_project: Option<String> = transaction
                 .query_row(
@@ -1227,6 +1309,7 @@ fn apply_peer_payload(
             }
         }
         PeerPayload::Presence { session, epoch } => {
+            super::protocol::validate_session(&session.registration.session)?;
             ensure!(
                 session.registration.session.machine == origin,
                 "peer presence is not origin-owned"
@@ -1236,6 +1319,23 @@ fn apply_peer_payload(
                 "peer presence project differs from event"
             );
             ensure!(*epoch > 0, "peer presence epoch must be positive");
+            ensure!(
+                !session.registration.name.trim().is_empty()
+                    && session.registration.name.len() <= 256,
+                "invalid peer session name"
+            );
+            ensure!(
+                matches!(
+                    session.registration.client.as_str(),
+                    "codex" | "claude" | "pi"
+                ),
+                "unsupported peer client"
+            );
+            ensure!(
+                !session.registration.native_id.is_empty()
+                    && !session.registration.process_start.is_empty(),
+                "peer native identity is empty"
+            );
             ensure!(
                 !session.ended || (!session.connected && !session.registration.eligible),
                 "ended peer session cannot be active"
@@ -1258,6 +1358,12 @@ fn apply_peer_payload(
                 ensure!(
                     old.registration.project == event.project,
                     "peer incarnation changed project"
+                );
+                ensure!(
+                    old.registration.client == session.registration.client
+                        && old.registration.native_id == session.registration.native_id
+                        && old.registration.process_start == session.registration.process_start,
+                    "peer incarnation changed native identity"
                 );
             }
             transaction.execute(
@@ -1669,6 +1775,10 @@ mod tests {
         drop(legacy);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let mut upgraded = Store::open(&path).unwrap();
+        let replay = upgraded.export_events("lam", 0, 10).unwrap();
+        assert!(replay.iter().any(|event| matches!(
+            &event.payload, PeerPayload::Presence { session, .. } if session.ended
+        )));
         let replacement = connect(&mut upgraded).unwrap();
         assert_ne!(replacement.session, original.session);
         assert_eq!(connect(&mut upgraded).unwrap().session, replacement.session);
@@ -1840,6 +1950,10 @@ mod tests {
             )
             .unwrap();
         let event = pc.export_events(project, 0, 10).unwrap().remove(0);
+        assert!(
+            pc.export_events(project, 2, 10).is_err(),
+            "an origin restore must not silently skip its missing history"
+        );
         let allowed = vec![project.to_owned()];
         assert!(matches!(
             mac.import_event(pc_id, &event, &allowed).unwrap(),

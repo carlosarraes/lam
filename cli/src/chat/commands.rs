@@ -35,6 +35,8 @@ pub enum ChatCommand {
         #[arg(long, value_parser = ["pi"])]
         client: String,
     },
+    #[command(hide = true)]
+    PeerStdio,
     /// Run the private local Chat daemon. Does not install a service.
     Serve {
         #[arg(long, required = true)]
@@ -139,6 +141,13 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
         return super::adapters::pi::run_bridge();
     }
     let paths = Paths::discover()?;
+    if matches!(args.command.as_ref(), Some(ChatCommand::PeerStdio)) {
+        #[cfg(unix)]
+        super::peer::run_stdio(&paths)?;
+        #[cfg(not(unix))]
+        bail!("Chat peer bridge requires Unix sockets");
+        return Ok(0);
+    }
     if args.command.is_none() {
         #[cfg(target_os = "linux")]
         anyhow::ensure!(
@@ -156,6 +165,7 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
     match args.command.expect("handled empty Chat command") {
         ChatCommand::Hook { .. } => unreachable!("hook is dispatched before fallible setup"),
         ChatCommand::Bridge { .. } => unreachable!("bridge is dispatched before fallible setup"),
+        ChatCommand::PeerStdio => unreachable!("peer bridge is dispatched before command matching"),
         ChatCommand::Serve {
             native_bindings, ..
         } => {
@@ -727,6 +737,7 @@ mod tests {
             database: dir.path().join("chat.sqlite3"),
             socket: dir.path().join("chat.sock"),
             observer_socket: socket,
+            peer_socket: dir.path().join("peer.sock"),
             lock: dir.path().join("chat.lock"),
         };
         let owner = std::thread::spawn(move || {

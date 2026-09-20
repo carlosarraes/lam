@@ -157,3 +157,11 @@ pub enum ImportResult {
     Applied { through: u64 },
     Duplicate { through: u64 },
 }
+
+impl ImportResult {
+    pub fn through(self) -> u64 {
+        match self {
+            Self::Applied { through } | Self::Duplicate { through } => through,
+        }
+    }
+}
