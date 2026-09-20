@@ -18,9 +18,11 @@ unsafe extern "C" {
         bytes: *mut u8,
         length: *mut libc::size_t,
     ) -> libc::c_int;
+    fn lam_chat_process_owner(pid: libc::c_int, uid: *mut u32) -> libc::c_int;
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ProcessEvidence {
     pub pid: u32,
     pub parent: u32,
@@ -30,7 +32,31 @@ pub(super) struct ProcessEvidence {
     pub executable: PathBuf,
 }
 
+impl PartialEq for ProcessEvidence {
+    fn eq(&self, other: &Self) -> bool {
+        self.pid == other.pid
+            && self.uid == other.uid
+            && self.boot_id == other.boot_id
+            && self.start_usec == other.start_usec
+            && self.executable == other.executable
+    }
+}
+
+impl Eq for ProcessEvidence {}
+
 impl ProcessEvidence {
+    pub fn owner(pid: u32) -> Result<u32> {
+        ensure!(pid > 0 && pid <= i32::MAX as u32, "invalid process ID");
+        let mut uid = 0;
+        if unsafe { lam_chat_process_owner(pid as libc::c_int, &mut uid) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(uid)
+    }
+
+    pub fn start_marker(&self) -> u64 {
+        self.start_usec
+    }
     pub fn args(pid: u32) -> Result<Vec<Vec<u8>>> {
         ensure!(pid > 0 && pid <= i32::MAX as u32, "invalid process ID");
         let mut bytes = vec![0_u8; 1_048_576];
@@ -149,6 +175,9 @@ mod tests {
             std::env::current_exe().unwrap().canonicalize().unwrap()
         );
         assert_eq!(ProcessEvidence::read(std::process::id()).unwrap(), first);
+        let mut reparented = first.clone();
+        reparented.parent = 1;
+        assert_eq!(first, reparented);
         first.validate().unwrap();
         first.validate_descendant(std::process::id()).unwrap();
         assert!(first.validate_descendant(1).is_err());
@@ -189,5 +218,14 @@ mod tests {
         assert!(!args.is_empty());
         assert!(std::path::Path::new(std::ffi::OsStr::from_bytes(&args[0])).is_absolute());
         assert!(ProcessEvidence::args(0).is_err());
+    }
+
+    #[test]
+    fn native_argv_can_be_read_from_same_user_parent() {
+        let parent = unsafe { libc::getppid() } as u32;
+        let process = ProcessEvidence::read(parent).unwrap();
+        assert_eq!(process.uid, unsafe { libc::geteuid() });
+        let args = ProcessEvidence::args(parent).unwrap();
+        assert!(!args.is_empty());
     }
 }

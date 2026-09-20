@@ -31,7 +31,7 @@ impl HookInput {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn socket_locator(
     value: Option<std::ffi::OsString>,
 ) -> anyhow::Result<Option<std::path::PathBuf>> {
@@ -41,11 +41,13 @@ pub(super) fn socket_locator(
         path.is_absolute(),
         "Claude peer socket path is not absolute"
     );
+    #[cfg(target_os = "macos")]
+    let path = path.canonicalize()?;
     crate::chat::config::validate_path_components(&path)?;
     Ok(Some(path))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn encode_peer_frame(attempt: &crate::chat::types::Attempt) -> anyhow::Result<String> {
     crate::chat::protocol::validate_uuid(&attempt.id)?;
     crate::chat::protocol::validate_session(&attempt.recipient)?;
@@ -64,7 +66,7 @@ fn encode_peer_frame(attempt: &crate::chat::types::Attempt) -> anyhow::Result<St
     Ok(frame)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn submit_frame(
     process: &super::binding::ProcessEvidence,
     stream: &mut std::os::unix::net::UnixStream,
@@ -101,7 +103,7 @@ fn submit_frame(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(in crate::chat) fn submit_owned(
     directory: &std::path::Path,
     registration: &crate::chat::types::Registration,
@@ -119,7 +121,7 @@ pub(in crate::chat) fn submit_owned(
     Some((attempt, outcome))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn write_locator(path: &std::path::Path, id: &str) -> anyhow::Result<()> {
     use std::{
         io::Write,
@@ -130,6 +132,18 @@ fn write_locator(path: &std::path::Path, id: &str) -> anyhow::Result<()> {
         path.is_absolute(),
         "Claude environment file is not absolute"
     );
+    #[cfg(target_os = "macos")]
+    let canonical_parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("missing Claude environment directory"))?
+        .canonicalize()?;
+    #[cfg(target_os = "macos")]
+    let canonical_path = canonical_parent.join(
+        path.file_name()
+            .ok_or_else(|| anyhow::anyhow!("missing Claude environment filename"))?,
+    );
+    #[cfg(target_os = "macos")]
+    let path = canonical_path.as_path();
     crate::chat::config::validate_path_components(path)?;
     let mut file = std::fs::OpenOptions::new()
         .append(true)
@@ -151,7 +165,7 @@ fn write_locator(path: &std::path::Path, id: &str) -> anyhow::Result<()> {
 
 /// Hook failures never block Claude's native work or inject recurring warnings.
 pub fn run_hook(event: &str, name: Option<String>) -> i32 {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let deadline = std::time::Instant::now() + crate::chat::delivery::HOOK_DEADLINE;
         let mut stage = "input";
@@ -173,11 +187,45 @@ pub fn run_hook(event: &str, name: Option<String>) -> i32 {
             let _ = super::hooks::record_error("claude", stage);
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (event, name);
     }
     0
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::{socket_locator, write_locator};
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+
+    #[test]
+    fn claude_tmp_alias_resolves_to_private_socket_and_environment_file() {
+        let dir = tempfile::Builder::new()
+            .prefix("lam-chat-claude-")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let socket = dir.path().join("native.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let alias = std::path::Path::new("/tmp")
+            .join(dir.path().file_name().unwrap())
+            .join("native.sock");
+        assert_eq!(
+            socket_locator(Some(alias.into_os_string())).unwrap(),
+            Some(socket)
+        );
+
+        let env_file = std::path::Path::new("/tmp")
+            .join(dir.path().file_name().unwrap())
+            .join("claude-env");
+        let id = "11111111-1111-4111-8111-111111111111";
+        write_locator(&env_file, id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("claude-env")).unwrap(),
+            format!("export LAM_CHAT_CLAUDE_SESSION_ID='{id}'\n")
+        );
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

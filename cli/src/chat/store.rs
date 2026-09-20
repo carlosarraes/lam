@@ -140,6 +140,17 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let was_ended: bool = transaction
+            .query_row(
+                "SELECT ended FROM sessions WHERE machine = ?1 AND incarnation = ?2",
+                params![
+                    registration.session.machine,
+                    registration.session.incarnation
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
         transaction.execute(
             "INSERT INTO sessions(machine, incarnation, project, name, client, native_id, process_start, eligible, connected, ended)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
@@ -150,6 +161,41 @@ impl Store {
                 registration.name, registration.client, registration.native_id, registration.process_start,
                 registration.eligible, entry.connected, entry.ended],
         )?;
+        if entry.ended && !was_ended {
+            let target = serde_json::to_string(&Target::Agent(registration.session.clone()))?;
+            let pending = transaction
+                .prepare(
+                    "SELECT d.message_id FROM delivery_receipts d
+                     WHERE d.target_key = ?1 AND d.state = 'queued'
+                       AND NOT EXISTS (
+                         SELECT 1 FROM delivery_attempt_messages m
+                         JOIN delivery_attempts a ON a.id = m.attempt_id
+                         WHERE m.message_id = d.message_id AND a.recipient_key = d.target_key
+                           AND a.state = 'submitting'
+                       )",
+                )?
+                .query_map([&target], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let now = Utc::now().to_rfc3339();
+            for id in pending {
+                transaction.execute(
+                    "UPDATE delivery_receipts SET state = 'unavailable', explicit_retry = 0, updated_at = ?3
+                     WHERE message_id = ?1 AND target_key = ?2 AND state = 'queued'",
+                    params![id, target, now],
+                )?;
+                append_event(
+                    &transaction,
+                    &id,
+                    &FeedEvent::Receipt {
+                        message_id: id.clone(),
+                        recipient: registration.session.clone(),
+                        attempt_id: None,
+                        state: "unavailable".into(),
+                        outcome: None,
+                    },
+                )?;
+            }
+        }
         if schema_version(&transaction)? >= 6 {
             let sequence = next_sequence(
                 &transaction,
@@ -414,11 +460,24 @@ impl Store {
             Handoff::Refused { .. } => "refused",
             Handoff::Unknown { .. } => "unknown",
         };
+        let ended: bool = transaction
+            .query_row(
+                "SELECT ended FROM sessions WHERE machine = ?1 AND incarnation = ?2",
+                params![attempt.recipient.machine, attempt.recipient.incarnation],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        let receipt_state = if state == "queued" && ended {
+            "unavailable"
+        } else {
+            state
+        };
         let now = Utc::now().to_rfc3339();
         transaction.execute("UPDATE delivery_attempts SET state = ?2, outcome_json = ?3, completed_at = ?4 WHERE id = ?1", params![attempt_id, if state == "queued" { "not_submitted" } else { state }, encoded, now])?;
         let ids = transaction.prepare("SELECT message_id FROM delivery_attempt_messages WHERE attempt_id = ?1 ORDER BY ordinal")?.query_map([attempt_id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         for id in &ids {
-            transaction.execute("UPDATE delivery_receipts SET state = ?3, evidence_json = ?4, updated_at = ?5, explicit_retry = CASE WHEN ?3 = 'queued' THEN explicit_retry ELSE 0 END WHERE message_id = ?1 AND target_key = ?2", params![id, target, state, encoded, now])?;
+            transaction.execute("UPDATE delivery_receipts SET state = ?3, evidence_json = ?4, updated_at = ?5, explicit_retry = CASE WHEN ?3 = 'queued' THEN explicit_retry ELSE 0 END WHERE message_id = ?1 AND target_key = ?2", params![id, target, receipt_state, encoded, now])?;
             append_event(
                 &transaction,
                 id,
@@ -426,7 +485,7 @@ impl Store {
                     message_id: id.clone(),
                     recipient: attempt.recipient.clone(),
                     attempt_id: Some(attempt.id.clone()),
-                    state: state.into(),
+                    state: receipt_state.into(),
                     outcome: Some(outcome.clone()),
                 },
             )?;
@@ -1569,6 +1628,116 @@ mod tests {
     };
 
     #[test]
+    fn ending_local_session_makes_queued_receipt_unavailable_without_losing_message() {
+        use crate::chat::registry::{ClientKind, NativeEvidence, Registry};
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("chat.sqlite3")).unwrap();
+        store.set_machine("pc").unwrap();
+        let registration = Registry::new(&mut store)
+            .unwrap()
+            .connect(
+                "lam",
+                crate::name::Sources {
+                    explicit: Some("pm".into()),
+                    lam_name: None,
+                    multiplexer: None,
+                },
+                NativeEvidence {
+                    client: ClientKind::Claude,
+                    native_id: "native".into(),
+                    process_start: "boot:1:2".into(),
+                },
+                true,
+            )
+            .unwrap();
+        let mut draft = draft("orphaned");
+        draft.to = vec![Target::Agent(registration.session.clone())];
+        draft.body = "orphaned".into();
+        let message = store.send(&sender(), &draft).unwrap();
+        Registry::new(&mut store)
+            .unwrap()
+            .end(&registration.session)
+            .unwrap();
+        let target = serde_json::to_string(&Target::Agent(registration.session.clone())).unwrap();
+        let state: String = store
+            .connection
+            .query_row(
+                "SELECT state FROM delivery_receipts WHERE message_id = ?1 AND target_key = ?2",
+                params![message.id, target],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "unavailable");
+        assert_eq!(store.message(&message.id).unwrap().draft.body, "orphaned");
+        assert!(store
+            .export_events("lam", 0, 100)
+            .unwrap()
+            .iter()
+            .any(|event| {
+                matches!(&event.payload, PeerPayload::Receipt { message_id, state: Some(state), .. }
+                if message_id == &message.id && state == "unavailable")
+            }));
+    }
+
+    #[test]
+    fn not_submitted_handoff_after_session_end_stays_unavailable() {
+        use crate::chat::{
+            config::DEFAULT_LIMITS,
+            registry::{ClientKind, NativeEvidence, Registry},
+            types::Handoff,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("chat.sqlite3")).unwrap();
+        store.set_machine("pc").unwrap();
+        let registration = Registry::new(&mut store)
+            .unwrap()
+            .connect(
+                "lam",
+                crate::name::Sources {
+                    explicit: Some("pm".into()),
+                    lam_name: None,
+                    multiplexer: None,
+                },
+                NativeEvidence {
+                    client: ClientKind::Claude,
+                    native_id: "native".into(),
+                    process_start: "boot:1:2".into(),
+                },
+                true,
+            )
+            .unwrap();
+        let mut draft = draft("late-finish");
+        draft.to = vec![Target::Agent(registration.session.clone())];
+        let message = store.send(&sender(), &draft).unwrap();
+        let attempt = store
+            .claim(&registration.session, DEFAULT_LIMITS)
+            .unwrap()
+            .unwrap();
+        Registry::new(&mut store)
+            .unwrap()
+            .end(&registration.session)
+            .unwrap();
+        store
+            .finish(
+                &attempt.id,
+                Handoff::NotSubmitted {
+                    reason: "closed".into(),
+                },
+            )
+            .unwrap();
+        let target = serde_json::to_string(&Target::Agent(registration.session)).unwrap();
+        let state: String = store
+            .connection
+            .query_row(
+                "SELECT state FROM delivery_receipts WHERE message_id = ?1 AND target_key = ?2",
+                params![message.id, target],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "unavailable");
+    }
+
+    #[test]
     fn mixed_preview_and_full_attempt_preserves_inbox_order() {
         use crate::chat::config::DEFAULT_LIMITS;
         let dir = tempfile::tempdir().unwrap();
@@ -1817,7 +1986,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(receipt.0, serde_json::to_string(&queued.to[0]).unwrap());
-            assert_eq!(receipt.1, "queued");
+            assert_eq!(receipt.1, "unavailable");
             assert_eq!(
                 serde_json::to_value(store.message(&message.id).unwrap()).unwrap(),
                 serde_json::to_value(&message).unwrap()

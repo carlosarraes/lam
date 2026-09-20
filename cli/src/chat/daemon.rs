@@ -39,6 +39,9 @@ pub struct PeerIdentity {
 /// cannot authorize a context. Participant bindings must never return Observer.
 pub trait BindingValidator: Send + Sync {
     fn validate(&self, peer: PeerIdentity, binding: &str) -> Result<VerifiedContext>;
+    fn reaps_local_processes(&self) -> bool {
+        false
+    }
     fn status(&self) -> &'static str {
         "custom validator"
     }
@@ -68,8 +71,9 @@ struct Work {
     deadline: Instant,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 enum QueueAction {
+    #[cfg(target_os = "linux")]
     Claim {
         registration: Registration,
         token: u64,
@@ -86,10 +90,8 @@ enum QueueAction {
         attempt: String,
         outcome: super::types::Handoff,
     },
-    Done {
-        session: SessionRef,
-        token: u64,
-    },
+    #[cfg(target_os = "linux")]
+    Done { session: SessionRef, token: u64 },
     DirectDone {
         session: SessionRef,
         token: u64,
@@ -278,7 +280,7 @@ fn run_queue_worker(
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_direct_worker(
     directory: std::path::PathBuf,
     registration: Registration,
@@ -314,7 +316,7 @@ fn run_direct_worker(
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn apply_queue_action(
     service: &mut Service,
     action: QueueAction,
@@ -322,6 +324,7 @@ fn apply_queue_action(
     running: &mut usize,
 ) {
     match action {
+        #[cfg(target_os = "linux")]
         QueueAction::Claim {
             registration,
             token,
@@ -374,6 +377,7 @@ fn apply_queue_action(
                 changes.notify();
             }
         }
+        #[cfg(target_os = "linux")]
         QueueAction::Done { session, token } => {
             service.queue_done(&session, token);
             *running = running.saturating_sub(1);
@@ -390,11 +394,22 @@ fn apply_queue_action(
 }
 
 fn run_owner(mut service: Service, receiver: mpsc::Receiver<Work>, changes: &Changes) -> Service {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let (queue_sender, queue_receiver) = mpsc::sync_channel::<QueueAction>(WRITER_QUEUE);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let mut queue_running = 0_usize;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let mut next_process_check = Instant::now();
     loop {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if service.native_liveness && Instant::now() >= next_process_check {
+            match service.reap_dead_local_processes() {
+                Ok(true) => changes.notify(),
+                Ok(false) => {}
+                Err(error) => eprintln!("Chat local process check failed: {error:#}"),
+            }
+            next_process_check = Instant::now() + Duration::from_secs(1);
+        }
         if service.expire_hooks(Instant::now()) {
             changes.notify();
         }
@@ -453,6 +468,36 @@ fn run_owner(mut service: Service, receiver: mpsc::Receiver<Work>, changes: &Cha
                 }
             }
         }
+        #[cfg(target_os = "macos")]
+        {
+            if service.expire_queues(Instant::now()) {
+                changes.notify();
+            }
+            for _ in 0..WRITER_QUEUE {
+                let Ok(action) = queue_receiver.try_recv() else {
+                    break;
+                };
+                apply_queue_action(&mut service, action, changes, &mut queue_running);
+            }
+            if queue_running < 4 {
+                if let Some((registration, token)) = service.next_direct() {
+                    let directory = service.bindings_directory.clone();
+                    let worker_sender = queue_sender.clone();
+                    let session = registration.session.clone();
+                    if thread::Builder::new()
+                        .name("lam-chat-claude-peer".into())
+                        .spawn(move || {
+                            run_direct_worker(directory, registration, token, worker_sender)
+                        })
+                        .is_ok()
+                    {
+                        queue_running += 1;
+                    } else {
+                        service.direct_done(&session, token, false);
+                    }
+                }
+            }
+        }
         repair_fetch(&mut service, changes, Instant::now());
         match receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(work) => apply_work(&mut service, work, changes),
@@ -492,6 +537,7 @@ pub fn run_with_validator(paths: &Paths, validator: Arc<dyn BindingValidator>) -
         .map(|peer| (peer.machine.clone(), false))
         .collect();
     service.participant_auth = validator.status();
+    service.native_liveness = validator.reaps_local_processes();
     service.limits = config.limits();
     // Register termination handling only for this command. Enabling ctrlc's
     // global termination feature would also change the existing pairing flow.
@@ -1063,6 +1109,7 @@ pub enum VerifiedContext {
 
 struct Service {
     participant_auth: &'static str,
+    native_liveness: bool,
     store: Store,
     machine: String,
     cursor_key: String,
@@ -1106,6 +1153,24 @@ struct Cursor {
 }
 
 impl Service {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn reap_dead_local_processes(&mut self) -> Result<bool> {
+        let dead: Vec<_> = self
+            .store
+            .load_sessions()?
+            .into_iter()
+            .filter(|state| {
+                !state.ended && !super::adapters::registration_live(&state.registration)
+            })
+            .map(|state| state.registration.session)
+            .collect();
+        for session in &dead {
+            Registry::new(&mut self.store)?.end(session)?;
+            self.queue.remove(session);
+            self.direct.remove(session);
+        }
+        Ok(!dead.is_empty())
+    }
     fn register_direct(&mut self, registration: &Registration) -> Result<()> {
         if registration.client != "claude" {
             return Ok(());
@@ -1345,6 +1410,7 @@ impl Service {
         }
         Ok(Self {
             participant_auth: "disabled",
+            native_liveness: false,
             store,
             machine: machine.into(),
             cursor_key,
@@ -1672,7 +1738,7 @@ impl Service {
         changed
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn expire_queues(&mut self, now: Instant) -> bool {
         let expired: Vec<_> = self
             .queue_deadlines
@@ -1979,6 +2045,36 @@ pub(super) mod tests {
             process_start: format!("boot:1:{id}"),
             eligible: true,
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn native_owner_reaps_a_dead_local_incarnation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service = Service::open(&dir.path().join("chat.sqlite3"), MACHINE).unwrap();
+        let mut stale = registration("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        stale.client = "claude".into();
+        stale.process_start = format!("{}:4294967295:1", uuid::Uuid::new_v4());
+        service
+            .handle(
+                &VerifiedContext::Integration(stale.clone()),
+                Operation::Register {},
+            )
+            .unwrap();
+        assert_eq!(
+            Registry::new(&mut service.store)
+                .unwrap()
+                .snapshot(PROJECT)
+                .len(),
+            1
+        );
+        assert!(service.reap_dead_local_processes().unwrap());
+        assert!(Registry::new(&mut service.store)
+            .unwrap()
+            .snapshot(PROJECT)
+            .is_empty());
+        assert!(!service.direct.contains_key(&stale.session));
+        assert!(!service.reap_dead_local_processes().unwrap());
     }
 
     #[test]

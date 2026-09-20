@@ -1,3 +1,6 @@
+#[cfg(target_os = "macos")]
+pub(super) use super::macos_process::ProcessEvidence;
+
 /// Authenticate only on the private participant endpoint. Connection and both
 /// frames share the caller's absolute deadline, including a congested listener.
 fn request(
@@ -109,6 +112,22 @@ fn connect_authenticated(
     let mut framed = daemon::DeadlineStream::until(&mut stream, deadline);
     protocol::write_frame(
         &mut framed,
+        &serde_json::json!({"version":1,"binding":credential}),
+    )?;
+    Ok(stream)
+}
+
+#[cfg(target_os = "macos")]
+fn connect_authenticated(
+    socket: &std::path::Path,
+    credential: &str,
+    deadline: std::time::Instant,
+) -> anyhow::Result<std::os::unix::net::UnixStream> {
+    use crate::chat::{daemon, protocol};
+    let mut stream = connect_native_socket(socket, deadline)?;
+    daemon::peer_identity(&stream)?;
+    protocol::write_frame(
+        &mut daemon::DeadlineStream::until(&mut stream, deadline),
         &serde_json::json!({"version":1,"binding":credential}),
     )?;
     Ok(stream)
@@ -604,13 +623,15 @@ fn binding_locator(
     use sha2::Digest;
     let lifetime = format!(
         "{}:{}:{}",
-        process.boot_id, process.pid, process.start_ticks
+        process.boot_id,
+        process.pid,
+        process.start_marker()
     );
     let input = serde_json::to_vec(&(client, native_id, lifetime))?;
     Ok(format!("{:x}", sha2::Sha256::digest(input)))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct NativeRuntime {
     client: String,
     version: String,
@@ -686,6 +707,185 @@ impl NativeRuntime {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl NativeRuntime {
+    fn discover(pid: u32, deadline: std::time::Instant) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        Self::find(pid, deadline)?.context("no supported native execution ancestor")
+    }
+
+    fn find(mut pid: u32, deadline: std::time::Instant) -> anyhow::Result<Option<Self>> {
+        use anyhow::Context;
+        for _ in 0..64 {
+            if pid <= 1 {
+                return Ok(None);
+            }
+            if ProcessEvidence::owner(pid).with_context(|| format!("native process owner {pid}"))?
+                != unsafe { libc::geteuid() }
+            {
+                return Ok(None);
+            }
+            let process = ProcessEvidence::read(pid)
+                .with_context(|| format!("native process evidence {pid}"))?;
+            let args = ProcessEvidence::args(pid)
+                .with_context(|| format!("native process arguments {pid}"))?;
+            let client = native_client(&process.executable, &args).or_else(|| {
+                pi_process_title(&process.executable, &args)
+                    .then(|| std::env::var_os("LAM_CHAT_PI_ENTRYPOINT"))
+                    .flatten()
+                    .map(|_| "pi")
+            });
+            if let Some(client) = client {
+                let version_args = version_args(client, &args)?;
+                let borrowed: Vec<_> = version_args.iter().map(String::as_str).collect();
+                let output = bounded_command(&process.executable, &borrowed, deadline, 256)?;
+                anyhow::ensure!(output.success, "native version check failed");
+                let version = parse_version(client, &output.stdout)?;
+                process.validate()?;
+                return Ok(Some(Self {
+                    client: client.into(),
+                    version,
+                    process,
+                }));
+            }
+            anyhow::ensure!(process.parent != pid, "invalid native process ancestry");
+            pid = process.parent;
+        }
+        anyhow::bail!("native process ancestry exceeds validation bound")
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_runtime_tests {
+    use super::*;
+    use crate::chat::types::{Attempt, Handoff, Registration, RenderedBatch, SessionRef};
+    use std::{
+        io::Read,
+        os::unix::{fs::PermissionsExt, net::UnixListener},
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn human_ssh_command_has_no_native_participant() {
+        let found = NativeRuntime::find(
+            std::process::id(),
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn private_mac_binding_authenticates_exact_lifetime_and_claude_socket() {
+        let dir = tempfile::Builder::new()
+            .prefix("lam-chat-mac-binding-")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let files = BindingFiles::open(&dir.path().join("bindings")).unwrap();
+        let native_id = "11111111-1111-4111-8111-111111111111";
+        let project = "22222222-2222-4222-8222-222222222222";
+        let session = SessionRef {
+            machine: "33333333-3333-4333-8333-333333333333".into(),
+            incarnation: "44444444-4444-4444-8444-444444444444".into(),
+        };
+        let process = ProcessEvidence::read(std::process::id()).unwrap();
+        let socket_dir = dir.path().join("claude-sockets");
+        std::fs::create_dir(&socket_dir).unwrap();
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = socket_dir.join("native.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut binding = NativeBinding::new(
+            "claude",
+            "2.1.278",
+            native_id,
+            process.clone(),
+            project,
+            "dev",
+        )
+        .unwrap();
+        binding.native_socket = Some(socket.clone());
+        binding.bind(session.clone()).unwrap();
+        files
+            .create(&binding, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+
+        let credential = format!(
+            "{}.{}",
+            binding.locator().unwrap(),
+            binding.participant_secret
+        );
+        let validator = NativeBindings::open(&files.directory).unwrap();
+        let context = validator
+            .validate_with(
+                crate::chat::daemon::PeerIdentity {
+                    uid: process.uid,
+                    pid: Some(process.pid),
+                },
+                &credential,
+                || {
+                    Ok(NativeRuntime {
+                        client: "claude".into(),
+                        version: "2.1.278".into(),
+                        process: process.clone(),
+                    })
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            context,
+            crate::chat::daemon::VerifiedContext::Participant(_)
+        ));
+        assert!(validator
+            .validate_with(
+                crate::chat::daemon::PeerIdentity {
+                    uid: process.uid,
+                    pid: Some(1)
+                },
+                &credential,
+                || Ok(NativeRuntime {
+                    client: "claude".into(),
+                    version: "2.1.278".into(),
+                    process: process.clone()
+                }),
+            )
+            .is_err());
+
+        let registration = Registration {
+            session: session.clone(),
+            project: project.into(),
+            name: "dev".into(),
+            client: "claude".into(),
+            native_id: native_id.into(),
+            process_start: binding.process_start(),
+            eligible: true,
+        };
+        let attempt = Attempt {
+            id: "55555555-5555-4555-8555-555555555555".into(),
+            recipient: session,
+            batch: RenderedBatch {
+                text: "native Mac frame".into(),
+                ..Default::default()
+            },
+        };
+        let result = super::super::claude::submit_owned(
+            &files.directory,
+            &registration,
+            Instant::now() + Duration::from_secs(2),
+            || Ok(Some(attempt.clone())),
+        )
+        .unwrap();
+        assert_eq!(result.0.id, attempt.id);
+        assert!(matches!(result.1, Handoff::Unknown { .. }));
+        let (mut receiver, _) = listener.accept().unwrap();
+        let mut bytes = String::new();
+        receiver.read_to_string(&mut bytes).unwrap();
+        let frame: serde_json::Value = serde_json::from_str(bytes.trim()).unwrap();
+        assert_eq!(frame["msg_id"], attempt.id);
+        assert_eq!(frame["message"]["content"], "native Mac frame");
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn user_manager_command(args: &[Vec<u8>]) -> bool {
     use std::os::unix::ffi::OsStrExt;
@@ -696,7 +896,7 @@ fn user_manager_command(args: &[Vec<u8>]) -> bool {
     }) && args.get(1).is_some_and(|flag| flag == b"--user")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn version_args(client: &str, process_args: &[Vec<u8>]) -> anyhow::Result<Vec<String>> {
     match client {
         "codex" | "claude" => Ok(vec!["--version".into()]),
@@ -729,7 +929,7 @@ fn version_args(client: &str, process_args: &[Vec<u8>]) -> anyhow::Result<Vec<St
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn parse_version(client: &str, output: &str) -> anyhow::Result<String> {
     let version = match client {
         "codex" => output.trim().strip_prefix("codex-cli "),
@@ -748,7 +948,7 @@ fn parse_version(client: &str, output: &str) -> anyhow::Result<String> {
     Ok(version.into())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn native_id_from(client: &str, lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<String> {
     let key = match client {
         "codex" => "CODEX_THREAD_ID",
@@ -761,7 +961,7 @@ fn native_id_from(client: &str, lookup: impl Fn(&str) -> Option<String>) -> anyh
     Ok(id)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn native_client(executable: &std::path::Path, args: &[Vec<u8>]) -> Option<&'static str> {
     let path = executable.to_str()?;
     let name = executable.file_name()?.to_str()?;
@@ -782,7 +982,7 @@ fn native_client(executable: &std::path::Path, args: &[Vec<u8>]) -> Option<&'sta
     None
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn pi_process_title(executable: &std::path::Path, args: &[Vec<u8>]) -> bool {
     executable
         .file_name()
@@ -790,12 +990,12 @@ fn pi_process_title(executable: &std::path::Path, args: &[Vec<u8>]) -> bool {
         && args.first().is_some_and(|arg| arg == b"pi")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(in crate::chat) struct NativeBindings {
     files: BindingFiles,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl NativeBindings {
     pub fn open(directory: &std::path::Path) -> anyhow::Result<Self> {
         Ok(Self {
@@ -847,10 +1047,13 @@ impl NativeBindings {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl crate::chat::daemon::BindingValidator for NativeBindings {
     fn status(&self) -> &'static str {
         "experimental native validator; native gates incomplete"
+    }
+    fn reaps_local_processes(&self) -> bool {
+        true
     }
     fn validate(
         &self,
@@ -865,6 +1068,11 @@ impl crate::chat::daemon::BindingValidator for NativeBindings {
             )
         })
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(in crate::chat) fn registration_live(registration: &crate::chat::types::Registration) -> bool {
+    registration_process(registration).is_ok()
 }
 
 #[cfg(unix)]
@@ -972,6 +1180,10 @@ pub struct ProcessEvidence {
 
 #[cfg(target_os = "linux")]
 impl ProcessEvidence {
+    pub fn start_marker(&self) -> u64 {
+        self.start_ticks
+    }
+
     pub fn read(pid: u32) -> anyhow::Result<Self> {
         use std::os::unix::fs::MetadataExt;
         anyhow::ensure!(pid > 0, "missing native process identity");
@@ -1146,6 +1358,24 @@ fn registration_process(
     Ok(process)
 }
 
+#[cfg(target_os = "macos")]
+fn registration_process(
+    registration: &crate::chat::types::Registration,
+) -> anyhow::Result<ProcessEvidence> {
+    let mut lifetime = registration.process_start.split(':');
+    let boot = lifetime.next().unwrap_or_default();
+    let pid = lifetime.next().unwrap_or_default().parse::<u32>()?;
+    let start = lifetime.next().unwrap_or_default().parse::<u64>()?;
+    anyhow::ensure!(lifetime.next().is_none(), "invalid native process lifetime");
+    crate::chat::protocol::validate_uuid(boot)?;
+    let process = ProcessEvidence::read(pid)?;
+    anyhow::ensure!(
+        process.boot_id == boot && process.start_marker() == start,
+        "native process lifetime changed"
+    );
+    Ok(process)
+}
+
 #[cfg(target_os = "linux")]
 pub(in crate::chat) fn claude_target(
     directory: &std::path::Path,
@@ -1220,6 +1450,48 @@ pub(in crate::chat) fn claude_target(
         }
     }
     anyhow::ensure!(owned, "native Claude process does not own peer listener");
+    process.validate()?;
+    Ok((process, path))
+}
+
+#[cfg(target_os = "macos")]
+pub(in crate::chat) fn claude_target(
+    directory: &std::path::Path,
+    registration: &crate::chat::types::Registration,
+) -> anyhow::Result<(ProcessEvidence, std::path::PathBuf)> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    anyhow::ensure!(registration.client == "claude", "peer target is not Claude");
+    crate::chat::protocol::validate_session(&registration.session)?;
+    crate::chat::protocol::validate_uuid(&registration.native_id)?;
+    let process = registration_process(registration)?;
+    let files = BindingFiles::open(directory)?;
+    let key = binding_locator("claude", &registration.native_id, &process)?;
+    let binding = files.load(&key)?;
+    anyhow::ensure!(
+        binding.process == process
+            && binding.client == registration.client
+            && binding.native_id == registration.native_id
+            && binding.session.as_ref() == Some(&registration.session)
+            && binding.project == registration.project
+            && binding.process_start() == registration.process_start
+            && binding.version == "2.1.278",
+        "native Claude binding changed"
+    );
+    let path = binding
+        .native_socket
+        .ok_or_else(|| anyhow::anyhow!("native Claude peer socket is unavailable"))?;
+    crate::chat::config::validate_path_components(&path)?;
+    crate::chat::daemon::validate_socket(&path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("missing native socket directory"))?;
+    let metadata = parent.symlink_metadata()?;
+    anyhow::ensure!(
+        metadata.is_dir()
+            && metadata.uid() == process.uid
+            && metadata.permissions().mode() & 0o077 == 0,
+        "native Claude socket directory must be private"
+    );
     process.validate()?;
     Ok((process, path))
 }
@@ -1345,6 +1617,85 @@ pub(super) fn connect_native_socket(
     Ok(stream)
 }
 
+#[cfg(target_os = "macos")]
+pub(super) fn connect_native_socket(
+    path: &std::path::Path,
+    deadline: std::time::Instant,
+) -> anyhow::Result<std::os::unix::net::UnixStream> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{ffi::OsStrExt, net::UnixStream},
+    };
+    crate::chat::daemon::validate_socket(path)?;
+    let bytes = path.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    anyhow::ensure!(
+        bytes.len() < address.sun_path.len() && !bytes.contains(&0) && length <= u8::MAX as usize,
+        "invalid native socket path"
+    );
+    address.sun_len = length as u8;
+    address.sun_family = libc::AF_UNIX as u8;
+    for (target, source) in address.sun_path.iter_mut().zip(bytes) {
+        *target = *source as libc::c_char;
+    }
+    anyhow::ensure!(
+        std::time::Instant::now() < deadline,
+        "native connection deadline expired"
+    );
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    anyhow::ensure!(fd >= 0, "cannot create native connection");
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    anyhow::ensure!(
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == 0,
+        "cannot make native connection close-on-exec"
+    );
+    stream.set_nonblocking(true)?;
+    let connected = unsafe {
+        libc::connect(
+            fd,
+            (&address as *const libc::sockaddr_un).cast(),
+            length as libc::socklen_t,
+        )
+    };
+    if connected != 0 {
+        let error = std::io::Error::last_os_error();
+        anyhow::ensure!(
+            error.raw_os_error() == Some(libc::EINPROGRESS),
+            "native connection failed"
+        );
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| anyhow::anyhow!("native connection deadline expired"))?;
+            let mut poll = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let ready = unsafe {
+                libc::poll(
+                    &mut poll,
+                    1,
+                    remaining.as_millis().min(i32::MAX as u128) as i32,
+                )
+            };
+            if ready < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            anyhow::ensure!(ready > 0, "native connection deadline expired");
+            if let Some(error) = stream.take_error()? {
+                return Err(error.into());
+            }
+            break;
+        }
+    }
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
 #[cfg(target_os = "linux")]
 fn parse_process_stat(stat: &str) -> anyhow::Result<(u32, u64)> {
     use anyhow::Context;
@@ -1365,7 +1716,7 @@ fn parse_process_stat(stat: &str) -> anyhow::Result<(u32, u64)> {
 
 /// Private integration record. Its secrets never enter model context or argv.
 /// Native IDs locate the record; a matching secret selects a fixed authority.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeBinding {
@@ -1387,7 +1738,7 @@ struct NativeBinding {
     integration_secret: String,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl NativeBinding {
     fn new(
         client: &str,
@@ -1452,7 +1803,7 @@ impl NativeBinding {
         );
         anyhow::ensure!(
             self.process.pid > 0
-                && self.process.start_ticks > 0
+                && self.process.start_marker() > 0
                 && self.process.executable.is_absolute(),
             "invalid native process evidence"
         );
@@ -1488,7 +1839,9 @@ impl NativeBinding {
     fn process_start(&self) -> String {
         format!(
             "{}:{}:{}",
-            self.process.boot_id, self.process.pid, self.process.start_ticks
+            self.process.boot_id,
+            self.process.pid,
+            self.process.start_marker()
         )
     }
 
@@ -1546,7 +1899,7 @@ impl NativeBinding {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_binding_key(key: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         key.len() == 64
@@ -1558,12 +1911,12 @@ fn validate_binding_key(key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct BindingFiles {
     directory: std::path::PathBuf,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl BindingFiles {
     fn open(directory: &std::path::Path) -> anyhow::Result<Self> {
         crate::chat::config::validate_path_components(directory)?;
@@ -1639,7 +1992,8 @@ impl BindingFiles {
             let target = CString::new(path.as_os_str().as_bytes())?;
             // Readers never see a partial record. An existing record (including
             // a symlink) is never replaced, even outside the cooperative lock.
-            if unsafe {
+            #[cfg(target_os = "linux")]
+            let renamed = unsafe {
                 libc::renameat2(
                     libc::AT_FDCWD,
                     source.as_ptr(),
@@ -1647,8 +2001,18 @@ impl BindingFiles {
                     target.as_ptr(),
                     libc::RENAME_NOREPLACE,
                 )
-            } != 0
-            {
+            };
+            #[cfg(target_os = "macos")]
+            let renamed = unsafe {
+                libc::renameatx_np(
+                    libc::AT_FDCWD,
+                    source.as_ptr(),
+                    libc::AT_FDCWD,
+                    target.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            };
+            if renamed != 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
             std::fs::File::open(&self.directory)?.sync_all()?;

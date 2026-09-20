@@ -2,7 +2,7 @@ use super::{
     config::{Config, Paths},
     protocol,
 };
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 use anyhow::bail;
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
@@ -241,7 +241,7 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
         return Ok(0);
     }
     if args.command.is_none() {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         anyhow::ensure!(
             maybe_participant(&paths)?.is_none(),
             "open the Chat observer in a human terminal, outside a native agent session"
@@ -264,7 +264,7 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
         } => {
             #[cfg(unix)]
             if native_bindings {
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 {
                     let directory = paths
                         .database
@@ -274,7 +274,7 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
                     let validator = super::adapters::NativeBindings::open(&directory)?;
                     super::daemon::run_with_validator(&paths, std::sync::Arc::new(validator))?;
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 bail!("native Chat binding validation is not implemented on this platform");
             } else {
                 super::daemon::run(&paths)?;
@@ -306,7 +306,7 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
             json,
             as_human,
         } => {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
                 use super::types::Draft;
                 let body = read_body(message, file, stdin)?;
@@ -314,6 +314,11 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
                 anyhow::ensure!(
                     !as_human || participant.is_none(),
                     "an authenticated agent cannot claim human Chat origin"
+                );
+                #[cfg(target_os = "macos")]
+                anyhow::ensure!(
+                    participant.is_some() || as_human,
+                    "macOS human Chat sends require --as-human"
                 );
                 let project = if let Some(participant) = &participant {
                     selected_participant_project(participant, project)?
@@ -346,36 +351,6 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
                 let result = submit_with_retry(&paths, participant.as_ref(), operation)?;
                 print_send(&result, json)?;
             }
-            #[cfg(all(unix, not(target_os = "linux")))]
-            {
-                let body = read_body(message, file, stdin)?;
-                anyhow::ensure!(
-                    as_human,
-                    "macOS Chat sends require --as-human; native agent binding is unavailable"
-                );
-                let project = selected_observer_project(&paths, project)?;
-                let roster = observer_request(
-                    &paths,
-                    protocol::Operation::Sessions {
-                        project: project.clone(),
-                    },
-                )?;
-                let recipients = exact_recipients(roster, &to, allow_stale_roster, None)?;
-                let result = submit_observer_with_retry(
-                    &paths,
-                    protocol::Operation::Send {
-                        draft: super::types::Draft {
-                            key: idempotency_key
-                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                            project,
-                            to: recipients,
-                            body,
-                            reply_to: None,
-                        },
-                    },
-                )?;
-                print_send(&result, json)?;
-            }
             #[cfg(not(unix))]
             {
                 let _ = (
@@ -404,12 +379,17 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
             as_human,
         } => {
             let body = read_body(message, file, stdin)?;
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             let result = {
                 let participant = maybe_participant(&paths)?;
                 anyhow::ensure!(
                     !as_human || participant.is_none(),
                     "an authenticated agent cannot claim human Chat origin"
+                );
+                #[cfg(target_os = "macos")]
+                anyhow::ensure!(
+                    participant.is_some() || as_human,
+                    "macOS human Chat replies require --as-human"
                 );
                 let selected = if let Some(participant) = &participant {
                     selected_participant_project(participant, project)?
@@ -435,33 +415,6 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
                     all,
                 };
                 submit_with_retry(&paths, participant.as_ref(), operation)?
-            };
-            #[cfg(all(unix, not(target_os = "linux")))]
-            let result = {
-                anyhow::ensure!(
-                    as_human,
-                    "macOS Chat replies require --as-human; native agent binding is unavailable"
-                );
-                let selected = selected_observer_project(&paths, project)?;
-                let original = observer_request(
-                    &paths,
-                    protocol::Operation::Show {
-                        id: message_id.clone(),
-                    },
-                )?;
-                anyhow::ensure!(
-                    original["draft"]["project"] == selected,
-                    "Chat reply belongs to another project"
-                );
-                submit_observer_with_retry(
-                    &paths,
-                    protocol::Operation::Reply {
-                        id: message_id,
-                        key: idempotency_key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                        body,
-                        all,
-                    },
-                )?
             };
             #[cfg(not(unix))]
             let result: Value = {
@@ -511,7 +464,7 @@ pub fn run_inbox(args: InboxArgs) -> Result<i32> {
     Ok(0)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn participant(paths: &Paths) -> Result<super::adapters::Participant> {
     super::adapters::Participant::current(
         paths,
@@ -519,7 +472,7 @@ fn participant(paths: &Paths) -> Result<super::adapters::Participant> {
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn maybe_participant(paths: &Paths) -> Result<Option<super::adapters::Participant>> {
     super::adapters::Participant::maybe_current(
         paths,
@@ -527,7 +480,7 @@ fn maybe_participant(paths: &Paths) -> Result<Option<super::adapters::Participan
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn submit_with_retry(
     paths: &Paths,
     native: Option<&super::adapters::Participant>,
@@ -571,7 +524,7 @@ fn read_project_operation(
     selected: Option<String>,
     build: impl FnOnce(String) -> protocol::Operation,
 ) -> Result<Value> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         if let Some(participant) = maybe_participant(paths)? {
             let project = selected_participant_project(&participant, selected)?;
@@ -583,11 +536,11 @@ fn read_project_operation(
 }
 
 fn participant_request(paths: &Paths, operation: protocol::Operation) -> Result<Value> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         participant(paths)?.request(operation)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (paths, operation);
         bail!("Chat requires a validated native participant binding; this platform integration is unavailable")
@@ -685,7 +638,7 @@ fn selected_observer_project(paths: &Paths, selected: Option<String>) -> Result<
     config.project_for_root(&std::env::current_dir()?)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn selected_participant_project(
     participant: &super::adapters::Participant,
     selected: Option<String>,

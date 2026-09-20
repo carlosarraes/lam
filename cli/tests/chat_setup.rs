@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
@@ -159,7 +159,7 @@ fn service_install_is_explicit_and_reversible_in_a_staged_directory() {
         assert!(content.contains("chat serve --foreground --native-bindings"));
     } else {
         assert!(content.contains("<string>serve</string>"));
-        assert!(!content.contains("--native-bindings"));
+        assert!(content.contains("<string>--native-bindings</string>"));
     }
     assert!(invoke("install", true).status.success());
     assert!(invoke("uninstall", true).status.success());
@@ -191,6 +191,39 @@ fn macos_native_setup_remains_preview_only() {
         .unwrap();
     assert!(!apply.status.success());
     assert!(!root.path().join(".codex/hooks.json").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_claude_setup_is_explicit_and_reversible() {
+    let root = tempfile::Builder::new()
+        .prefix("lam-chat-mac-setup-")
+        .tempdir_in("/private/tmp")
+        .unwrap();
+    let hook = root.path().join(".claude/settings.local.json");
+    let invoke = |extra: &[&str]| {
+        command()
+            .args(["chat", "setup", "--client", "claude", "--root"])
+            .arg(root.path())
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    assert!(invoke(&["--dry-run"]).status.success());
+    assert!(!hook.exists());
+    let applied = invoke(&["--apply"]);
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert!(std::fs::read_to_string(&hook)
+        .unwrap()
+        .contains("--client claude"));
+    assert_eq!(hook.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(invoke(&["--apply"]).status.success());
+    assert!(invoke(&["--remove", "--apply"]).status.success());
+    assert!(!hook.exists());
 }
 
 #[test]

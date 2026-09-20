@@ -66,3 +66,20 @@ int lam_chat_process_arguments(int pid, uint8_t *bytes, size_t *length) {
     int mib[3] = {CTL_KERN, KERN_PROCARGS2, pid};
     return sysctl(mib, 3, bytes, length, NULL, 0);
 }
+
+int lam_chat_process_owner(int pid, uint32_t *uid) {
+    if (pid <= 0 || uid == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid};
+    struct kinfo_proc info;
+    size_t length = sizeof(info);
+    if (sysctl(mib, 4, &info, &length, NULL, 0) != 0 || length != sizeof(info) ||
+        info.kp_proc.p_pid != pid) {
+        errno = ESRCH;
+        return -1;
+    }
+    *uid = info.kp_eproc.e_ucred.cr_uid;
+    return 0;
+}
