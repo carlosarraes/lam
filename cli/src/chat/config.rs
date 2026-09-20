@@ -40,6 +40,8 @@ pub struct ProjectMapping {
 pub struct PeerConfig {
     pub machine: String,
     pub ssh_host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_binary: Option<PathBuf>,
     pub initiator: bool,
     pub projects: Vec<String>,
 }
@@ -157,6 +159,15 @@ impl Config {
                     && !peer.ssh_host.starts_with('-'),
                 "invalid Chat SSH host alias",
             );
+            if let Some(binary) = &peer.remote_binary {
+                let path = binary
+                    .to_str()
+                    .context("Chat remote binary path is not UTF-8")?;
+                ensure!(
+                    binary.is_absolute() && !path.chars().any(char::is_control),
+                    "Chat remote binary must be an absolute path without control characters"
+                );
+            }
         }
         Ok(())
     }

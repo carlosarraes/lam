@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
@@ -7,6 +8,7 @@ fn command() -> Command {
     Command::new(env!("CARGO_BIN_EXE_lam"))
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn setup_preview_then_apply_creates_only_owned_project_hook() {
     let root = tempfile::tempdir().unwrap();
@@ -62,6 +64,7 @@ fn setup_refuses_to_clobber_an_existing_unowned_hook() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn setup_repeat_apply_and_remove_preserve_recoverable_backups() {
     for (client, relative) in [
@@ -102,6 +105,7 @@ fn setup_repeat_apply_and_remove_preserve_recoverable_backups() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn setup_refuses_a_user_edit_even_when_managed_marker_remains() {
     for (client, relative) in [
@@ -132,7 +136,11 @@ fn setup_refuses_a_user_edit_even_when_managed_marker_remains() {
 #[test]
 fn service_install_is_explicit_and_reversible_in_a_staged_directory() {
     let root = tempfile::tempdir().unwrap();
-    let unit = root.path().join("lam-chat.service");
+    let unit = root.path().join(if cfg!(target_os = "linux") {
+        "lam-chat.service"
+    } else {
+        "dev.lam.chat.plist"
+    });
     let invoke = |action: &str, apply: bool| {
         let mut command = command();
         command
@@ -147,7 +155,12 @@ fn service_install_is_explicit_and_reversible_in_a_staged_directory() {
     assert!(!unit.exists());
     assert!(invoke("install", true).status.success());
     let content = std::fs::read_to_string(&unit).unwrap();
-    assert!(content.contains("chat serve --foreground --native-bindings"));
+    if cfg!(target_os = "linux") {
+        assert!(content.contains("chat serve --foreground --native-bindings"));
+    } else {
+        assert!(content.contains("<string>serve</string>"));
+        assert!(!content.contains("--native-bindings"));
+    }
     assert!(invoke("install", true).status.success());
     assert!(invoke("uninstall", true).status.success());
     assert!(!unit.exists());
@@ -158,6 +171,26 @@ fn service_install_is_explicit_and_reversible_in_a_staged_directory() {
             .to_string_lossy()
             .contains("lam-chat-backup")
     }));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_native_setup_remains_preview_only() {
+    let root = tempfile::tempdir().unwrap();
+    let preview = command()
+        .args(["chat", "setup", "--client", "codex", "--root"])
+        .arg(root.path())
+        .output()
+        .unwrap();
+    assert!(preview.status.success());
+    let apply = command()
+        .args(["chat", "setup", "--client", "codex", "--root"])
+        .arg(root.path())
+        .arg("--apply")
+        .output()
+        .unwrap();
+    assert!(!apply.status.success());
+    assert!(!root.path().join(".codex/hooks.json").exists());
 }
 
 #[test]

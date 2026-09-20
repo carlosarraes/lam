@@ -87,6 +87,9 @@ pub enum ChatCommand {
         allow_stale_roster: bool,
         #[arg(long)]
         json: bool,
+        /// Explicit human origin when native agent binding is unavailable.
+        #[arg(long)]
+        as_human: bool,
     },
     /// Reply to the original sender, or explicitly include all original participants.
     Reply {
@@ -105,6 +108,9 @@ pub enum ChatCommand {
         project: Option<String>,
         #[arg(long)]
         json: bool,
+        /// Explicit human origin when native agent binding is unavailable.
+        #[arg(long)]
+        as_human: bool,
     },
     /// List the current project's registered agent sessions.
     Sessions {
@@ -298,12 +304,17 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
             project,
             allow_stale_roster,
             json,
+            as_human,
         } => {
             #[cfg(target_os = "linux")]
             {
                 use super::types::Draft;
                 let body = read_body(message, file, stdin)?;
                 let participant = maybe_participant(&paths)?;
+                anyhow::ensure!(
+                    !as_human || participant.is_none(),
+                    "an authenticated agent cannot claim human Chat origin"
+                );
                 let project = if let Some(participant) = &participant {
                     selected_participant_project(participant, project)?
                 } else {
@@ -335,7 +346,37 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
                 let result = submit_with_retry(&paths, participant.as_ref(), operation)?;
                 print_send(&result, json)?;
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(all(unix, not(target_os = "linux")))]
+            {
+                let body = read_body(message, file, stdin)?;
+                anyhow::ensure!(
+                    as_human,
+                    "macOS Chat sends require --as-human; native agent binding is unavailable"
+                );
+                let project = selected_observer_project(&paths, project)?;
+                let roster = observer_request(
+                    &paths,
+                    protocol::Operation::Sessions {
+                        project: project.clone(),
+                    },
+                )?;
+                let recipients = exact_recipients(roster, &to, allow_stale_roster, None)?;
+                let result = submit_observer_with_retry(
+                    &paths,
+                    protocol::Operation::Send {
+                        draft: super::types::Draft {
+                            key: idempotency_key
+                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                            project,
+                            to: recipients,
+                            body,
+                            reply_to: None,
+                        },
+                    },
+                )?;
+                print_send(&result, json)?;
+            }
+            #[cfg(not(unix))]
             {
                 let _ = (
                     to,
@@ -346,8 +387,9 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
                     project,
                     allow_stale_roster,
                     json,
+                    as_human,
                 );
-                bail!("Chat requires a validated native participant binding; this platform integration is unavailable");
+                bail!("Chat local messaging requires Unix sockets");
             }
         }
         ChatCommand::Reply {
@@ -359,11 +401,16 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
             idempotency_key,
             project,
             json,
+            as_human,
         } => {
             let body = read_body(message, file, stdin)?;
             #[cfg(target_os = "linux")]
             let result = {
                 let participant = maybe_participant(&paths)?;
+                anyhow::ensure!(
+                    !as_human || participant.is_none(),
+                    "an authenticated agent cannot claim human Chat origin"
+                );
                 let selected = if let Some(participant) = &participant {
                     selected_participant_project(participant, project)?
                 } else {
@@ -389,10 +436,24 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
                 };
                 submit_with_retry(&paths, participant.as_ref(), operation)?
             };
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(all(unix, not(target_os = "linux")))]
             let result = {
-                let _ = project;
-                participant_request(
+                anyhow::ensure!(
+                    as_human,
+                    "macOS Chat replies require --as-human; native agent binding is unavailable"
+                );
+                let selected = selected_observer_project(&paths, project)?;
+                let original = observer_request(
+                    &paths,
+                    protocol::Operation::Show {
+                        id: message_id.clone(),
+                    },
+                )?;
+                anyhow::ensure!(
+                    original["draft"]["project"] == selected,
+                    "Chat reply belongs to another project"
+                );
+                submit_observer_with_retry(
                     &paths,
                     protocol::Operation::Reply {
                         id: message_id,
@@ -401,6 +462,11 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
                         all,
                     },
                 )?
+            };
+            #[cfg(not(unix))]
+            let result: Value = {
+                let _ = (message_id, idempotency_key, project, all, body, as_human);
+                bail!("Chat local messaging requires Unix sockets");
             };
             print_send(&result, json)?;
         }
@@ -467,25 +533,35 @@ fn submit_with_retry(
     native: Option<&super::adapters::Participant>,
     operation: protocol::Operation,
 ) -> Result<Value> {
+    let Some(native_client) = native else {
+        return submit_observer_with_retry(paths, operation);
+    };
     let key = match &operation {
         protocol::Operation::Send { draft } => draft.key.clone(),
         protocol::Operation::Reply { key, .. } => key.clone(),
         _ => anyhow::bail!("only addressed Chat sends may use submission retry"),
     };
-    let first = if let Some(participant) = native {
-        participant.request(operation.clone())
-    } else {
-        observer_request(paths, operation.clone())
-    };
+    let first = native_client.request(operation.clone());
     if let Ok(result) = first {
         return Ok(result);
     }
-    let second = if native.is_some() {
-        participant(paths).and_then(|client| client.request(operation))
-    } else {
-        observer_request(paths, operation)
-    };
+    let second = participant(paths).and_then(|client| client.request(operation));
     second.map_err(|error| anyhow::anyhow!(
+        "Chat send was not confirmed. Retry with --idempotency-key {key} to avoid duplicates: {error}"
+    ))
+}
+
+#[cfg(unix)]
+fn submit_observer_with_retry(paths: &Paths, operation: protocol::Operation) -> Result<Value> {
+    let key = match &operation {
+        protocol::Operation::Send { draft } => draft.key.clone(),
+        protocol::Operation::Reply { key, .. } => key.clone(),
+        _ => anyhow::bail!("only addressed Chat sends may use submission retry"),
+    };
+    if let Ok(result) = observer_request(paths, operation.clone()) {
+        return Ok(result);
+    }
+    observer_request(paths, operation).map_err(|error| anyhow::anyhow!(
         "Chat send was not confirmed. Retry with --idempotency-key {key} to avoid duplicates: {error}"
     ))
 }
@@ -657,7 +733,7 @@ fn observer_request(_paths: &Paths, _operation: protocol::Operation) -> Result<V
     bail!("Chat observer requires Unix sockets")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn exact_recipients(
     roster: Value,
     addresses: &[String],

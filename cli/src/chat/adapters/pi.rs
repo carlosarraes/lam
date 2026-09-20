@@ -45,13 +45,13 @@ pub fn run_hook(event: &str, name: Option<String>) -> i32 {
             let _ = super::hooks::record_error("pi", stage);
             return 1;
         }
+        0
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (event, name);
-        return 1;
+        1
     }
-    0
 }
 
 #[cfg(target_os = "linux")]
@@ -243,24 +243,31 @@ mod tests {
 
     #[test]
     fn pi_lifecycle_requires_current_native_session_and_exact_event() {
-        let input = br#"{"session_id":"11111111-1111-4111-8111-111111111111","cwd":"/tmp/owned","hook_event_name":"SessionStart"}"#;
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let input = serde_json::to_vec(&serde_json::json!({
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "cwd": cwd,
+            "hook_event_name": "SessionStart"
+        }))
+        .unwrap();
         assert!(HookInput::parse(
-            input,
+            &input,
             "SessionStart",
             "11111111-1111-4111-8111-111111111111"
         )
         .is_ok());
         assert!(
-            HookInput::parse(input, "SessionEnd", "11111111-1111-4111-8111-111111111111").is_err()
+            HookInput::parse(&input, "SessionEnd", "11111111-1111-4111-8111-111111111111").is_err()
         );
         assert!(HookInput::parse(
-            input,
+            &input,
             "SessionStart",
             "22222222-2222-4222-8222-222222222222"
         )
         .is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn bridge_ack_must_match_the_claimed_attempt() {
         assert!(super::accepted_ack(

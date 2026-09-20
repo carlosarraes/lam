@@ -75,7 +75,19 @@ pub fn ssh_command(peer: &PeerConfig) -> Result<Command> {
         "ServerAliveCountMax=3",
         "--",
     ]);
-    command.arg(&peer.ssh_host).arg("lam chat peer-stdio");
+    let remote = if let Some(binary) = &peer.remote_binary {
+        let path = binary
+            .to_str()
+            .context("Chat remote binary path is not UTF-8")?;
+        ensure!(
+            binary.is_absolute() && !path.chars().any(char::is_control),
+            "Chat remote binary must be an absolute path without control characters"
+        );
+        format!("'{}' chat peer-stdio", path.replace('\'', "'\\''"))
+    } else {
+        "lam chat peer-stdio".into()
+    };
+    command.arg(&peer.ssh_host).arg(remote);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -482,6 +494,7 @@ mod tests {
         let peer = PeerConfig {
             machine: "22222222-2222-4222-8222-222222222222".into(),
             ssh_host: "macbox".into(),
+            remote_binary: None,
             initiator: true,
             projects: vec!["33333333-3333-4333-8333-333333333333".into()],
         };
@@ -514,6 +527,25 @@ mod tests {
         let mut bad = peer;
         bad.ssh_host = "-oProxyCommand=bad".into();
         assert!(ssh_command(&bad).is_err());
+    }
+
+    #[test]
+    fn ssh_can_use_a_pinned_remote_binary_without_a_shell_injection() {
+        let (_, mut peer) = pair();
+        peer.remote_binary = Some("/private/tmp/LAM's build/lam".into());
+        let command = ssh_command(&peer).unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args.last().unwrap(),
+            "'/private/tmp/LAM'\\''s build/lam' chat peer-stdio"
+        );
+        peer.remote_binary = Some("relative/lam".into());
+        assert!(ssh_command(&peer).is_err());
+        peer.remote_binary = Some("/tmp/lam\nunsafe".into());
+        assert!(ssh_command(&peer).is_err());
     }
 
     #[test]

@@ -56,8 +56,11 @@ fn chat_send_help_is_available_without_cloud_config() {
             .output()
             .unwrap();
         assert!(!result.status.success());
+        #[cfg(target_os = "linux")]
         assert!(String::from_utf8_lossy(&result.stderr)
             .contains("validated native participant binding"));
+        #[cfg(not(target_os = "linux"))]
+        assert!(!result.stderr.is_empty());
     }
     let override_sender = fixture
         .command()
@@ -74,6 +77,7 @@ fn chat_send_help_is_available_without_cloud_config() {
         .output()
         .unwrap();
     assert!(!override_sender.status.success());
+    #[cfg(target_os = "linux")]
     assert!(!fixture.dir.path().join("config/chat.toml").exists());
     assert!(!fixture.dir.path().join("data/chat.sqlite3").exists());
 }
@@ -108,6 +112,33 @@ fn chat_message_sources_are_exclusive_and_bounded_before_authentication() {
     assert!(!fixture.dir.path().join("data/chat.sqlite3").exists());
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_agent_command_cannot_implicitly_claim_human_origin() {
+    let fixture = Fixture::new();
+    let send = fixture
+        .command()
+        .args(["chat", "send", "--to", "pm", "--message", "hello"])
+        .output()
+        .unwrap();
+    assert!(!send.status.success());
+    assert!(String::from_utf8_lossy(&send.stderr).contains("--as-human"));
+    assert!(!fixture.dir.path().join("config/chat.toml").exists());
+    let reply = fixture
+        .command()
+        .args([
+            "chat",
+            "reply",
+            "11111111-1111-4111-8111-111111111111",
+            "--message",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+    assert!(!reply.status.success());
+    assert!(String::from_utf8_lossy(&reply.stderr).contains("--as-human"));
+}
+
 #[test]
 fn chat_sessions_and_history_help_require_no_cloud_configuration() {
     let fixture = Fixture::new();
@@ -124,6 +155,7 @@ fn chat_sessions_and_history_help_require_no_cloud_configuration() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn codex_hook_operational_errors_are_silent_and_privately_bounded() {
     use std::os::unix::fs::MetadataExt;
@@ -163,6 +195,7 @@ fn codex_hook_operational_errors_are_silent_and_privately_bounded() {
     assert!(diagnostic.len() < 128);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn pi_extension_helper_reports_failure_only_to_its_parent_process() {
     let fixture = Fixture::new();
@@ -185,6 +218,7 @@ fn pi_extension_helper_reports_failure_only_to_its_parent_process() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn native_validator_is_explicitly_experimental_and_status_distinguishes_it() {
     let mut fixture = Fixture::new();
@@ -444,6 +478,9 @@ fn chat_subscription_wakes_on_commit_and_resumes_without_blocking_status() {
     f.terminate();
 }
 
+// The forced-overflow socket-close expectation is Linux-specific; the portable
+// subscription/reconnect behavior is exercised by the neighboring test.
+#[cfg(target_os = "linux")]
 #[test]
 fn chat_slow_subscriber_cannot_block_writes_or_exhaust_regular_slots() {
     let mut f = Fixture::new();

@@ -3459,8 +3459,9 @@ pub(super) mod tests {
                 )
                 .unwrap();
                 protocol::write_frame(&mut client, &json!({"version": 1, "operation": {"op": "inbox", "cursor": cursor, "limit": 1}})).unwrap();
+                let mut client = Some(client);
                 if fail_after_bytes == Some(0) {
-                    client.shutdown(std::net::Shutdown::Read).unwrap();
+                    client.take();
                 }
                 let sender = sender.clone();
                 let changes = changes.clone();
@@ -3477,16 +3478,24 @@ pub(super) mod tests {
                     )
                 });
                 if !fail_write {
-                    let page = protocol::read_frame(&mut client).unwrap();
+                    let page = protocol::read_frame(client.as_mut().unwrap()).unwrap();
                     assert_eq!(page["data"]["events"].as_array().unwrap().len(), 1);
                     cursor = page["data"]["cursor"].as_str().map(str::to_owned);
                 }
                 if fail_after_bytes == Some(128) {
                     use std::io::Read;
-                    client.read_exact(&mut [0_u8; 128]).unwrap();
-                    client.shutdown(std::net::Shutdown::Read).unwrap();
+                    client
+                        .as_mut()
+                        .unwrap()
+                        .read_exact(&mut [0_u8; 128])
+                        .unwrap();
+                    client.take();
                 }
-                assert_eq!(worker.join().unwrap().is_err(), fail_write);
+                assert_eq!(
+                    worker.join().unwrap().is_err(),
+                    fail_write,
+                    "case {fail_after_bytes:?}"
+                );
             }
             drop(sender);
             let mut service = owner.join().unwrap();
