@@ -32,6 +32,20 @@ impl HookInput {
 }
 
 #[cfg(target_os = "linux")]
+pub(super) fn socket_locator(
+    value: Option<std::ffi::OsString>,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    let Some(value) = value else { return Ok(None) };
+    let path = std::path::PathBuf::from(value);
+    anyhow::ensure!(
+        path.is_absolute(),
+        "Claude peer socket path is not absolute"
+    );
+    crate::chat::config::validate_path_components(&path)?;
+    Ok(Some(path))
+}
+
+#[cfg(target_os = "linux")]
 fn write_locator(path: &std::path::Path, id: &str) -> anyhow::Result<()> {
     use std::{
         io::Write,
@@ -94,7 +108,7 @@ pub fn run_hook(event: &str, name: Option<String>) -> i32 {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{write_locator, HookInput};
+    use super::{socket_locator, write_locator, HookInput};
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     #[test]
@@ -135,5 +149,20 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(write_locator(&file, id).is_err());
         assert!(write_locator(&file, "not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn socket_locator_is_an_absolute_non_symlinked_owned_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inbox.sock");
+        assert_eq!(socket_locator(None).unwrap(), None);
+        assert_eq!(
+            socket_locator(Some(path.clone().into_os_string())).unwrap(),
+            Some(path.clone())
+        );
+        assert!(socket_locator(Some("relative.sock".into())).is_err());
+        let link = dir.path().join("linked");
+        symlink(dir.path(), &link).unwrap();
+        assert!(socket_locator(Some(link.join("inbox.sock").into_os_string())).is_err());
     }
 }

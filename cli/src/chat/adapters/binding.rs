@@ -324,7 +324,7 @@ pub(super) fn claude_check(
             lam_name: std::env::var("LAM_NAME").ok(),
             multiplexer: None,
         })?;
-        let candidate = NativeBinding::new(
+        let mut candidate = NativeBinding::new(
             "claude",
             &runtime.version,
             &input.session_id,
@@ -332,6 +332,8 @@ pub(super) fn claude_check(
             &project,
             &name,
         )?;
+        candidate.native_socket =
+            super::claude::socket_locator(std::env::var_os("CLAUDE_CODE_MESSAGING_SOCKET"))?;
         enroll(&files, &paths.socket, candidate, deadline)?
     } else {
         let key = binding_locator("claude", &input.session_id, &runtime.process)?;
@@ -487,7 +489,7 @@ fn parse_version(client: &str, output: &str) -> anyhow::Result<String> {
     .ok_or_else(|| anyhow::anyhow!("unrecognized native execution version"))?;
     let supported = match client {
         "codex" => matches!(version, "0.153.4" | "0.154.0"),
-        "claude" => matches!(version, "2.1.270" | "2.1.273"),
+        "claude" => matches!(version, "2.1.270" | "2.1.273" | "2.1.278"),
         "pi" => matches!(version, "0.85.1" | "0.86.1"),
         _ => false,
     };
@@ -1019,6 +1021,8 @@ struct NativeBinding {
     session: Option<crate::chat::types::SessionRef>,
     eligible: bool,
     #[serde(default)]
+    native_socket: Option<std::path::PathBuf>,
+    #[serde(default)]
     observation_epoch: u64,
     enrollment_secret: String,
     participant_secret: String,
@@ -1052,6 +1056,7 @@ impl NativeBinding {
             name: name.into(),
             session: None,
             eligible: true,
+            native_socket: None,
             observation_epoch: 0,
             enrollment_secret: secret(),
             participant_secret: secret(),
@@ -1069,6 +1074,13 @@ impl NativeBinding {
             "invalid native observation epoch"
         );
         self.client_kind()?;
+        if let Some(path) = &self.native_socket {
+            anyhow::ensure!(
+                self.client == "claude",
+                "native socket belongs to another client"
+            );
+            anyhow::ensure!(path.is_absolute(), "native socket path is not absolute");
+        }
         protocol::validate_uuid(&self.native_id)?;
         protocol::validate_uuid(&self.process.boot_id)?;
         protocol::validate_project(&self.project)?;
@@ -1369,6 +1381,7 @@ impl BindingFiles {
                 &candidate.project,
                 &candidate.name,
             )?;
+            binding.native_socket = candidate.native_socket.clone();
             self.replace(&key, &binding)?;
         }
         anyhow::ensure!(
@@ -1937,6 +1950,10 @@ mod tests {
         assert_eq!(
             parse_version("claude", "2.1.273 (Claude Code)\n").unwrap(),
             "2.1.273"
+        );
+        assert_eq!(
+            parse_version("claude", "2.1.278 (Claude Code)\n").unwrap(),
+            "2.1.278"
         );
         assert_eq!(parse_version("pi", "0.86.1\n").unwrap(), "0.86.1");
         assert!(parse_version("pi", "v0.86.1\n").is_err());
