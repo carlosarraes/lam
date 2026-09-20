@@ -913,7 +913,37 @@ pub fn peer_identity(stream: &UnixStream) -> Result<PeerIdentity> {
             pid: u32::try_from(credential.pid).ok(),
         }
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let peer = {
+        let mut uid = 0;
+        let mut gid = 0;
+        ensure!(
+            unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0,
+            "cannot validate Chat peer credentials"
+        );
+        // Darwin's public sys/un.h defines SOL_LOCAL=0, LOCAL_PEERPID=2.
+        let mut pid: libc::pid_t = 0;
+        let mut length = std::mem::size_of_val(&pid) as libc::socklen_t;
+        ensure!(
+            unsafe {
+                libc::getsockopt(
+                    stream.as_raw_fd(),
+                    0,
+                    2,
+                    (&mut pid as *mut libc::pid_t).cast(),
+                    &mut length,
+                )
+            } == 0
+                && length as usize == std::mem::size_of_val(&pid)
+                && pid > 0,
+            "cannot validate Chat peer process"
+        );
+        PeerIdentity {
+            uid,
+            pid: u32::try_from(pid).ok(),
+        }
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let peer = {
         let mut uid = 0;
         let mut gid = 0;
@@ -3772,6 +3802,14 @@ pub(super) mod tests {
     fn peer_owner_must_match_effective_user() {
         assert!(validate_peer_owner(1000, 1000).is_ok());
         assert!(validate_peer_owner(1001, 1000).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_peer_identity_includes_kernel_pid() {
+        let (client, _server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let peer = super::peer_identity(&client).unwrap();
+        assert_eq!(peer.pid, Some(std::process::id()));
     }
 
     #[test]
