@@ -8,4 +8,5 @@ pub mod protocol;
 pub mod registry;
 pub mod render;
 pub mod store;
+pub mod tui;
 pub mod types;

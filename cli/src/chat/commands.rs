@@ -14,8 +14,10 @@ const MAX_BODY_BYTES: u64 = 65_536;
 
 #[derive(Args)]
 pub struct ChatArgs {
+    #[arg(long)]
+    pub project: Option<String>,
     #[command(subcommand)]
-    pub command: ChatCommand,
+    pub command: Option<ChatCommand>,
 }
 #[derive(Subcommand)]
 pub enum ChatCommand {
@@ -119,25 +121,39 @@ pub enum InboxCommand {
 }
 
 pub fn run_chat(args: ChatArgs) -> Result<i32> {
-    if let ChatCommand::Hook {
+    if let Some(ChatCommand::Hook {
         client,
         event,
         name,
-    } = args.command
+    }) = &args.command
     {
         return Ok(match client.as_str() {
-            "codex" => super::adapters::codex::run_hook(&event, name),
-            "claude" => super::adapters::claude::run_hook(&event, name),
-            "pi" => super::adapters::pi::run_hook(&event, name),
+            "codex" => super::adapters::codex::run_hook(event, name.clone()),
+            "claude" => super::adapters::claude::run_hook(event, name.clone()),
+            "pi" => super::adapters::pi::run_hook(event, name.clone()),
             _ => unreachable!("client is constrained by Clap"),
         });
     }
-    if let ChatCommand::Bridge { client } = &args.command {
+    if let Some(ChatCommand::Bridge { client }) = &args.command {
         debug_assert_eq!(client, "pi");
         return super::adapters::pi::run_bridge();
     }
     let paths = Paths::discover()?;
-    match args.command {
+    if args.command.is_none() {
+        #[cfg(target_os = "linux")]
+        anyhow::ensure!(
+            maybe_participant(&paths)?.is_none(),
+            "open the Chat observer in a human terminal, outside a native agent session"
+        );
+        let project = selected_observer_project(&paths, args.project)?;
+        super::tui::run(&paths, &project)?;
+        return Ok(0);
+    }
+    anyhow::ensure!(
+        args.project.is_none(),
+        "for a Chat subcommand, place --project after the subcommand"
+    );
+    match args.command.expect("handled empty Chat command") {
         ChatCommand::Hook { .. } => unreachable!("hook is dispatched before fallible setup"),
         ChatCommand::Bridge { .. } => unreachable!("bridge is dispatched before fallible setup"),
         ChatCommand::Serve {
@@ -219,11 +235,7 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
                         reply_to: None,
                     },
                 };
-                let result = if let Some(participant) = &participant {
-                    participant.request(operation)?
-                } else {
-                    observer_request(&paths, operation)?
-                };
+                let result = submit_with_retry(&paths, participant.as_ref(), operation)?;
                 print_send(&result, json)?;
             }
             #[cfg(not(target_os = "linux"))]
@@ -278,11 +290,7 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
                     body,
                     all,
                 };
-                if let Some(participant) = &participant {
-                    participant.request(operation)?
-                } else {
-                    observer_request(&paths, operation)?
-                }
+                submit_with_retry(&paths, participant.as_ref(), operation)?
             };
             #[cfg(not(target_os = "linux"))]
             let result = {
@@ -351,6 +359,35 @@ fn maybe_participant(paths: &Paths) -> Result<Option<super::adapters::Participan
         paths,
         std::time::Instant::now() + std::time::Duration::from_secs(6),
     )
+}
+
+#[cfg(target_os = "linux")]
+fn submit_with_retry(
+    paths: &Paths,
+    native: Option<&super::adapters::Participant>,
+    operation: protocol::Operation,
+) -> Result<Value> {
+    let key = match &operation {
+        protocol::Operation::Send { draft } => draft.key.clone(),
+        protocol::Operation::Reply { key, .. } => key.clone(),
+        _ => anyhow::bail!("only addressed Chat sends may use submission retry"),
+    };
+    let first = if let Some(participant) = native {
+        participant.request(operation.clone())
+    } else {
+        observer_request(paths, operation.clone())
+    };
+    if let Ok(result) = first {
+        return Ok(result);
+    }
+    let second = if native.is_some() {
+        participant(paths).and_then(|client| client.request(operation))
+    } else {
+        observer_request(paths, operation)
+    };
+    second.map_err(|error| anyhow::anyhow!(
+        "Chat send was not confirmed. Retry with --idempotency-key {key} to avoid duplicates: {error}"
+    ))
 }
 
 fn read_project_operation(
@@ -674,6 +711,56 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("UTF-8"));
+    }
+
+    #[test]
+    fn lost_observer_response_retries_the_same_idempotency_key() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.path().join("observer.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let paths = Paths {
+            config: dir.path().join("chat.toml"),
+            database: dir.path().join("chat.sqlite3"),
+            socket: dir.path().join("chat.sock"),
+            observer_socket: socket,
+            lock: dir.path().join("chat.lock"),
+        };
+        let owner = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                requests.push(protocol::read_frame(&mut stream).unwrap());
+                if attempt == 1 {
+                    protocol::write_frame(&mut stream, &json!({"version":1,"ok":true,"data":{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}})).unwrap();
+                }
+            }
+            requests
+        });
+        let operation = protocol::Operation::Send {
+            draft: super::super::types::Draft {
+                key: "one-stable-key".into(),
+                project: "22222222-2222-4222-8222-222222222222".into(),
+                to: vec![super::super::types::Target::Agent(
+                    super::super::types::SessionRef {
+                        machine: "11111111-1111-4111-8111-111111111111".into(),
+                        incarnation: "33333333-3333-4333-8333-333333333333".into(),
+                    },
+                )],
+                body: "test".into(),
+                reply_to: None,
+            },
+        };
+        assert_eq!(
+            submit_with_retry(&paths, None, operation).unwrap()["id"],
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        );
+        let requests = owner.join().unwrap();
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!(requests[0]["operation"]["draft"]["key"], "one-stable-key");
     }
 }
 

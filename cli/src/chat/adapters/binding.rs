@@ -626,11 +626,14 @@ impl NativeRuntime {
 
     fn find(mut pid: u32, deadline: std::time::Instant) -> anyhow::Result<Option<Self>> {
         use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
         for _ in 0..64 {
             if pid <= 1 {
                 return Ok(None);
             }
-            let process = ProcessEvidence::read(pid)?;
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+            let (parent, _) = parse_process_stat(&stat)?;
+            anyhow::ensure!(parent != pid, "invalid native process ancestry");
             let mut cmdline = Vec::new();
             std::fs::File::open(format!("/proc/{pid}/cmdline"))?
                 .take(65_537)
@@ -643,6 +646,18 @@ impl NativeRuntime {
                 .split(|byte| *byte == 0)
                 .map(|arg| arg.to_vec())
                 .collect();
+            // A human terminal launched by the per-user manager reaches a
+            // non-dumpable `systemd --user` process. Its /proc/exe is often
+            // unreadable even to the same UID. This is an ancestry boundary,
+            // not a candidate agent. Everything below it was inspected first.
+            if parent == 1
+                && std::fs::metadata(format!("/proc/{pid}"))?.uid() == unsafe { libc::geteuid() }
+                && std::fs::read_to_string(format!("/proc/{pid}/comm"))?.trim() == "systemd"
+                && user_manager_command(&args)
+            {
+                return Ok(None);
+            }
+            let process = ProcessEvidence::read(pid)?;
             let client = native_client(&process.executable, &args).or_else(|| {
                 pi_process_title(&process.executable, &args)
                     .then(|| std::env::var_os("LAM_CHAT_PI_ENTRYPOINT"))
@@ -665,13 +680,20 @@ impl NativeRuntime {
                     process,
                 }));
             }
-            let (parent, _) =
-                parse_process_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat"))?)?;
-            anyhow::ensure!(parent != pid, "invalid native process ancestry");
             pid = parent;
         }
         anyhow::bail!("native process ancestry exceeds validation bound")
     }
+}
+
+#[cfg(target_os = "linux")]
+fn user_manager_command(args: &[Vec<u8>]) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    args.first().is_some_and(|program| {
+        std::path::Path::new(std::ffi::OsStr::from_bytes(program))
+            .file_name()
+            .is_some_and(|name| name == "systemd")
+    }) && args.get(1).is_some_and(|flag| flag == b"--user")
 }
 
 #[cfg(target_os = "linux")]
@@ -2273,6 +2295,15 @@ mod tests {
             Path::new("/usr/bin/python"),
             &[b"pi".to_vec()]
         ));
+        assert!(user_manager_command(&[
+            b"/usr/lib/systemd/systemd".to_vec(),
+            b"--user".to_vec(),
+            b"--deserialize=14".to_vec(),
+        ]));
+        assert!(!user_manager_command(&[
+            b"/usr/bin/codex".to_vec(),
+            b"--user".to_vec(),
+        ]));
     }
 
     #[test]
