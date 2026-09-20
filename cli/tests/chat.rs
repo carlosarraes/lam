@@ -23,6 +23,10 @@ fn chat_send_help_is_available_without_cloud_config() {
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(help.contains("--to"));
     assert!(help.contains("--message"));
+    assert!(help.contains("--file"));
+    assert!(help.contains("--stdin"));
+    assert!(help.contains("--project"));
+    assert!(help.contains("--json"));
     for args in [
         vec!["chat", "send", "--to", "owned", "--message", "body"],
         vec!["inbox", "show", "11111111-1111-4111-8111-111111111111"],
@@ -54,6 +58,52 @@ fn chat_send_help_is_available_without_cloud_config() {
     assert!(!override_sender.status.success());
     assert!(!fixture.dir.path().join("config/chat.toml").exists());
     assert!(!fixture.dir.path().join("data/chat.sqlite3").exists());
+}
+
+#[test]
+fn chat_message_sources_are_exclusive_and_bounded_before_authentication() {
+    let fixture = Fixture::new();
+    let invalid = fixture
+        .command()
+        .args([
+            "chat",
+            "send",
+            "--to",
+            "owned",
+            "--message",
+            "inline",
+            "--stdin",
+        ])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("cannot be used with"));
+
+    let too_large = "x".repeat(65_537);
+    let oversized = fixture
+        .command()
+        .args(["chat", "send", "--to", "owned", "--message", &too_large])
+        .output()
+        .unwrap();
+    assert!(!oversized.status.success());
+    assert!(String::from_utf8_lossy(&oversized.stderr).contains("64 KiB"));
+    assert!(!fixture.dir.path().join("data/chat.sqlite3").exists());
+}
+
+#[test]
+fn chat_sessions_and_history_help_require_no_cloud_configuration() {
+    let fixture = Fixture::new();
+    for command in ["sessions", "history"] {
+        let output = fixture
+            .command()
+            .args(["chat", command, "--help"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let help = String::from_utf8_lossy(&output.stdout);
+        assert!(help.contains("--project"));
+        assert!(help.contains("--json"));
+    }
 }
 
 #[test]

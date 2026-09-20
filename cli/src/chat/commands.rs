@@ -1,9 +1,16 @@
-use super::{config::Paths, protocol};
+use super::{
+    config::{Config, Paths},
+    protocol,
+};
 #[cfg(not(target_os = "linux"))]
 use anyhow::bail;
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
+use std::io::Read;
+use std::path::PathBuf;
+
+const MAX_BODY_BYTES: u64 = 65_536;
 
 #[derive(Args)]
 pub struct ChatArgs {
@@ -39,24 +46,60 @@ pub enum ChatCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Queue for exact registered recipients. Native delivery remains experimental and unverified.
+    /// Send to pinned recipients in this project. Native delivery remains experimental.
     Send {
         #[arg(long, required = true)]
         to: Vec<String>,
-        #[arg(long)]
-        message: String,
+        #[arg(long, conflicts_with_all = ["file", "stdin"])]
+        message: Option<String>,
+        #[arg(long, conflicts_with_all = ["message", "stdin"])]
+        file: Option<PathBuf>,
+        #[arg(long, conflicts_with_all = ["message", "file"])]
+        stdin: bool,
         #[arg(long)]
         idempotency_key: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        allow_stale_roster: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Reply to the original sender, or explicitly include all original participants.
     Reply {
         message_id: String,
-        #[arg(long)]
-        message: String,
+        #[arg(long, conflicts_with_all = ["file", "stdin"])]
+        message: Option<String>,
+        #[arg(long, conflicts_with_all = ["message", "stdin"])]
+        file: Option<PathBuf>,
+        #[arg(long, conflicts_with_all = ["message", "file"])]
+        stdin: bool,
         #[arg(long)]
         all: bool,
         #[arg(long)]
         idempotency_key: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the current project's registered agent sessions.
+    Sessions {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read this project's observer feed without consuming agent inboxes.
+    History {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u16,
+        #[arg(long)]
+        json: bool,
     },
 }
 #[derive(Args)]
@@ -136,46 +179,145 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
         ChatCommand::Send {
             to,
             message,
+            file,
+            stdin,
             idempotency_key,
+            project,
+            allow_stale_roster,
+            json,
         } => {
             #[cfg(target_os = "linux")]
             {
                 use super::types::Draft;
-                let participant = participant(&paths)?;
-                let roster = participant.request(protocol::Operation::Sessions {
-                    project: participant.project().into(),
-                })?;
-                let recipients = exact_recipients(roster, &to)?;
-                let result = participant.request(protocol::Operation::Send {
+                let body = read_body(message, file, stdin)?;
+                let participant = maybe_participant(&paths)?;
+                let project = if let Some(participant) = &participant {
+                    selected_participant_project(participant, project)?
+                } else {
+                    selected_observer_project(&paths, project)?
+                };
+                let sessions = protocol::Operation::Sessions {
+                    project: project.clone(),
+                };
+                let roster = if let Some(participant) = &participant {
+                    participant.request(sessions)?
+                } else {
+                    observer_request(&paths, sessions)?
+                };
+                let recipients = exact_recipients(
+                    roster,
+                    &to,
+                    allow_stale_roster,
+                    participant.as_ref().map(|p| p.session()),
+                )?;
+                let operation = protocol::Operation::Send {
                     draft: Draft {
                         key: idempotency_key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                        project: participant.project().into(),
+                        project,
                         to: recipients,
-                        body: message,
+                        body,
                         reply_to: None,
                     },
-                })?;
-                println!("{}", serde_json::to_string(&result)?);
+                };
+                let result = if let Some(participant) = &participant {
+                    participant.request(operation)?
+                } else {
+                    observer_request(&paths, operation)?
+                };
+                print_send(&result, json)?;
             }
             #[cfg(not(target_os = "linux"))]
-            bail!("Chat requires a validated native participant binding; this platform integration is unavailable");
+            {
+                let _ = (
+                    to,
+                    message,
+                    file,
+                    stdin,
+                    idempotency_key,
+                    project,
+                    allow_stale_roster,
+                    json,
+                );
+                bail!("Chat requires a validated native participant binding; this platform integration is unavailable");
+            }
         }
         ChatCommand::Reply {
             message_id,
             message,
+            file,
+            stdin,
             all,
             idempotency_key,
+            project,
+            json,
         } => {
-            let result = participant_request(
-                &paths,
-                protocol::Operation::Reply {
+            let body = read_body(message, file, stdin)?;
+            #[cfg(target_os = "linux")]
+            let result = {
+                let participant = maybe_participant(&paths)?;
+                let selected = if let Some(participant) = &participant {
+                    selected_participant_project(participant, project)?
+                } else {
+                    selected_observer_project(&paths, project)?
+                };
+                let show = protocol::Operation::Show {
+                    id: message_id.clone(),
+                };
+                let original = if let Some(participant) = &participant {
+                    participant.request(show)?
+                } else {
+                    observer_request(&paths, show)?
+                };
+                anyhow::ensure!(
+                    original["draft"]["project"] == selected,
+                    "Chat reply belongs to another project"
+                );
+                let operation = protocol::Operation::Reply {
                     id: message_id,
                     key: idempotency_key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                    body: message,
+                    body,
                     all,
-                },
-            )?;
-            println!("{}", serde_json::to_string(&result)?);
+                };
+                if let Some(participant) = &participant {
+                    participant.request(operation)?
+                } else {
+                    observer_request(&paths, operation)?
+                }
+            };
+            #[cfg(not(target_os = "linux"))]
+            let result = {
+                let _ = project;
+                participant_request(
+                    &paths,
+                    protocol::Operation::Reply {
+                        id: message_id,
+                        key: idempotency_key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        body,
+                        all,
+                    },
+                )?
+            };
+            print_send(&result, json)?;
+        }
+        ChatCommand::Sessions { project, json } => {
+            let result = read_project_operation(&paths, project, |project| {
+                protocol::Operation::Sessions { project }
+            })?;
+            print_value(&result, json)?;
+        }
+        ChatCommand::History {
+            project,
+            cursor,
+            limit,
+            json,
+        } => {
+            let result =
+                read_project_operation(&paths, project, |project| protocol::Operation::History {
+                    project,
+                    cursor,
+                    limit,
+                })?;
+            print_value(&result, json)?;
         }
     }
     Ok(0)
@@ -203,6 +345,30 @@ fn participant(paths: &Paths) -> Result<super::adapters::Participant> {
     )
 }
 
+#[cfg(target_os = "linux")]
+fn maybe_participant(paths: &Paths) -> Result<Option<super::adapters::Participant>> {
+    super::adapters::Participant::maybe_current(
+        paths,
+        std::time::Instant::now() + std::time::Duration::from_secs(6),
+    )
+}
+
+fn read_project_operation(
+    paths: &Paths,
+    selected: Option<String>,
+    build: impl FnOnce(String) -> protocol::Operation,
+) -> Result<Value> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(participant) = maybe_participant(paths)? {
+            let project = selected_participant_project(&participant, selected)?;
+            return participant.request(build(project));
+        }
+    }
+    let project = selected_observer_project(paths, selected)?;
+    observer_request(paths, build(project))
+}
+
 fn participant_request(paths: &Paths, operation: protocol::Operation) -> Result<Value> {
     #[cfg(target_os = "linux")]
     {
@@ -215,8 +381,152 @@ fn participant_request(paths: &Paths, operation: protocol::Operation) -> Result<
     }
 }
 
+fn read_body(message: Option<String>, file: Option<PathBuf>, stdin: bool) -> Result<String> {
+    let count = u8::from(message.is_some()) + u8::from(file.is_some()) + u8::from(stdin);
+    anyhow::ensure!(
+        count == 1,
+        "choose exactly one of --message, --file, or --stdin"
+    );
+    let body = if let Some(message) = message {
+        message
+    } else {
+        let mut bytes = Vec::new();
+        if let Some(path) = file {
+            std::fs::File::open(&path)
+                .with_context(|| format!("cannot open Chat body file {}", path.display()))?
+                .take(MAX_BODY_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+        } else {
+            std::io::stdin()
+                .lock()
+                .take(MAX_BODY_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+        }
+        String::from_utf8(bytes).context("Chat body must be UTF-8")?
+    };
+    anyhow::ensure!(
+        body.len() <= MAX_BODY_BYTES as usize,
+        "Chat body exceeds 64 KiB"
+    );
+    anyhow::ensure!(!body.trim().is_empty(), "Chat body cannot be empty");
+    Ok(body)
+}
+
+fn print_send(result: &Value, json_output: bool) -> Result<()> {
+    if json_output {
+        let recipients = result["draft"]["to"]
+            .as_array()
+            .context("Chat send response has no recipient set")?
+            .iter()
+            .map(|target| json!({"target": target, "state": "queued_locally"}))
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string(
+                &json!({"id": result["id"], "recipients": recipients, "message": result})
+            )?
+        );
+    } else {
+        let id = result["id"]
+            .as_str()
+            .context("Chat send response has no ID")?;
+        let count = result["draft"]["to"]
+            .as_array()
+            .context("Chat send response has no recipient set")?
+            .len();
+        println!("Queued Chat message {id} for {count} recipient(s).");
+    }
+    Ok(())
+}
+
+fn print_value(result: &Value, json_output: bool) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string(result)?);
+    } else if let Some(sessions) = result["sessions"].as_array() {
+        for session in sessions {
+            println!(
+                "{}  {}  {}/{}{}",
+                session["name"].as_str().unwrap_or("?"),
+                session["client"].as_str().unwrap_or("?"),
+                session["session"]["machine"].as_str().unwrap_or("?"),
+                session["session"]["incarnation"].as_str().unwrap_or("?"),
+                if session["eligible"] == true {
+                    ""
+                } else {
+                    "  unavailable"
+                }
+            );
+        }
+    } else {
+        println!("{}", serde_json::to_string_pretty(result)?);
+    }
+    Ok(())
+}
+
+fn selected_observer_project(paths: &Paths, selected: Option<String>) -> Result<String> {
+    if let Some(project) = selected {
+        protocol::validate_project(&project)?;
+        return Ok(project);
+    }
+    let config = Config::load_or_create(&paths.config)?;
+    config.project_for_root(&std::env::current_dir()?)
+}
+
 #[cfg(target_os = "linux")]
-fn exact_recipients(roster: Value, addresses: &[String]) -> Result<Vec<super::types::Target>> {
+fn selected_participant_project(
+    participant: &super::adapters::Participant,
+    selected: Option<String>,
+) -> Result<String> {
+    if let Some(project) = selected {
+        protocol::validate_project(&project)?;
+        anyhow::ensure!(
+            project == participant.project(),
+            "Chat project is outside this participant binding"
+        );
+        Ok(project)
+    } else {
+        Ok(participant.project().into())
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn observer_request(paths: &Paths, operation: protocol::Operation) -> Result<Value> {
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+    operation.validate()?;
+    super::daemon::validate_socket(&paths.observer_socket)?;
+    let mut stream =
+        UnixStream::connect(&paths.observer_socket).context("Chat daemon is not running")?;
+    stream.set_read_timeout(Some(Duration::from_secs(6)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(6)))?;
+    super::daemon::peer_identity(&stream)?;
+    protocol::write_frame(
+        &mut stream,
+        &serde_json::to_value(protocol::Request {
+            version: 1,
+            operation,
+        })?,
+    )?;
+    let response = protocol::read_frame(&mut stream)?;
+    anyhow::ensure!(
+        response["version"] == 1 && response["ok"] == true,
+        "invalid Chat observer response"
+    );
+    Ok(response["data"].clone())
+}
+
+#[cfg(not(unix))]
+fn observer_request(_paths: &Paths, _operation: protocol::Operation) -> Result<Value> {
+    bail!("Chat observer requires Unix sockets")
+}
+
+#[cfg(target_os = "linux")]
+fn exact_recipients(
+    roster: Value,
+    addresses: &[String],
+    allow_stale: bool,
+    sender: Option<&super::types::SessionRef>,
+) -> Result<Vec<super::types::Target>> {
     #[derive(serde::Deserialize)]
     struct Entry {
         session: super::types::SessionRef,
@@ -226,7 +536,22 @@ fn exact_recipients(roster: Value, addresses: &[String]) -> Result<Vec<super::ty
     let entries: Vec<Entry> =
         serde_json::from_value(roster["sessions"].clone()).context("invalid Chat roster")?;
     let mut recipients = Vec::new();
+    let stale = roster["stale"] == true;
     for address in addresses {
+        if address == "@all" {
+            anyhow::ensure!(
+                !stale || allow_stale,
+                "project roster is stale; use --allow-stale-roster to broadcast"
+            );
+            for entry in &entries {
+                let target = super::types::Target::Agent(entry.session.clone());
+                if entry.eligible && sender != Some(&entry.session) && !recipients.contains(&target)
+                {
+                    recipients.push(target);
+                }
+            }
+            continue;
+        }
         let matches: Vec<_> = entries
             .iter()
             .filter(|entry| {
@@ -241,8 +566,12 @@ fn exact_recipients(roster: Value, addresses: &[String]) -> Result<Vec<super::ty
             "recipient {address:?} is missing or ambiguous; use its exact machine/incarnation"
         );
         protocol::validate_session(&matches[0].session)?;
-        recipients.push(super::types::Target::Agent(matches[0].session.clone()));
+        let target = super::types::Target::Agent(matches[0].session.clone());
+        if !recipients.contains(&target) {
+            recipients.push(target);
+        }
     }
+    anyhow::ensure!(!recipients.is_empty(), "no eligible recipients selected");
     Ok(recipients)
 }
 
@@ -256,26 +585,95 @@ mod tests {
         let entry = json!({"session":{"machine":machine,"incarnation":incarnation},"name":"owned","eligible":true,"client":"codex"});
         let roster = json!({"sessions":[entry.clone()]});
         assert_eq!(
-            exact_recipients(roster.clone(), &["owned".into()])
+            exact_recipients(roster.clone(), &["owned".into()], false, None)
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
-            exact_recipients(roster.clone(), &[format!("{machine}/{incarnation}")])
-                .unwrap()
-                .len(),
+            exact_recipients(
+                roster.clone(),
+                &[format!("{machine}/{incarnation}")],
+                false,
+                None
+            )
+            .unwrap()
+            .len(),
             1
         );
-        assert!(exact_recipients(roster, &["own".into()]).is_err());
+        assert!(exact_recipients(roster, &["own".into()], false, None).is_err());
         assert!(exact_recipients(
             json!({"sessions":[entry.clone(),entry.clone()]}),
-            &["owned".into()]
+            &["owned".into()],
+            false,
+            None
         )
         .is_err());
         let mut ineligible = entry;
         ineligible["eligible"] = json!(false);
-        assert!(exact_recipients(json!({"sessions":[ineligible]}), &["owned".into()]).is_err());
+        assert!(exact_recipients(
+            json!({"sessions":[ineligible]}),
+            &["owned".into()],
+            false,
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn broadcast_freezes_unique_eligible_recipients_and_excludes_sender() {
+        let first = super::super::types::SessionRef {
+            machine: "11111111-1111-4111-8111-111111111111".into(),
+            incarnation: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+        };
+        let second = super::super::types::SessionRef {
+            machine: first.machine.clone(),
+            incarnation: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
+        };
+        let roster = json!({"sessions": [
+            {"session": first, "name": "self", "eligible": true},
+            {"session": second, "name": "peer", "eligible": true}
+        ], "stale": false});
+        assert_eq!(
+            exact_recipients(
+                roster.clone(),
+                &["@all".into(), "peer".into()],
+                false,
+                Some(&first)
+            )
+            .unwrap(),
+            vec![super::super::types::Target::Agent(second.clone())]
+        );
+        let mut stale = roster;
+        stale["stale"] = json!(true);
+        assert!(exact_recipients(stale.clone(), &["@all".into()], false, Some(&first)).is_err());
+        assert_eq!(
+            exact_recipients(stale, &["@all".into()], true, Some(&first))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn body_file_is_bounded_and_utf8_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("message.md");
+        std::fs::write(&path, "a 🐏 message").unwrap();
+        assert_eq!(
+            read_body(None, Some(path.clone()), false).unwrap(),
+            "a 🐏 message"
+        );
+        std::fs::write(&path, vec![b'x'; 65_537]).unwrap();
+        assert!(read_body(None, Some(path.clone()), false)
+            .unwrap_err()
+            .to_string()
+            .contains("64 KiB"));
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(read_body(None, Some(path), false)
+            .unwrap_err()
+            .to_string()
+            .contains("UTF-8"));
     }
 }
 

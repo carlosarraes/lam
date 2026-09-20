@@ -437,22 +437,58 @@ impl Participant {
         use anyhow::Context;
         (|| -> anyhow::Result<Self> {
             let runtime = NativeRuntime::discover(std::process::id(), deadline)?;
-            let native_id = native_id_from(&runtime.client, |key| std::env::var(key).ok())?;
-            let directory = paths.database.parent().context("missing Chat data directory")?.join("bindings");
-            anyhow::ensure!(directory.exists(), "native integration has not issued a binding");
-            let files = BindingFiles::open(&directory)?;
-            let locator = binding_locator(&runtime.client, &native_id, &runtime.process)?;
-            let binding = files.load(&locator)?;
-            anyhow::ensure!(binding.session.is_some() && binding.version == runtime.version && binding.process == runtime.process, "native enrollment missing or changed");
-            Ok(Self { binding, socket: paths.socket.clone(), deadline })
+            Self::for_runtime(paths, deadline, runtime)
         })().context("Chat requires a validated native participant binding; configure the client integration")
+    }
+
+    pub(in crate::chat) fn maybe_current(
+        paths: &crate::chat::config::Paths,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Option<Self>> {
+        let runtime = NativeRuntime::find(std::process::id(), deadline)?;
+        runtime
+            .map(|runtime| Self::for_runtime(paths, deadline, runtime))
+            .transpose()
+            .map_err(|error| error.context("Chat requires a validated native participant binding; configure the client integration"))
+    }
+
+    fn for_runtime(
+        paths: &crate::chat::config::Paths,
+        deadline: std::time::Instant,
+        runtime: NativeRuntime,
+    ) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        let native_id = native_id_from(&runtime.client, |key| std::env::var(key).ok())?;
+        let directory = paths
+            .database
+            .parent()
+            .context("missing Chat data directory")?
+            .join("bindings");
+        anyhow::ensure!(
+            directory.exists(),
+            "native integration has not issued a binding"
+        );
+        let files = BindingFiles::open(&directory)?;
+        let locator = binding_locator(&runtime.client, &native_id, &runtime.process)?;
+        let binding = files.load(&locator)?;
+        anyhow::ensure!(
+            binding.session.is_some()
+                && binding.version == runtime.version
+                && binding.process == runtime.process,
+            "native enrollment missing or changed"
+        );
+        Ok(Self {
+            binding,
+            socket: paths.socket.clone(),
+            deadline,
+        })
     }
 
     pub fn project(&self) -> &str {
         &self.binding.project
     }
 
-    pub(super) fn session(&self) -> &crate::chat::types::SessionRef {
+    pub(in crate::chat) fn session(&self) -> &crate::chat::types::SessionRef {
         self.binding
             .session
             .as_ref()
@@ -583,10 +619,17 @@ struct NativeRuntime {
 
 #[cfg(target_os = "linux")]
 impl NativeRuntime {
-    fn discover(mut pid: u32, deadline: std::time::Instant) -> anyhow::Result<Self> {
+    fn discover(pid: u32, deadline: std::time::Instant) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        Self::find(pid, deadline)?.context("no supported native execution ancestor")
+    }
+
+    fn find(mut pid: u32, deadline: std::time::Instant) -> anyhow::Result<Option<Self>> {
         use std::io::Read;
         for _ in 0..64 {
-            anyhow::ensure!(pid > 1, "no supported native execution ancestor");
+            if pid <= 1 {
+                return Ok(None);
+            }
             let process = ProcessEvidence::read(pid)?;
             let mut cmdline = Vec::new();
             std::fs::File::open(format!("/proc/{pid}/cmdline"))?
@@ -616,11 +659,11 @@ impl NativeRuntime {
                 anyhow::ensure!(output.success, "native version check failed");
                 let version = parse_version(client, &output.stdout)?;
                 process.validate()?;
-                return Ok(Self {
+                return Ok(Some(Self {
                     client: client.into(),
                     version,
                     process,
-                });
+                }));
             }
             let (parent, _) =
                 parse_process_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat"))?)?;
