@@ -68,7 +68,10 @@ pub(super) fn record_error(client: &str, stage: &str) -> anyhow::Result<()> {
             && metadata.len() < 65_536,
         "private hook diagnostic unavailable"
     );
-    anyhow::ensure!(matches!(client, "codex" | "claude"), "invalid hook client");
+    anyhow::ensure!(
+        matches!(client, "codex" | "claude" | "pi"),
+        "invalid hook client"
+    );
     anyhow::ensure!(
         matches!(stage, "input" | "binding" | "output"),
         "invalid hook diagnostic stage"

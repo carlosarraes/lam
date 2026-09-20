@@ -14,12 +14,17 @@ pub struct ChatArgs {
 pub enum ChatCommand {
     /// Run an experimental native Chat hook. Empty checks are silent; Codex PostToolUse may supply peer context.
     Hook {
-        #[arg(long, value_parser = ["codex", "claude"])]
+        #[arg(long, value_parser = ["codex", "claude", "pi"])]
         client: String,
         #[arg(long)]
         event: String,
         #[arg(long)]
         name: Option<String>,
+    },
+    #[command(hide = true)]
+    Bridge {
+        #[arg(long, value_parser = ["pi"])]
+        client: String,
     },
     /// Run the private local Chat daemon. Does not install a service.
     Serve {
@@ -80,12 +85,18 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
         return Ok(match client.as_str() {
             "codex" => super::adapters::codex::run_hook(&event, name),
             "claude" => super::adapters::claude::run_hook(&event, name),
+            "pi" => super::adapters::pi::run_hook(&event, name),
             _ => unreachable!("client is constrained by Clap"),
         });
+    }
+    if let ChatCommand::Bridge { client } = &args.command {
+        debug_assert_eq!(client, "pi");
+        return super::adapters::pi::run_bridge();
     }
     let paths = Paths::discover()?;
     match args.command {
         ChatCommand::Hook { .. } => unreachable!("hook is dispatched before fallible setup"),
+        ChatCommand::Bridge { .. } => unreachable!("bridge is dispatched before fallible setup"),
         ChatCommand::Serve {
             native_bindings, ..
         } => {

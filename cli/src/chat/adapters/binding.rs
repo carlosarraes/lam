@@ -7,13 +7,43 @@ fn request(
     deadline: std::time::Instant,
 ) -> anyhow::Result<serde_json::Value> {
     use crate::chat::{daemon, protocol};
+    use std::time::Instant;
+    operation.validate()?;
+    let mut stream = connect_authenticated(socket, credential, deadline)?;
+    let mut stream = daemon::DeadlineStream::until(&mut stream, deadline);
+    protocol::write_frame(
+        &mut stream,
+        &serde_json::to_value(protocol::Request {
+            version: 1,
+            operation,
+        })?,
+    )?;
+    let response = protocol::read_frame(&mut stream)?;
+    anyhow::ensure!(
+        Instant::now() <= deadline,
+        "native request deadline expired"
+    );
+    anyhow::ensure!(
+        response["version"] == 1 && response["ok"] == true,
+        "Chat participant request failed: {}",
+        response["error"]
+    );
+    Ok(response["data"].clone())
+}
+
+#[cfg(target_os = "linux")]
+fn connect_authenticated(
+    socket: &std::path::Path,
+    credential: &str,
+    deadline: std::time::Instant,
+) -> anyhow::Result<std::os::unix::net::UnixStream> {
+    use crate::chat::{daemon, protocol};
     use std::os::{
         fd::{AsRawFd, FromRawFd},
         unix::{ffi::OsStrExt, net::UnixStream},
     };
     use std::time::Instant;
     daemon::validate_socket(socket)?;
-    operation.validate()?;
     let path = socket.as_os_str().as_bytes();
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     anyhow::ensure!(
@@ -76,25 +106,12 @@ fn request(
     }
     stream.set_nonblocking(false)?;
     daemon::peer_identity(&stream)?;
-    let mut stream = daemon::DeadlineStream::until(&mut stream, deadline);
+    let mut framed = daemon::DeadlineStream::until(&mut stream, deadline);
     protocol::write_frame(
-        &mut stream,
+        &mut framed,
         &serde_json::json!({"version":1,"binding":credential}),
     )?;
-    protocol::write_frame(
-        &mut stream,
-        &serde_json::to_value(protocol::Request {
-            version: 1,
-            operation,
-        })?,
-    )?;
-    let response = protocol::read_frame(&mut stream)?;
-    anyhow::ensure!(
-        response["version"] == 1 && response["ok"] == true,
-        "Chat participant request failed: {}",
-        response["error"]
-    );
-    Ok(response["data"].clone())
+    Ok(stream)
 }
 
 fn enroll(
@@ -356,6 +373,62 @@ pub(super) fn claude_check(
     Ok(())
 }
 
+pub(super) fn pi_check(
+    paths: &crate::chat::config::Paths,
+    input: &super::pi::HookInput,
+    explicit_name: Option<String>,
+    deadline: std::time::Instant,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let runtime = NativeRuntime::discover(std::process::id(), deadline)?;
+    anyhow::ensure!(
+        runtime.client == "pi",
+        "native Pi extension ancestry changed"
+    );
+    let directory = paths
+        .database
+        .parent()
+        .context("missing Chat data directory")?
+        .join("bindings");
+    let files = BindingFiles::open(&directory)?;
+    let binding = if input.hook_event_name == "SessionStart" {
+        let config = crate::chat::config::Config::load_or_create(&paths.config)?;
+        let project = config.project_for_root(&input.cwd)?;
+        let name = crate::name::pick(crate::name::Sources {
+            explicit: explicit_name,
+            lam_name: std::env::var("LAM_NAME").ok(),
+            multiplexer: None,
+        })?;
+        let candidate = NativeBinding::new(
+            "pi",
+            &runtime.version,
+            &input.session_id,
+            runtime.process,
+            &project,
+            &name,
+        )?;
+        enroll(&files, &paths.socket, candidate, deadline)?
+    } else {
+        let key = binding_locator("pi", &input.session_id, &runtime.process)?;
+        let binding = files.load(&key)?;
+        anyhow::ensure!(
+            binding.session.is_some()
+                && binding.version == runtime.version
+                && binding.process == runtime.process,
+            "native Pi binding is missing or changed"
+        );
+        binding
+    };
+    let credential = format!("{}.{}", binding.locator()?, binding.integration_secret);
+    let operation = if input.hook_event_name == "SessionEnd" {
+        crate::chat::protocol::Operation::End {}
+    } else {
+        crate::chat::protocol::Operation::Register {}
+    };
+    request(&paths.socket, &credential, operation, deadline)?;
+    Ok(())
+}
+
 impl Participant {
     pub fn current(
         paths: &crate::chat::config::Paths,
@@ -379,6 +452,13 @@ impl Participant {
         &self.binding.project
     }
 
+    pub(super) fn session(&self) -> &crate::chat::types::SessionRef {
+        self.binding
+            .session
+            .as_ref()
+            .expect("validated participant has a session")
+    }
+
     pub fn request(
         &self,
         operation: crate::chat::protocol::Operation,
@@ -389,6 +469,94 @@ impl Participant {
             self.binding.participant_secret
         );
         request(&self.socket, &credential, operation, self.deadline)
+    }
+
+    pub(super) fn subscribe_pi(&self) -> anyhow::Result<std::os::unix::net::UnixStream> {
+        use crate::chat::protocol::{self, Operation, Request};
+        anyhow::ensure!(
+            self.binding.client == "pi",
+            "Pi bridge requires a Pi binding"
+        );
+        let credential = format!(
+            "{}.{}",
+            self.binding.locator()?,
+            self.binding.participant_secret
+        );
+        let mut stream = connect_authenticated(&self.socket, &credential, self.deadline)?;
+        protocol::write_frame(
+            &mut crate::chat::daemon::DeadlineStream::until(&mut stream, self.deadline),
+            &serde_json::to_value(Request {
+                version: 1,
+                operation: Operation::Subscribe {
+                    project: self.binding.project.clone(),
+                    cursor: None,
+                    limit: 100,
+                },
+            })?,
+        )?;
+        stream.set_read_timeout(None)?;
+        Ok(stream)
+    }
+
+    pub(super) fn claim_pi(&self) -> anyhow::Result<Option<crate::chat::types::Attempt>> {
+        use crate::chat::{protocol::Operation, types::ClientEvent};
+        anyhow::ensure!(
+            self.binding.client == "pi",
+            "Pi bridge requires a Pi binding"
+        );
+        let paths = crate::chat::config::Paths::discover()?;
+        let files = BindingFiles::open(
+            &paths
+                .database
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("missing Chat data directory"))?
+                .join("bindings"),
+        )?;
+        let epoch = files.next_epoch(
+            &self.binding,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )?;
+        let credential = format!(
+            "{}.{}",
+            self.binding.locator()?,
+            self.binding.integration_secret
+        );
+        let value = request(
+            &self.socket,
+            &credential,
+            Operation::Delivery {
+                event: ClientEvent::Hook,
+                epoch,
+            },
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    pub(super) fn finish_pi(
+        &self,
+        attempt: &str,
+        outcome: crate::chat::types::Handoff,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.binding.client == "pi",
+            "Pi bridge requires a Pi binding"
+        );
+        let credential = format!(
+            "{}.{}",
+            self.binding.locator()?,
+            self.binding.integration_secret
+        );
+        request(
+            &self.socket,
+            &credential,
+            crate::chat::protocol::Operation::Finish {
+                attempt: attempt.into(),
+                outcome,
+            },
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )?;
+        Ok(())
     }
 }
 
@@ -432,7 +600,13 @@ impl NativeRuntime {
                 .split(|byte| *byte == 0)
                 .map(|arg| arg.to_vec())
                 .collect();
-            if let Some(client) = native_client(&process.executable, &args) {
+            let client = native_client(&process.executable, &args).or_else(|| {
+                pi_process_title(&process.executable, &args)
+                    .then(|| std::env::var_os("LAM_CHAT_PI_ENTRYPOINT"))
+                    .flatten()
+                    .map(|_| "pi")
+            });
+            if let Some(client) = client {
                 // The nearest recognized client owns the command, even if an
                 // outer client exported a different session locator.
                 let executable = std::path::PathBuf::from(format!("/proc/{pid}/exe"));
@@ -467,12 +641,24 @@ fn version_args(client: &str, process_args: &[Vec<u8>]) -> anyhow::Result<Vec<St
                     .ok()
                     .filter(|arg| arg.contains("/pi-coding-agent/") && arg.ends_with("/cli.js"))
             });
-            let script = script.ok_or_else(|| anyhow::anyhow!("missing native Pi entrypoint"))?;
+            let script = if let Some(script) = script {
+                script.to_owned()
+            } else {
+                let inherited = std::env::var("LAM_CHAT_PI_ENTRYPOINT")
+                    .map_err(|_| anyhow::anyhow!("missing native Pi entrypoint"))?;
+                let canonical = std::fs::canonicalize(inherited)?;
+                let value = canonical.to_string_lossy();
+                anyhow::ensure!(
+                    value.contains("/pi-coding-agent/dist/") && value.ends_with("/cli.js"),
+                    "Pi entrypoint does not identify the installed client"
+                );
+                value.into_owned()
+            };
             anyhow::ensure!(
-                std::path::Path::new(script).is_absolute(),
+                std::path::Path::new(&script).is_absolute(),
                 "Pi entrypoint is not absolute"
             );
-            Ok(vec![script.into(), "--version".into()])
+            Ok(vec![script, "--version".into()])
         }
         _ => anyhow::bail!("unsupported native client"),
     }
@@ -532,6 +718,14 @@ fn native_client(executable: &std::path::Path, args: &[Vec<u8>]) -> Option<&'sta
 }
 
 #[cfg(target_os = "linux")]
+fn pi_process_title(executable: &std::path::Path, args: &[Vec<u8>]) -> bool {
+    executable
+        .file_name()
+        .is_some_and(|name| matches!(name.to_str(), Some("node" | "nodejs" | "bun")))
+        && args.first().is_some_and(|arg| arg == b"pi")
+}
+
+#[cfg(target_os = "linux")]
 pub(in crate::chat) struct NativeBindings {
     files: BindingFiles,
 }
@@ -564,7 +758,19 @@ impl NativeBindings {
         validate_binding_key(secret)?;
         let binding = self.files.load(key)?;
         let context = binding.context(secret)?;
-        let runtime = observe()?;
+        let runtime = if binding.client == "pi" {
+            // Pi overwrites /proc/cmdline after startup. The trusted extension
+            // checked its entrypoint/version when issuing this exact-process
+            // binding; the daemon can recheck lifetime and child ancestry.
+            binding.process.validate()?;
+            NativeRuntime {
+                client: "pi".into(),
+                version: binding.version.clone(),
+                process: binding.process.clone(),
+            }
+        } else {
+            observe()?
+        };
         anyhow::ensure!(
             runtime.client == binding.client
                 && runtime.version == binding.version
@@ -2012,6 +2218,18 @@ mod tests {
             Some("pi")
         );
         assert_eq!(native_client(Path::new("/usr/bin/sh"), &[]), None);
+        assert!(pi_process_title(
+            Path::new("/usr/bin/node"),
+            &[b"pi".to_vec()]
+        ));
+        assert!(!pi_process_title(
+            Path::new("/usr/bin/node"),
+            &[b"node".to_vec()]
+        ));
+        assert!(!pi_process_title(
+            Path::new("/usr/bin/python"),
+            &[b"pi".to_vec()]
+        ));
     }
 
     #[test]

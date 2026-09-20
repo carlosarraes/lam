@@ -96,6 +96,28 @@ fn codex_hook_operational_errors_are_silent_and_privately_bounded() {
 }
 
 #[test]
+fn pi_extension_helper_reports_failure_only_to_its_parent_process() {
+    let fixture = Fixture::new();
+    let mut child = fixture
+        .command()
+        .args(["chat", "hook", "--client", "pi", "--event", "SessionStart"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"not json").unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    assert!(result.stderr.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(fixture.dir.path().join("data/hook-errors.jsonl")).unwrap(),
+        "{\"client\":\"pi\",\"stage\":\"input\",\"status\":\"error\"}\n"
+    );
+}
+
+#[test]
 fn native_validator_is_explicitly_experimental_and_status_distinguishes_it() {
     let mut fixture = Fixture::new();
     let help = fixture

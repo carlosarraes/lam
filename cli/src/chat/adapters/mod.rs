@@ -14,6 +14,7 @@ pub mod claude;
 pub mod codex;
 #[cfg(target_os = "linux")]
 mod hooks;
+pub mod pi;
 
 pub trait Adapter {
     fn validate(&self, session: &crate::chat::types::SessionRef) -> anyhow::Result<()>;
