@@ -8,11 +8,11 @@ Build the Rust CLI, then start a foreground service in a terminal:
 
 ```sh
 cargo build --manifest-path cli/Cargo.toml --release --locked
-lam chat serve --foreground --native-bindings  # Linux native adapters only
+lam chat serve --foreground --native-bindings
 lam chat status --json
 ```
 
-`--native-bindings` enables the experimental Linux Claude/Codex/Pi integration. Without it, `lam chat serve --foreground` still supports the human observer and history, but native participants cannot authenticate. The daemon creates private Chat config/data under the platform's user config/data directories; it does not contact Cloudflare or the LAM phone app. `LAM_CHAT_CONFIG` and `LAM_CHAT_DATA_DIR` are scoped overrides for isolated setups.
+`--native-bindings` enables the experimental Linux Claude/Codex/Pi integration and macOS Claude binding. Without it, `lam chat serve --foreground` still supports the human observer and history, but native participants cannot authenticate. The daemon creates private Chat config/data under the platform's user config/data directories; it does not contact Cloudflare or the LAM phone app. `LAM_CHAT_CONFIG` and `LAM_CHAT_DATA_DIR` are scoped overrides for isolated setups.
 
 From a human terminal outside an agent session, run `lam chat` to open the observer. Its recipient field accepts `@name` with fuzzy suggestions or an exact `MACHINE/INCARNATION`; Tab moves among recipients, message body, and feed. Enter selects a recipient or sends the body; Ctrl-J inserts a newline. In the feed, `r` replies to the sender, `a` replies to all original participants, Home loads older history, G jumps to latest, and PgUp/PgDn scroll detail. A stale `@all` roster requires a second Enter. The live feed resumes from a signed cursor after a connection break.
 
@@ -74,10 +74,19 @@ lam chat setup --client pi --root "$HOME" --dry-run
 lam chat setup --client pi --root "$HOME" --apply
 ```
 
+On macOS, only Claude setup can currently be applied. Preview its project-scoped hook, review the exact file changes, and then apply it for new Claude sessions:
+
+```sh
+lam chat setup --client claude --dry-run
+lam chat setup --client claude --apply
+```
+
+Mac Codex and Pi setup remains preview-only; do not treat peer history synchronization as native model delivery.
+
 Codex and Claude setup targets are project-scoped; Pi's target is the supplied home directory. Setup refuses an existing file it cannot match *byte-for-byte* to its own generated template. It prints the proposed template during a dry run so unrelated settings can be merged manually. It never rewrites a foreign hook file or silently disables a native client trust prompt. Run the installed binary for both setup and later operation: its absolute path is embedded in generated hooks. `--remove --dry-run` previews removal; `--remove --apply` moves an unchanged owned file out of the active path and prints a private backup location. A user-edited file is left alone. `LAM_CHAT_DISABLE=1` in a **new** agent process opts out of native registration and delivery while retaining history.
 
 `lam chat service install` previews a Linux systemd user unit (or a macOS launchd user-agent file). `--apply` writes only that owned file; it does not enable, start, restart or stop anything. Use `lam chat service status` to inspect whether the template is installed, not whether its process is running. Start the foreground service first; if you later choose to manage it through your user service manager, review the generated file and enable/start it explicitly. `lam chat service uninstall --apply` removes only an unchanged owned unit and prints its recoverable backup. Stop any running Chat service yourself before uninstalling its file. Chat config, history, the ordinary LAM cloud config, and other client hooks are not removed.
 
 ## Current platform boundary
 
-The native participant adapters are implemented and live-probed on Linux. The peer replay path has both an isolated two-daemon test and a staged real SSH exchange between this PC and the Mac, including an offline replay after restarting only the staged Mac daemon. That does not establish macOS native agent delivery or a production installation. On macOS the human observer, human CLI send/reply, and peer bridge can run, but native agent hooks are still disabled. Mac CLI sends and replies require explicit `--as-human`; agent sessions must not use that flag to mislabel their origin. This is an attribution safeguard within a trusted same-user account, not proof of human intent. Treat `lam chat status --json` and an actual directed exchange as the authority for an installation; a message stored or imported remotely is not automatically model-visible. Existing LAM requests, FYIs and Articles are independent of Chat.
+The native participant adapters are implemented and live-probed on Linux. The peer replay path has both an isolated two-daemon test and a staged real SSH exchange between this PC and the Mac, including an offline replay after restarting only the staged Mac daemon. On macOS, Claude's startup binding and private-socket handoff have isolated checks, but an authenticated live model delivery and production installation have not passed. The Mac's Claude CLI was logged out during the staged probe. Mac Codex/Pi native delivery is unavailable. Mac CLI sends and replies require explicit `--as-human`; agent sessions must not use that flag to mislabel their origin. This is an attribution safeguard within a trusted same-user account, not proof of human intent. Treat `lam chat status --json` and an actual directed exchange as the authority for an installation; a message stored or imported remotely is not automatically model-visible. Existing LAM requests, FYIs and Articles are independent of Chat.
