@@ -1464,7 +1464,9 @@ async fn article_open_launches_valid_session_without_printing_or_marking_read() 
     assert!(!String::from_utf8_lossy(&out.stdout).contains("opaque-capability"));
     assert!(!String::from_utf8_lossy(&out.stderr).contains("opaque-capability"));
     let deadline = Instant::now() + Duration::from_secs(2);
-    while !opened.exists() && Instant::now() < deadline {
+    while fs::read_to_string(&opened).ok().as_deref() != Some(normalized)
+        && Instant::now() < deadline
+    {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(fs::read_to_string(opened).unwrap(), normalized);
