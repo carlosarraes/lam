@@ -61,6 +61,23 @@ The other machine uses its own machine UUID and root, names the first machine as
 
 The private observer and peer Unix sockets trust processes running as the same OS user. SSH authenticates the host and user connection; both config files must explicitly allow the same peer machine and project IDs. Do not place untrusted users on either account. If a restored database's replay cursor is newer than the origin's history, synchronization stops with an error rather than silently losing events.
 
+## Optional native setup and user service
+
+On Linux, run these commands from the *installed* LAM binary's project directory before starting new agent sessions:
+
+```sh
+lam chat setup --client codex --dry-run
+lam chat setup --client codex --apply
+lam chat setup --client claude --dry-run
+lam chat setup --client claude --apply
+lam chat setup --client pi --root "$HOME" --dry-run
+lam chat setup --client pi --root "$HOME" --apply
+```
+
+Codex and Claude setup targets are project-scoped; Pi's target is the supplied home directory. Setup refuses an existing file it cannot match *byte-for-byte* to its own generated template. It prints the proposed template during a dry run so unrelated settings can be merged manually. It never rewrites a foreign hook file or silently disables a native client trust prompt. Run the installed binary for both setup and later operation: its absolute path is embedded in generated hooks. `--remove --dry-run` previews removal; `--remove --apply` moves an unchanged owned file out of the active path and prints a private backup location. A user-edited file is left alone. `LAM_CHAT_DISABLE=1` in a **new** agent process opts out of native registration and delivery while retaining history.
+
+`lam chat service install` previews a Linux systemd user unit (or a macOS launchd user-agent file). `--apply` writes only that owned file; it does not enable, start, restart or stop anything. Use `lam chat service status` to inspect whether the template is installed, not whether its process is running. Start the foreground service first; if you later choose to manage it through your user service manager, review the generated file and enable/start it explicitly. `lam chat service uninstall --apply` removes only an unchanged owned unit and prints its recoverable backup. Stop any running Chat service yourself before uninstalling its file. Chat config, history, the ordinary LAM cloud config, and other client hooks are not removed.
+
 ## Current platform boundary
 
 The native participant adapters are implemented and live-probed on Linux. The two-daemon peer replay path is tested with isolated Linux processes and an owned SSH shim. That test does not establish macOS native delivery or a real PC–Mac link. On macOS the human observer and peer bridge can run, but native agent hooks are still disabled. Treat `lam chat status --json` and an actual directed exchange as the authority for an installation; a message stored or imported remotely is not automatically model-visible. Existing LAM requests, FYIs and Articles are independent of Chat.

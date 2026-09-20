@@ -117,6 +117,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.on("session_start", async (_event, ctx) => {
+    if (process.env.LAM_CHAT_DISABLE === "1") return;
     const sessionId = ctx.sessionManager.getSessionId();
     const name = ctx.sessionManager.getSessionName() ?? process.env.LAM_NAME ?? `pi-${sessionId.slice(0, 8)}`;
     const state: ActiveSession = {

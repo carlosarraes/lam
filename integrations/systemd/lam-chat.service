@@ -1,0 +1,16 @@
+[Unit]
+Description=LAM Chat local observer and peer relay
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@LAM_BINARY@ chat serve --foreground --native-bindings
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=default.target

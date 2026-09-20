@@ -37,6 +37,25 @@ pub enum ChatCommand {
     },
     #[command(hide = true)]
     PeerStdio,
+    /// Preview or install project-scoped native Chat integration without touching unrelated settings.
+    Setup {
+        #[arg(long, value_parser = ["codex", "claude", "pi"])]
+        client: String,
+        /// Project root for Codex/Claude; home directory for Pi. Defaults accordingly.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Stage an owned user-service file. Installation does not start or enable it.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// Run the private local Chat daemon. Does not install a service.
     Serve {
         #[arg(long, required = true)]
@@ -106,6 +125,26 @@ pub enum ChatCommand {
         json: bool,
     },
 }
+
+#[derive(Subcommand)]
+pub enum ServiceAction {
+    Install {
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        apply: bool,
+    },
+    Uninstall {
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        apply: bool,
+    },
+    Status {
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+}
 #[derive(Args)]
 pub struct InboxArgs {
     #[arg(long)]
@@ -129,6 +168,9 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
         name,
     }) = &args.command
     {
+        if std::env::var("LAM_CHAT_DISABLE").as_deref() == Ok("1") {
+            return Ok(0);
+        }
         return Ok(match client.as_str() {
             "codex" => super::adapters::codex::run_hook(event, name.clone()),
             "claude" => super::adapters::claude::run_hook(event, name.clone()),
@@ -137,8 +179,52 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
         });
     }
     if let Some(ChatCommand::Bridge { client }) = &args.command {
+        if std::env::var("LAM_CHAT_DISABLE").as_deref() == Ok("1") {
+            return Ok(0);
+        }
         debug_assert_eq!(client, "pi");
         return super::adapters::pi::run_bridge();
+    }
+    if let Some(ChatCommand::Setup {
+        client,
+        root,
+        apply,
+        remove,
+        ..
+    }) = &args.command
+    {
+        #[cfg(unix)]
+        {
+            let root = match root {
+                Some(root) => root.clone(),
+                None if client == "pi" => {
+                    dirs::home_dir().context("cannot find home for Pi extension")?
+                }
+                None => std::env::current_dir()?,
+            };
+            super::setup::run(client, &root, *apply, *remove)?;
+        }
+        #[cfg(not(unix))]
+        bail!("Chat setup requires Unix platform support");
+        return Ok(0);
+    }
+    if let Some(ChatCommand::Service { action }) = &args.command {
+        #[cfg(unix)]
+        {
+            let (root, apply, remove, status) = match action {
+                ServiceAction::Install { root, apply } => (root, *apply, false, false),
+                ServiceAction::Uninstall { root, apply } => (root, *apply, true, false),
+                ServiceAction::Status { root } => (root, false, false, true),
+            };
+            let root = match root {
+                Some(root) => root.clone(),
+                None => super::setup::default_service_root()?,
+            };
+            super::setup::run_service(&root, apply, remove, status)?;
+        }
+        #[cfg(not(unix))]
+        bail!("Chat service setup requires Unix platform support");
+        return Ok(0);
     }
     let paths = Paths::discover()?;
     if matches!(args.command.as_ref(), Some(ChatCommand::PeerStdio)) {
@@ -166,6 +252,7 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
         ChatCommand::Hook { .. } => unreachable!("hook is dispatched before fallible setup"),
         ChatCommand::Bridge { .. } => unreachable!("bridge is dispatched before fallible setup"),
         ChatCommand::PeerStdio => unreachable!("peer bridge is dispatched before command matching"),
+        ChatCommand::Setup { .. } => unreachable!("setup is dispatched before command matching"),
         ChatCommand::Serve {
             native_bindings, ..
         } => {
@@ -336,6 +423,9 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
                     limit,
                 })?;
             print_value(&result, json)?;
+        }
+        ChatCommand::Service { .. } => {
+            unreachable!("Chat service was handled before daemon discovery")
         }
     }
     Ok(0)

@@ -9,6 +9,8 @@ pub mod peer;
 pub mod protocol;
 pub mod registry;
 pub mod render;
+#[cfg(unix)]
+pub mod setup;
 pub mod store;
 pub mod tui;
 pub mod types;
