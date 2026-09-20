@@ -305,9 +305,8 @@ impl Participant {
     ) -> anyhow::Result<Self> {
         use anyhow::Context;
         (|| -> anyhow::Result<Self> {
-            let native_id = std::env::var("CODEX_THREAD_ID").context("missing native thread locator")?;
-            crate::chat::protocol::validate_uuid(&native_id)?;
             let runtime = NativeRuntime::discover(std::process::id(), deadline)?;
+            let native_id = native_id_from(&runtime.client, |key| std::env::var(key).ok())?;
             let directory = paths.database.parent().context("missing Chat data directory")?.join("bindings");
             anyhow::ensure!(directory.exists(), "native integration has not issued a binding");
             let files = BindingFiles::open(&directory)?;
@@ -376,26 +375,18 @@ impl NativeRuntime {
                 .map(|arg| arg.to_vec())
                 .collect();
             if let Some(client) = native_client(&process.executable, &args) {
-                // A nearer foreign client must never inherit an outer Codex identity.
-                anyhow::ensure!(
-                    client == "codex",
-                    "native client binding is not implemented for this client"
-                );
+                // The nearest recognized client owns the command, even if an
+                // outer client exported a different session locator.
                 let executable = std::path::PathBuf::from(format!("/proc/{pid}/exe"));
-                let output = bounded_command(&executable, &["--version"], deadline, 256)?;
-                let version = output
-                    .stdout
-                    .trim()
-                    .strip_prefix("codex-cli ")
-                    .ok_or_else(|| anyhow::anyhow!("unrecognized native execution version"))?;
-                anyhow::ensure!(
-                    output.success && matches!(version, "0.153.4" | "0.154.0"),
-                    "unsupported native execution version"
-                );
+                let version_args = version_args(client, &args)?;
+                let borrowed: Vec<_> = version_args.iter().map(String::as_str).collect();
+                let output = bounded_command(&executable, &borrowed, deadline, 256)?;
+                anyhow::ensure!(output.success, "native version check failed");
+                let version = parse_version(client, &output.stdout)?;
                 process.validate()?;
                 return Ok(Self {
                     client: client.into(),
-                    version: version.into(),
+                    version,
                     process,
                 });
             }
@@ -406,6 +397,59 @@ impl NativeRuntime {
         }
         anyhow::bail!("native process ancestry exceeds validation bound")
     }
+}
+
+#[cfg(target_os = "linux")]
+fn version_args(client: &str, process_args: &[Vec<u8>]) -> anyhow::Result<Vec<String>> {
+    match client {
+        "codex" | "claude" => Ok(vec!["--version".into()]),
+        "pi" => {
+            let script = process_args.iter().skip(1).take(4).find_map(|arg| {
+                std::str::from_utf8(arg)
+                    .ok()
+                    .filter(|arg| arg.contains("/pi-coding-agent/") && arg.ends_with("/cli.js"))
+            });
+            let script = script.ok_or_else(|| anyhow::anyhow!("missing native Pi entrypoint"))?;
+            anyhow::ensure!(
+                std::path::Path::new(script).is_absolute(),
+                "Pi entrypoint is not absolute"
+            );
+            Ok(vec![script.into(), "--version".into()])
+        }
+        _ => anyhow::bail!("unsupported native client"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_version(client: &str, output: &str) -> anyhow::Result<String> {
+    let version = match client {
+        "codex" => output.trim().strip_prefix("codex-cli "),
+        "claude" => output.trim().strip_suffix(" (Claude Code)"),
+        "pi" => Some(output.trim()),
+        _ => None,
+    }
+    .ok_or_else(|| anyhow::anyhow!("unrecognized native execution version"))?;
+    let supported = match client {
+        "codex" => matches!(version, "0.153.4" | "0.154.0"),
+        "claude" => matches!(version, "2.1.270" | "2.1.273"),
+        "pi" => matches!(version, "0.85.1" | "0.86.1"),
+        _ => false,
+    };
+    anyhow::ensure!(supported, "unsupported native execution version");
+    Ok(version.into())
+}
+
+#[cfg(target_os = "linux")]
+fn native_id_from(client: &str, lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<String> {
+    let key = match client {
+        "codex" => "CODEX_THREAD_ID",
+        "claude" => "LAM_CHAT_CLAUDE_SESSION_ID",
+        "pi" => "PI_SESSION_ID",
+        _ => anyhow::bail!("unsupported native client"),
+    };
+    let id = lookup(key).ok_or_else(|| anyhow::anyhow!("missing native session locator"))?;
+    crate::chat::protocol::validate_uuid(&id)?;
+    Ok(id)
 }
 
 #[cfg(target_os = "linux")]
@@ -1812,6 +1856,56 @@ mod tests {
             Some("pi")
         );
         assert_eq!(native_client(Path::new("/usr/bin/sh"), &[]), None);
+    }
+
+    #[test]
+    fn native_version_invocation_and_locator_are_client_specific() {
+        let pi_args = vec![
+            b"node".to_vec(),
+            b"/opt/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js".to_vec(),
+        ];
+        assert_eq!(version_args("codex", &[]).unwrap(), vec!["--version"]);
+        assert_eq!(version_args("claude", &[]).unwrap(), vec!["--version"]);
+        assert_eq!(
+            version_args("pi", &pi_args).unwrap(),
+            vec![
+                "/opt/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+                "--version"
+            ]
+        );
+        assert!(version_args("pi", &[b"node".to_vec()]).is_err());
+        assert_eq!(
+            parse_version("codex", "codex-cli 0.153.4\n").unwrap(),
+            "0.153.4"
+        );
+        assert_eq!(
+            parse_version("claude", "2.1.273 (Claude Code)\n").unwrap(),
+            "2.1.273"
+        );
+        assert_eq!(parse_version("pi", "0.86.1\n").unwrap(), "0.86.1");
+        assert!(parse_version("pi", "v0.86.1\n").is_err());
+        assert!(parse_version("claude", "2.1.999 (Claude Code)\n").is_err());
+
+        let value = |key: &str| match key {
+            "CODEX_THREAD_ID" => Some("11111111-1111-4111-8111-111111111111".into()),
+            "LAM_CHAT_CLAUDE_SESSION_ID" => Some("22222222-2222-4222-8222-222222222222".into()),
+            "PI_SESSION_ID" => Some("33333333-3333-4333-8333-333333333333".into()),
+            _ => None,
+        };
+        assert_eq!(
+            native_id_from("codex", value).unwrap(),
+            value("CODEX_THREAD_ID").unwrap()
+        );
+        assert_eq!(
+            native_id_from("claude", value).unwrap(),
+            value("LAM_CHAT_CLAUDE_SESSION_ID").unwrap()
+        );
+        assert_eq!(
+            native_id_from("pi", value).unwrap(),
+            value("PI_SESSION_ID").unwrap()
+        );
+        assert!(native_id_from("unknown", value).is_err());
+        assert!(native_id_from("pi", |_| Some("not-a-uuid".into())).is_err());
     }
 
     #[test]
