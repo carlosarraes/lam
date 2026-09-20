@@ -14,6 +14,8 @@ pub mod claude;
 pub mod codex;
 #[cfg(target_os = "linux")]
 mod hooks;
+#[cfg(all(test, target_os = "macos"))]
+mod macos_process;
 pub mod pi;
 
 pub trait Adapter {

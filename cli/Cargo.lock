@@ -1140,6 +1140,7 @@ name = "lam"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cc",
  "chrono",
  "chrono-tz",
  "clap",
