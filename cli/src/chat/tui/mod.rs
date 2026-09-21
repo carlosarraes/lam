@@ -12,6 +12,8 @@ use super::{
 };
 
 mod draw;
+mod readonly;
+pub(crate) use readonly::ReadonlyFeed;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -465,6 +467,8 @@ fn fuzzy_match(candidate: &str, query: &str) -> bool {
 }
 
 enum Network {
+    ReadonlyInit(String, Option<serde_json::Value>),
+    ReadonlyError(String),
     Feed(serde_json::Value),
     Older(serde_json::Value),
     OlderFailed(String),
@@ -477,6 +481,18 @@ enum Work {
     Send(Action, String),
     RefreshRoster,
     LoadOlder(u64),
+}
+
+fn roster_update(paths: &Paths, project: &str) -> Option<Network> {
+    let page = super::commands::observer_request(
+        paths,
+        protocol::Operation::Sessions {
+            project: project.into(),
+        },
+    )
+    .ok()?;
+    let roster = serde_json::from_value(page["sessions"].clone()).ok()?;
+    Some(Network::Roster(roster, page["stale"] == true))
 }
 
 pub fn run(paths: &Paths, project: &str) -> anyhow::Result<()> {
@@ -534,6 +550,7 @@ fn event_loop(
     loop {
         while let Ok(message) = network.try_recv() {
             match message {
+                Network::ReadonlyInit(_, _) | Network::ReadonlyError(_) => {}
                 Network::Feed(page) => app.add_page(&page, false),
                 Network::Older(page) => app.add_page(&page, true),
                 Network::OlderFailed(error) => {
@@ -632,15 +649,8 @@ fn spawn_worker(
                     });
                 }
                 Work::RefreshRoster => {
-                    if let Ok(page) = super::commands::observer_request(
-                        &paths,
-                        protocol::Operation::Sessions {
-                            project: project.clone(),
-                        },
-                    ) {
-                        if let Ok(roster) = serde_json::from_value(page["sessions"].clone()) {
-                            let _ = output.send(Network::Roster(roster, page["stale"] == true));
-                        }
+                    if let Some(update) = roster_update(&paths, &project) {
+                        let _ = output.send(update);
                     }
                 }
                 Work::Send(action, key) => {
@@ -743,6 +753,39 @@ fn spawn_subscription(
 mod tests {
     use super::*;
     use crate::chat::types::{Actor, Draft};
+
+    #[test]
+    fn readonly_feed_never_enters_composer_or_sends() {
+        let mut feed = ReadonlyFeed::default();
+        feed.app.add_event(FeedEvent::Message {
+            message: message("first", "hello"),
+        });
+        for key in ['r', 'a', 'x'] {
+            feed.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        }
+        feed.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(feed.app.focus, Focus::Recipients);
+        assert!(feed.app.body.is_empty());
+        assert!(feed.app.reply_to.is_none());
+        assert!(!feed.app.pending);
+    }
+
+    #[test]
+    fn readonly_feed_preserves_selection_when_a_message_arrives() {
+        let mut feed = ReadonlyFeed::default();
+        feed.app.add_event(FeedEvent::Message {
+            message: message("first", "one"),
+        });
+        feed.app.add_event(FeedEvent::Message {
+            message: message("second", "two"),
+        });
+        feed.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        feed.app.add_event(FeedEvent::Message {
+            message: message("third", "three"),
+        });
+        assert_eq!(feed.app.messages[feed.app.selected].message.id, "first");
+        assert_eq!(feed.app.unseen, 1);
+    }
 
     fn message(id: &str, body: &str) -> Message {
         Message {

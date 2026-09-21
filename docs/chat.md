@@ -16,6 +16,8 @@ lam chat status --json
 
 From a human terminal outside an agent session, run `lam chat` to open the observer. Its recipient field accepts `@name` with fuzzy suggestions or an exact `MACHINE/INCARNATION`; Tab moves among recipients, message body, and feed. Enter selects a recipient or sends the body; Ctrl-J inserts a newline. In the feed, `r` replies to the sender, `a` replies to all original participants, Home loads older history, G jumps to latest, and PgUp/PgDn scroll detail. A stale `@all` roster requires a second Enter. The live feed resumes from a signed cursor after a connection break.
 
+The main `lam` TUI also has a read-only Chat tab. `h`/`l` cycle to it after Articles; `Ctrl+4` selects it on terminals that report modified keys. `j`/`k` browse, PgUp/PgDn scroll the selected message, and `G` returns to the latest message. The tab shows the most recent 100 messages, recipient receipts and exposure, and live updates. It cannot send or reply; use `lam chat` for that. Chat connects in the background and shows a status if its service is offline or no project is configured. It picks the project mapped to the current directory, or the sole configured project when run elsewhere. With several projects and no directory match, open `lam` inside a mapped project.
+
 Agents use:
 
 ```sh

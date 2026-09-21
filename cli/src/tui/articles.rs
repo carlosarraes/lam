@@ -554,7 +554,7 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
             terminal.draw(|frame| app.draw(frame)).unwrap();
             let requests = terminal.backend().buffer().clone();
-            app.handle(key('h'));
+            app.set_tab(super::super::Tab::Articles);
             app.articles
                 .add(page(vec![article("one", false, 4)], None), 0, true);
             terminal.draw(|frame| app.draw(frame)).unwrap();
@@ -594,7 +594,7 @@ mod tests {
         for (width, height) in [(30, 8), (40, 10), (80, 24)] {
             for empty in [true, false] {
                 let mut app = App::new("host".into());
-                app.handle(key('h'));
+                app.set_tab(super::super::Tab::Articles);
                 app.articles.day = Some("2026-09-08".parse().unwrap());
                 let items = if empty {
                     vec![]
@@ -623,7 +623,7 @@ mod tests {
     #[test]
     fn selected_article_creation_time_uses_sao_paulo_calendar_day() {
         let mut app = App::new("host".into());
-        app.handle(key('h'));
+        app.set_tab(super::super::Tab::Articles);
         let mut row = article("one", false, 0);
         row.created_at = "2026-09-09T02:15:00.000Z".into();
         app.articles.add(page(vec![row], None), 0, true);
@@ -635,7 +635,7 @@ mod tests {
     #[test]
     fn article_error_stays_visible_above_a_long_summary() {
         let mut app = App::new("host".into());
-        app.handle(key('h'));
+        app.set_tab(super::super::Tab::Articles);
         let mut row = article("one", false, 1);
         row.summary = "Long summary line\n".repeat(40);
         app.articles.add(page(vec![row], None), 0, true);
@@ -648,7 +648,7 @@ mod tests {
     #[test]
     fn day_navigation_replaces_rows_and_rejects_old_pages() {
         let mut app = App::new("host".into());
-        app.handle(key('h'));
+        app.set_tab(super::super::Tab::Articles);
         app.articles.add(
             page(vec![article("old", false, 0)], Some("old-cursor")),
             0,
@@ -692,7 +692,7 @@ mod tests {
     #[test]
     fn date_jump_preserves_filters_through_paging_and_reconnect() {
         let mut app = App::new("host".into());
-        app.handle(key('h'));
+        app.set_tab(super::super::Tab::Articles);
         app.handle(key('f'));
         app.handle(key('/'));
         for c in "report".chars() {
@@ -743,7 +743,7 @@ mod tests {
     #[test]
     fn date_entry_rejects_invalid_and_future_days_without_navigation() {
         let mut app = App::new("host".into());
-        app.handle(key('h'));
+        app.set_tab(super::super::Tab::Articles);
         for invalid in ["2026-02-30", "2999-01-01", "2026-2-01", ""] {
             app.handle(key('D'));
             for c in invalid.chars() {
@@ -767,7 +767,7 @@ mod tests {
     #[test]
     fn opening_preserves_unread_and_explicit_unread_uses_selected_version() {
         let mut app = App::new("host".into());
-        app.handle(key('h'));
+        app.set_tab(super::super::Tab::Articles);
         app.articles
             .add(page(vec![article("one", false, 4)], None), 0, true);
         assert_eq!(
@@ -799,7 +799,7 @@ mod tests {
     #[test]
     fn failed_replacement_keeps_the_applied_filter_label_with_selectable_rows() {
         let mut app = App::new("host".into());
-        app.handle(key('h'));
+        app.set_tab(super::super::Tab::Articles);
         app.articles
             .add(page(vec![article("one", true, 1)], None), 0, true);
         app.handle(key('f'));
@@ -816,7 +816,7 @@ mod tests {
     #[test]
     fn typing_during_a_load_does_not_relabel_its_results_or_submit_search_on_invalidation() {
         let mut app = App::new("host".into());
-        app.handle(key('h'));
+        app.set_tab(super::super::Tab::Articles);
         app.handle(key('/'));
         app.handle(key('x'));
         app.articles
@@ -902,7 +902,7 @@ mod tests {
     #[test]
     fn search_filter_and_paging_keep_query_cursor_and_ignore_stale_generation() {
         let mut app = App::new("host".into());
-        app.handle(key('h'));
+        app.set_tab(super::super::Tab::Articles);
         app.articles.add(
             page(vec![article("one", true, 1)], Some("cursor-one")),
             0,
@@ -944,7 +944,7 @@ mod tests {
     #[test]
     fn empty_error_and_paged_lists_render_retry_and_end_without_phantom_actions() {
         let mut app = App::new("host".into());
-        app.handle(key('h'));
+        app.set_tab(super::super::Tab::Articles);
         assert!(render(&app).contains("Loading articles"));
         app.articles.loading = false;
         app.articles.error = Some("offline".into());

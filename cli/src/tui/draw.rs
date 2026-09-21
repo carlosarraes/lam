@@ -72,7 +72,7 @@ impl App {
         doc
     }
 
-    /// `requests  [history]` — the active tab bracketed. Both states are the same width, so the
+    /// `requests  [history]` — the active tab bracketed. All states are the same width, so the
     /// centred bar never shifts as you switch. Degrades to the active label alone, then to
     /// nothing, so a narrow terminal loses the bar rather than colliding with the side blocks.
     fn tab_spans(&self, width: u16) -> Vec<Span<'static>> {
@@ -81,8 +81,9 @@ impl App {
             (Tab::Requests, "requests"),
             (Tab::History, "history"),
             (Tab::Articles, "articles"),
+            (Tab::Chat, "chat"),
         ];
-        let full = 29;
+        let full = 35;
         if width >= full + HEADER_SIDES {
             return labels
                 .iter()
@@ -102,6 +103,7 @@ impl App {
             Tab::Requests => "[requests]",
             Tab::History => "[history]",
             Tab::Articles => "[articles]",
+            Tab::Chat => "[chat]",
         };
         if width >= active.len() as u16 + HEADER_SIDES {
             return vec![Span::styled(active.to_string(), ACCENT)];
@@ -169,9 +171,44 @@ impl App {
         );
     }
 
+    fn draw_chat(&self, f: &mut Frame) {
+        let [header, body, footer] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
+        .areas(f.area());
+        let requests = self
+            .requests
+            .items
+            .iter()
+            .filter(|item| item.is_actionable())
+            .count();
+        let fyis = self
+            .requests
+            .items
+            .iter()
+            .filter(|item| item.is_fyi() && item.status == "open")
+            .count();
+        self.draw_header(
+            f,
+            header,
+            vec![
+                Span::styled("lam", BOLD),
+                Span::styled(format!("  {requests} requests · {fyis} FYI"), META),
+            ],
+        );
+        self.chat.draw(f, body);
+        f.render_widget(Paragraph::new(self.nav_line()), footer);
+    }
+
     pub(super) fn draw(&self, f: &mut Frame) {
         if self.tab == Tab::Articles {
             self.draw_articles(f);
+            return;
+        }
+        if self.tab == Tab::Chat {
+            self.draw_chat(f);
             return;
         }
         let visible = self.visible();
@@ -187,7 +224,7 @@ impl App {
         let list_h = match self.tab {
             Tab::Requests => (visible.len() as u16 + 1).clamp(3, (f.area().height / 3).max(3)),
             Tab::History => body.height.saturating_sub(HISTORY_DETAIL).max(3),
-            Tab::Articles => unreachable!("articles draw separately"),
+            Tab::Articles | Tab::Chat => unreachable!("other tabs draw separately"),
         };
         let (list, detail) = if self.reader {
             let [l, r] =
@@ -326,6 +363,7 @@ impl App {
                     Tab::Requests => "nothing here — all caught up",
                     Tab::History => "nothing closed yet",
                     Tab::Articles => "no articles",
+                    Tab::Chat => "no chat messages",
                 },
                 META,
             ))],
@@ -1113,14 +1151,15 @@ mod tests {
                 .map(|s| s.content.chars().count())
                 .sum()
         };
-        assert_eq!(width(&a, 80), 29);
+        assert_eq!(width(&a, 81), 35);
         a.handle(super::super::tests::key('l'));
-        assert_eq!(width(&a, 80), 29, "all tab states keep the bar width");
+        assert_eq!(width(&a, 81), 35, "all tab states keep the bar width");
 
         a.handle(super::super::tests::key('l'));
-        assert_eq!(width(&a, 80), 29);
-        a.handle(super::super::tests::key('h'));
-        assert_eq!(width(&a, 60), 9, "squeezed down to the active label");
+        assert_eq!(width(&a, 81), 35);
+        a.handle(super::super::tests::key('l'));
+        assert_eq!(width(&a, 81), 35);
+        assert_eq!(width(&a, 60), 6, "squeezed down to the active label");
         assert_eq!(width(&a, 40), 0, "and out entirely rather than colliding");
     }
 
@@ -1138,11 +1177,31 @@ mod tests {
             head.trim_end().ends_with("archlinux  ● connecting"),
             "{head:?}"
         );
-        // 81 columns less the 29-column bar leaves 26 on each side.
+        // 81 columns less the 35-column bar leaves 23 on each side.
         assert_eq!(
-            head.chars().skip(26).take(29).collect::<String>(),
-            "[requests] history  articles ",
+            head.chars().skip(23).take(35).collect::<String>(),
+            "[requests] history  articles  chat ",
             "{head:?}"
         );
+    }
+
+    #[test]
+    fn chat_tab_uses_main_header_and_has_no_composer() {
+        let mut app = App::new("host".into());
+        app.handle(super::super::tests::key('h'));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        term.draw(|frame| app.draw(frame)).unwrap();
+        let buf = term.backend().buffer();
+        let screen = (0..20)
+            .map(|y| (0..100).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("[chat]"), "{screen}");
+        assert!(
+            screen.contains("No messages in this project yet."),
+            "{screen}"
+        );
+        assert!(screen.contains("lam chat to write"), "{screen}");
+        assert!(!screen.contains("recipients"), "{screen}");
     }
 }

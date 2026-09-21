@@ -8,6 +8,7 @@ use std::cell::Cell;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use crate::chat::tui::ReadonlyFeed;
 use crate::client::{Client, Item, Resolution};
 use crate::config::Config;
 use crate::watch;
@@ -80,6 +81,7 @@ pub enum Tab {
     Requests,
     History,
     Articles,
+    Chat,
 }
 
 /// One tab's list and its cursor. The tabs are independent views, so each keeps your place.
@@ -92,6 +94,7 @@ struct Pane {
 pub struct App {
     tab: Tab,
     articles: articles::ArticlesPane,
+    chat: ReadonlyFeed,
     requests: Pane,
     history: Pane,
     /// `created_at` of the last row the server returned, however few of them we kept. Paging from
@@ -127,6 +130,7 @@ impl App {
         Self {
             tab: Tab::Requests,
             articles: articles::ArticlesPane::default(),
+            chat: ReadonlyFeed::default(),
             requests: Pane::default(),
             history: Pane::default(),
             history_cursor: None,
@@ -156,7 +160,7 @@ impl App {
         match self.tab {
             Tab::Requests => &self.requests,
             Tab::History => &self.history,
-            Tab::Articles => &self.requests,
+            Tab::Articles | Tab::Chat => &self.requests,
         }
     }
 
@@ -164,7 +168,7 @@ impl App {
         match self.tab {
             Tab::Requests => &mut self.requests,
             Tab::History => &mut self.history,
-            Tab::Articles => &mut self.requests,
+            Tab::Articles | Tab::Chat => &mut self.requests,
         }
     }
 
@@ -248,7 +252,7 @@ impl App {
         let pane = match tab {
             Tab::Requests => &mut self.requests,
             Tab::History => &mut self.history,
-            Tab::Articles => return,
+            Tab::Articles | Tab::Chat => return,
         };
         pane.selected = pane.selected.min(n.saturating_sub(1));
         if self.tab == tab && self.reader_item.is_none() {
@@ -287,10 +291,13 @@ impl App {
     }
 
     fn nav_hint(&self) -> &'static str {
+        if self.tab == Tab::Chat {
+            return "h/l tabs · j/k browse · PgUp/PgDn read · G latest · lam chat to write · q quit";
+        }
         match (self.reader, self.kitty) {
             (true, _) => "j/k move · J/K scroll · g/G top/end · m close · / filter · q quit",
             (false, true) => {
-                "h/l prev/next tab · ^1/^2/^3 tabs · j/k move · m read · / filter · R refresh · q quit"
+                "h/l prev/next tab · ^1/^2/^3/^4 tabs · j/k move · m read · / filter · R refresh · q quit"
             }
             (false, false) => "h/l prev/next tab · j/k move · m read · / filter · R refresh · q quit",
         }
@@ -307,7 +314,7 @@ impl App {
         let items = match tab {
             Tab::Requests => &self.requests.items,
             Tab::History => &self.history.items,
-            Tab::Articles => return vec![],
+            Tab::Articles | Tab::Chat => return vec![],
         };
         if self.filter.is_empty() {
             return items.iter().collect();
@@ -407,7 +414,7 @@ impl App {
         }
         self.leave_fyi_reader();
         self.tab = tab;
-        if tab == Tab::Articles {
+        if matches!(tab, Tab::Articles | Tab::Chat) {
             self.reader = false;
         }
         self.check_sel = 0;
@@ -421,6 +428,9 @@ impl App {
     fn load_more(&mut self) -> Option<Action> {
         if self.tab == Tab::Articles {
             return self.articles.load(false);
+        }
+        if self.tab == Tab::Chat {
+            return None;
         }
         if self.tab != Tab::History || self.history_loading || self.history_end {
             return None;
@@ -440,6 +450,14 @@ impl App {
         if !matches!(
             self.mode,
             Mode::Filter | Mode::Reply(_) | Mode::ArticleDate(_)
+        ) && key.code == KeyCode::Char('4')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            return self.set_tab(Tab::Chat);
+        }
+        if !matches!(
+            self.mode,
+            Mode::Filter | Mode::Reply(_) | Mode::ArticleDate(_)
         ) && key.code == KeyCode::Char('3')
             && key.modifiers.contains(KeyModifiers::CONTROL)
         {
@@ -453,6 +471,32 @@ impl App {
             if !global {
                 return self.handle_articles(key);
             }
+        }
+        if self.tab == Tab::Chat {
+            return match key.code {
+                KeyCode::Char('h') => self.set_tab(Tab::Articles),
+                KeyCode::Char('l') => self.set_tab(Tab::Requests),
+                KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.set_tab(Tab::Requests)
+                }
+                KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.set_tab(Tab::History)
+                }
+                KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.set_tab(Tab::Articles)
+                }
+                KeyCode::Char('q' | 'c')
+                    if key.code == KeyCode::Char('q')
+                        || key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    Some(Action::Quit)
+                }
+                KeyCode::Esc => Some(Action::Quit),
+                _ => {
+                    self.chat.handle_key(key);
+                    None
+                }
+            };
         }
         if matches!(self.mode, Mode::Filter) {
             match key.code {
@@ -565,14 +609,16 @@ impl App {
                 Some(action)
             }
             KeyCode::Char('h') => self.set_tab(match self.tab {
-                Tab::Requests => Tab::Articles,
+                Tab::Requests => Tab::Chat,
                 Tab::History => Tab::Requests,
                 Tab::Articles => Tab::History,
+                Tab::Chat => Tab::Articles,
             }),
             KeyCode::Char('l') => self.set_tab(match self.tab {
                 Tab::Requests => Tab::History,
                 Tab::History => Tab::Articles,
-                Tab::Articles => Tab::Requests,
+                Tab::Articles => Tab::Chat,
+                Tab::Chat => Tab::Requests,
             }),
             KeyCode::Char('m') => {
                 if self.reader {
@@ -974,6 +1020,10 @@ fn event_loop(
     refresh();
     let mut last_refresh = Instant::now();
     loop {
+        if app.tab == Tab::Chat {
+            app.chat.start();
+        }
+        app.chat.poll();
         terminal.draw(|f| app.draw(f))?;
 
         while let Ok(msg) = rx.try_recv() {
@@ -1129,14 +1179,26 @@ mod tests {
         let mut a = App::new("host".into());
         assert_eq!(a.handle(key('a')), None);
         assert_eq!(a.tab, Tab::Requests);
-        for expected in [Tab::History, Tab::Articles, Tab::Requests] {
+        for expected in [Tab::History, Tab::Articles, Tab::Chat, Tab::Requests] {
             a.handle(key('l'));
             assert_eq!(a.tab, expected);
         }
-        for expected in [Tab::Articles, Tab::History, Tab::Requests] {
+        for expected in [Tab::Chat, Tab::Articles, Tab::History, Tab::Requests] {
             a.handle(key('h'));
             assert_eq!(a.tab, expected);
         }
+    }
+
+    #[test]
+    fn chat_shortcut_and_readonly_keys_leave_request_actions_unreachable() {
+        let mut app = app();
+        app.handle(ctrl('4'));
+        assert_eq!(app.tab, Tab::Chat);
+        for c in ['r', 'a', 'd', '1', 'm'] {
+            assert_eq!(app.handle(key(c)), None);
+            assert_eq!(app.tab, Tab::Chat);
+        }
+        assert_eq!(app.handle(KeyEvent::from(KeyCode::Enter)), None);
     }
 
     #[test]
@@ -1174,7 +1236,7 @@ mod tests {
         a.handle(ctrl('3'));
         assert_eq!(format!("{:?}", a.tab), "Articles");
         assert_eq!(a.handle(key('1')), None);
-        a.handle(key('l'));
+        a.handle(ctrl('1'));
         assert!(matches!(a.handle(key('1')), Some(Action::Resolve { .. })));
         a.handle(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL));
         assert_eq!(format!("{:?}", a.tab), "Articles");
@@ -1605,7 +1667,7 @@ mod tests {
         assert_eq!(a.requests.selected, 2);
         assert_eq!(a.handle(key('o')), None);
         assert!(matches!(
-            a.handle(key('h')),
+            a.handle(ctrl('3')),
             Some(Action::LoadArticles { .. })
         ));
         assert_eq!(a.handle(key('q')), Some(Action::Quit));

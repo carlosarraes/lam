@@ -1,4 +1,4 @@
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
@@ -13,27 +13,75 @@ const META: Style = Style::new().fg(Color::Gray);
 
 impl App {
     pub(super) fn draw(&self, frame: &mut Frame, project: &str) {
-        let area = frame.area();
+        self.draw_inner(frame, frame.area(), project, false, None);
+    }
+
+    pub(super) fn draw_readonly(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        project: Option<&str>,
+        error: Option<&str>,
+    ) {
+        self.draw_inner(frame, area, project.unwrap_or(""), true, error);
+    }
+
+    fn draw_inner(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        project: &str,
+        readonly: bool,
+        error: Option<&str>,
+    ) {
         let vertical = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(5),
-                Constraint::Length(8),
-                Constraint::Length(2),
-            ])
+            .constraints(if readonly {
+                [
+                    Constraint::Length(1),
+                    Constraint::Min(3),
+                    Constraint::Length(0),
+                    Constraint::Length(0),
+                ]
+            } else {
+                [
+                    Constraint::Length(3),
+                    Constraint::Min(5),
+                    Constraint::Length(8),
+                    Constraint::Length(2),
+                ]
+            })
             .split(area);
-        let label = project.rsplit(':').next().unwrap_or(project);
-        let short = &label[..label.len().min(12)];
-        let header = Paragraph::new(Line::from(vec![
-            Span::styled("LAM", ACCENT),
-            Span::raw("  /  chat"),
-            Span::styled(format!("    project {short}"), META),
-            Span::styled(format!("    {}", self.connection), META),
-            Span::styled(format!("    {}", self.status), META),
-        ]))
-        .block(Block::default().borders(Borders::BOTTOM));
-        frame.render_widget(header, vertical[0]);
+        if readonly {
+            let status = error.unwrap_or(&self.connection);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("project ", DIM),
+                    Span::styled(
+                        if project.is_empty() {
+                            "selecting"
+                        } else {
+                            project
+                        },
+                        META,
+                    ),
+                    Span::styled(format!("  ·  {status}"), META),
+                ])),
+                vertical[0],
+            );
+        } else {
+            let label = project.rsplit(':').next().unwrap_or(project);
+            let short = &label[..label.len().min(12)];
+            let header = Paragraph::new(Line::from(vec![
+                Span::styled("LAM", ACCENT),
+                Span::raw("  /  chat"),
+                Span::styled(format!("    project {short}"), META),
+                Span::styled(format!("    {}", self.connection), META),
+                Span::styled(format!("    {}", self.status), META),
+            ]))
+            .block(Block::default().borders(Borders::BOTTOM));
+            frame.render_widget(header, vertical[0]);
+        }
 
         let content = if area.width >= 88 {
             Layout::default()
@@ -136,6 +184,10 @@ impl App {
                 .block(Block::default().borders(Borders::ALL).title("message")),
             content[1],
         );
+
+        if readonly {
+            return;
+        }
 
         let composer = Layout::default()
             .direction(Direction::Vertical)

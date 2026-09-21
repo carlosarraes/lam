@@ -14,7 +14,7 @@ agent ──lam push──▶ lam-api (CF Worker: Effect + D1 + Topic DO) ──
 - `cli/` — Rust CLI. `cargo test`, `cargo build --release`.
 - `skill/lam/` — agent-facing skill; symlink into `~/.claude/skills/lam`.
 
-LAM Chat is a separate, experimental terminal-first channel for agent sessions. `lam chat` opens a human observer; `lam chat sessions`, `send`, `reply`, `history`, and `lam inbox` provide project-scoped coordination. Local messages and receipts live in SQLite; an explicitly mapped peer can replay them over a persistent SSH link without Cloudflare or phone notifications. Linux native adapters have been live-probed; macOS Claude binding is staged but live model delivery and production PC–Mac rollout are not yet verified. See [Chat setup and limitations](docs/chat.md).
+LAM Chat is an experimental terminal-first channel for agent sessions. The main `lam` TUI has a read-only live Chat tab; `lam chat` opens the interactive observer for composing and replying. `lam chat sessions`, `send`, `reply`, `history`, and `lam inbox` provide project-scoped coordination. Local messages and receipts live in SQLite; an explicitly mapped peer can replay them over a persistent SSH link without Cloudflare or phone notifications. Linux native adapters have been live-probed; macOS Claude binding is staged but live model delivery and production PC–Mac rollout are not yet verified. See [Chat setup and limitations](docs/chat.md).
 
 ## Setup
 
@@ -51,7 +51,7 @@ Every item records **who asked**. `lam push` resolves the name in this order: `-
 | `lam check tick\|untick <id> <n>` | Carlos's side, from the terminal |
 | `lam list [--all] [--json]`, `lam show <id>` | |
 | `lam done <id> [choice] [-m text]`, `lam dismiss <id>` | Carlos's side |
-| `lam` / `lam tui` | interactive queue in the terminal: `1-3` choose, `Enter` done or mark FYI seen, `Space` tick the next check, `Tab` + `j/k` pick a check, `r` reply text, `d` dismiss, `o` open link, `m` markdown reader, `/` filter by agent; `h`/`l` cycle Requests, History and Articles, or `Ctrl+1`/`Ctrl+2`/`Ctrl+3` select a tab; live updates |
+| `lam` / `lam tui` | interactive queue in the terminal: `1-3` choose, `Enter` done or mark FYI seen, `Space` tick the next check, `Tab` + `j/k` pick a check, `r` reply text, `d` dismiss, `o` open link, `m` markdown reader, `/` filter by agent; `h`/`l` cycle Requests, History, Articles and read-only Chat, or `Ctrl+1` through `Ctrl+4` select a tab; live updates |
 | `lam article publish --file PATH --title TITLE --summary TEXT [--asset PATH]… [--silent]` | save a static HTML report and its explicitly listed assets to Articles |
 | `lam article list [--day YYYY-MM-DD] [--read all\|unread\|read] [--query TEXT]` | list articles by creation day in `America/Sao_Paulo`; omit `--day` for all dates |
 | `lam article open ID`, `lam article read ID`, `lam article unread ID` | open the browser reader or explicitly change read state |
