@@ -8,6 +8,16 @@ fn command() -> Command {
     Command::new(env!("CARGO_BIN_EXE_lam"))
 }
 
+fn assert_codex_hook_deadlines(path: &std::path::Path) {
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let hooks = document["hooks"].as_object().unwrap();
+    assert_eq!(hooks.len(), 7);
+    for groups in hooks.values() {
+        assert_eq!(groups[0]["hooks"][0]["timeout"], 3);
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn setup_preview_then_apply_creates_only_owned_project_hook() {
@@ -38,6 +48,7 @@ fn setup_preview_then_apply_creates_only_owned_project_hook() {
     );
     let text = std::fs::read_to_string(&hook).unwrap();
     assert!(text.contains(" chat hook --client codex"));
+    assert_codex_hook_deadlines(&hook);
     assert_eq!(
         std::fs::metadata(&hook).unwrap().permissions().mode() & 0o777,
         0o600
@@ -201,6 +212,7 @@ fn macos_codex_setup_is_explicit_and_reversible() {
     assert!(std::fs::read_to_string(&hook)
         .unwrap()
         .contains("--client codex"));
+    assert_codex_hook_deadlines(&hook);
     assert_eq!(hook.metadata().unwrap().permissions().mode() & 0o777, 0o600);
     assert!(invoke(&["--apply"]).status.success());
     assert!(invoke(&["--remove", "--apply"]).status.success());

@@ -29,7 +29,7 @@ fn hook_command(client: &str, event: &str, binary: &Path) -> Result<String> {
 
 fn hook_group(client: &str, event: &str, binary: &Path, matcher: Option<&str>) -> Result<Value> {
     let mut group = json!({"hooks": [{
-        "type": "command", "command": hook_command(client, event, binary)?, "timeout": 2
+        "type": "command", "command": hook_command(client, event, binary)?, "timeout": 3
     }]});
     if let Some(matcher) = matcher {
         group["matcher"] = json!(matcher);
