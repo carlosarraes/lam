@@ -99,6 +99,8 @@ After claiming, LAM sends:
 
 `cx` calls `thread/queue/add` with the exact thread ID, attempt ID as `clientUserMessageId`, and one text input. It accepts the result only when Codex returns a UUID receipt with the same client message ID and input. The response returns that receipt without provider payloads.
 
+Every relay error uses a fixed code and a `submission` field of `not_started` or `uncertain`. `not_started` is permitted only before `cx` writes any part of `thread/queue/add` to the app server. Once that write begins, disconnects, timeouts, Codex errors, and validation failures report `uncertain`. LAM treats a missing relay response after sending Queue as `uncertain`.
+
 The secret stays in LAM's private binding and `cx` memory. It is absent from process arguments, the Codex environment, hook output, Chat history, and logs.
 
 ## Busy and idle delivery
