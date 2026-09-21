@@ -1,0 +1,50 @@
+{
+  "date": "2026-09-21",
+  "platform": "arm64-apple-darwin",
+  "versions": {
+    "lam_commit": "6bfeeac",
+    "cx_commit": "ca97474",
+    "codex": "0.155.1",
+    "protocol": 1
+  },
+  "sha256": {
+    "lam": "466633ec859fb6b8f70990992720d7cd0f96b9b274cd15b2b4d883bd621d8dfa",
+    "cx": "a466e852651e7d6cf0650da4216f0b1faf671f012219946954b7561495df0f77",
+    "hook": "426fb4e4808fb44893020227a27b9cbe0fb45530eb2c84517624fb59cd547025"
+  },
+  "cases": [
+    {
+      "name": "busy_post_tool_use",
+      "message_id": "d2e02e98-6f54-4375-86fd-a942578ef1e3",
+      "tool_seconds": 45,
+      "during_tool": { "receipt": "queued", "attempts": 0 },
+      "after_tool": { "receipt": "unknown", "exposure": "full" },
+      "passed": true
+    },
+    {
+      "name": "idle_native_queue",
+      "message_id": "8bae6e04-93d7-4222-ace6-be1bdf62dd15",
+      "receipt": "accepted",
+      "matched_native_receipt": true,
+      "exact_thread_exposure": true,
+      "passed": true
+    },
+    {
+      "name": "lam_daemon_restart",
+      "message_id": "a74b53fd-b891-43b8-84ad-73b42840cf0f",
+      "receipt": "accepted",
+      "matched_native_receipt": true,
+      "exact_thread_exposure": true,
+      "passed": true
+    },
+    {
+      "name": "reviewed_hook_startup",
+      "hook_process_timeout_seconds": 3,
+      "lam_internal_deadline_seconds": 2,
+      "hook_failed_lines": 0,
+      "name_source": "screen",
+      "passed": true
+    }
+  ],
+  "production_changed": false
+}

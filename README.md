@@ -14,7 +14,7 @@ agent ──lam push──▶ lam-api (CF Worker: Effect + D1 + Topic DO) ──
 - `cli/` — Rust CLI. `cargo test`, `cargo build --release`.
 - `skill/lam/` — agent-facing skill; symlink into `~/.claude/skills/lam`.
 
-LAM Chat is an experimental terminal-first channel for agent sessions. The main `lam` TUI has a read-only live Chat tab; `lam chat` opens the interactive observer for composing and replying. `lam chat sessions`, `send`, `reply`, `history`, and `lam inbox` provide project-scoped coordination. Local messages and receipts live in SQLite; an explicitly mapped peer can replay them over a persistent SSH link without Cloudflare or phone notifications. The PC–Mac observer/peer services are installed and linked. Linux native adapters have been live-probed; Mac native delivery remains disabled. See [Chat setup and limitations](docs/chat.md).
+LAM Chat is an experimental terminal-first channel for agent sessions. The main `lam` TUI has a read-only live Chat tab; `lam chat` opens the interactive observer for composing and replying. `lam chat sessions`, `send`, `reply`, `history`, and `lam inbox` provide project-scoped coordination. Local messages and receipts live in SQLite; an explicitly mapped peer can replay them over a persistent SSH link without Cloudflare or phone notifications. The PC–Mac observer/peer services are installed and linked. Linux native adapters have been live-probed. macOS Codex 0.155.1 delivery through `cx` has an isolated live gate and remains experimental. See [Chat setup and limitations](docs/chat.md).
 
 ## Setup
 
