@@ -281,11 +281,7 @@ pub(super) fn codex_check(
     ) {
         let config = crate::chat::config::Config::load_or_create(&paths.config)?;
         let project = config.project_for_root(&input.cwd)?;
-        let name = crate::name::pick(crate::name::Sources {
-            explicit: explicit_name,
-            lam_name: std::env::var("LAM_NAME").ok(),
-            multiplexer: None,
-        })?;
+        let name = crate::name::resolve(explicit_name)?;
         let candidate = NativeBinding::new(
             "codex",
             &runtime.version,
@@ -296,16 +292,7 @@ pub(super) fn codex_check(
         )?;
         let binding = enroll(&files, &paths.socket, candidate, deadline)?;
         #[cfg(target_os = "macos")]
-        let binding = {
-            super::codex::bind_relay(
-                &relay,
-                &runtime.process,
-                input.native_id(),
-                &binding.integration_secret,
-                deadline,
-            )?;
-            files.attach_codex_relay(&binding, relay.clone(), deadline)?
-        };
+        let binding = bind_or_resume_codex_relay(&files, binding, &relay, deadline)?;
         binding
     } else {
         let key = binding_locator("codex", input.native_id(), &runtime.process)?;
@@ -317,13 +304,7 @@ pub(super) fn codex_check(
             "native hook binding is missing or changed"
         );
         #[cfg(target_os = "macos")]
-        {
-            anyhow::ensure!(
-                binding.codex_relay.as_ref() == Some(&relay),
-                "native cx relay binding is missing or changed"
-            );
-            relay.validate_for(&runtime.process)?;
-        }
+        let binding = bind_or_resume_codex_relay(&files, binding, &relay, deadline)?;
         binding
     };
     if input.hook_event_name == "PostToolUse" {
@@ -358,6 +339,28 @@ pub(super) fn codex_check(
     };
     request(&paths.socket, &credential, operation, deadline)?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn bind_or_resume_codex_relay(
+    files: &BindingFiles,
+    binding: NativeBinding,
+    relay: &CodexRelay,
+    deadline: std::time::Instant,
+) -> anyhow::Result<NativeBinding> {
+    if let Some(attached) = &binding.codex_relay {
+        anyhow::ensure!(attached == relay, "native cx relay binding changed");
+        relay.validate_for(&binding.process)?;
+        return Ok(binding);
+    }
+    super::codex::bind_relay(
+        relay,
+        &binding.process,
+        &binding.native_id,
+        &binding.integration_secret,
+        deadline,
+    )?;
+    files.attach_codex_relay(&binding, relay.clone(), deadline)
 }
 
 #[cfg(target_os = "macos")]
@@ -1009,6 +1012,82 @@ mod macos_runtime_tests {
     }
 
     #[test]
+    fn later_mac_hook_completes_an_enrolled_binding_missing_its_relay() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let dir = tempfile::Builder::new()
+            .prefix("lam-chat-mac-cx-resume-")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = dir.path().join("cx");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let helper = ChildGuard(
+            std::process::Command::new(&executable)
+                .args([
+                    "--exact",
+                    "chat::adapters::binding::macos_runtime_tests::mac_cx_relay_helper",
+                    "--nocapture",
+                ])
+                .env("LAM_TEST_CX_RELAY_DIR", dir.path())
+                .env("LAM_TEST_CX_RELAY_BIND_ONLY", "1")
+                .spawn()
+                .unwrap(),
+        );
+        let ready = dir.path().join("codex.pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let codex_pid = loop {
+            if let Ok(value) = std::fs::read_to_string(&ready) {
+                break value.parse::<u32>().unwrap();
+            }
+            assert!(Instant::now() < deadline, "cx test helper did not start");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let codex = ProcessEvidence::read(codex_pid).unwrap();
+        let relay = CodexRelay {
+            path: dir.path().join("lam.sock"),
+            process: ProcessEvidence::read(helper.0.id()).unwrap(),
+        };
+        let files = BindingFiles::open(&dir.path().join("bindings")).unwrap();
+        let mut binding = NativeBinding::new(
+            "codex",
+            "0.155.1",
+            "11111111-1111-4111-8111-111111111111",
+            codex,
+            "22222222-2222-4222-8222-222222222222",
+            "dev",
+        )
+        .unwrap();
+        binding.integration_secret = "a".repeat(64);
+        binding
+            .bind(SessionRef {
+                machine: "33333333-3333-4333-8333-333333333333".into(),
+                incarnation: "44444444-4444-4444-8444-444444444444".into(),
+            })
+            .unwrap();
+        files
+            .create(&binding, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+
+        let resumed = bind_or_resume_codex_relay(
+            &files,
+            binding,
+            &relay,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(resumed.codex_relay.as_ref() == Some(&relay));
+        let persisted = files.load(&resumed.locator().unwrap()).unwrap();
+        assert!(persisted.codex_relay.as_ref() == Some(&relay));
+    }
+
+    #[test]
     fn mac_cx_relay_helper() {
         struct ChildGuard(std::process::Child);
         impl Drop for ChildGuard {
@@ -1035,14 +1114,21 @@ mod macos_runtime_tests {
         );
         std::fs::write(directory.join("codex.pid"), codex.0.id().to_string()).unwrap();
 
-        for operation in ["inspect", "queue"] {
+        let operations: &[&str] = if std::env::var_os("LAM_TEST_CX_RELAY_BIND_ONLY").is_some() {
+            &["bind"]
+        } else {
+            &["inspect", "queue"]
+        };
+        for operation in operations {
             let (mut stream, _) = listener.accept().unwrap();
             let request = crate::chat::protocol::read_frame(&mut stream).unwrap();
             assert_eq!(request["version"], 1);
-            assert_eq!(request["operation"], operation);
+            assert_eq!(request["operation"], *operation);
             assert_eq!(request["thread_id"], "11111111-1111-4111-8111-111111111111");
             assert_eq!(request["binding"], "a".repeat(64));
-            let response = if operation == "inspect" {
+            let response = if *operation == "bind" {
+                serde_json::json!({"version":1,"ok":true})
+            } else if *operation == "inspect" {
                 serde_json::json!({"version":1,"ok":true,"state":"idle"})
             } else {
                 crate::chat::protocol::validate_uuid(request["attempt_id"].as_str().unwrap())
