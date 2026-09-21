@@ -226,7 +226,8 @@ pub fn run(client: &str, root: &Path, apply: bool, remove: bool) -> Result<()> {
     }
     if apply {
         ensure!(
-            cfg!(target_os = "linux") || (cfg!(target_os = "macos") && client == "claude"),
+            cfg!(target_os = "linux")
+                || (cfg!(target_os = "macos") && matches!(client, "codex" | "claude")),
             "native Chat integration is not supported on this platform"
         );
         for change in &changes {

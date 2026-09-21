@@ -176,22 +176,35 @@ fn service_install_is_explicit_and_reversible_in_a_staged_directory() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn macos_native_setup_remains_preview_only() {
-    let root = tempfile::tempdir().unwrap();
-    let preview = command()
-        .args(["chat", "setup", "--client", "codex", "--root"])
-        .arg(root.path())
-        .output()
+fn macos_codex_setup_is_explicit_and_reversible() {
+    let root = tempfile::Builder::new()
+        .prefix("lam-chat-mac-codex-setup-")
+        .tempdir_in("/private/tmp")
         .unwrap();
-    assert!(preview.status.success());
-    let apply = command()
-        .args(["chat", "setup", "--client", "codex", "--root"])
-        .arg(root.path())
-        .arg("--apply")
-        .output()
-        .unwrap();
-    assert!(!apply.status.success());
-    assert!(!root.path().join(".codex/hooks.json").exists());
+    let hook = root.path().join(".codex/hooks.json");
+    let invoke = |extra: &[&str]| {
+        command()
+            .args(["chat", "setup", "--client", "codex", "--root"])
+            .arg(root.path())
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    assert!(invoke(&["--dry-run"]).status.success());
+    assert!(!hook.exists());
+    let applied = invoke(&["--apply"]);
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert!(std::fs::read_to_string(&hook)
+        .unwrap()
+        .contains("--client codex"));
+    assert_eq!(hook.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(invoke(&["--apply"]).status.success());
+    assert!(invoke(&["--remove", "--apply"]).status.success());
+    assert!(!hook.exists());
 }
 
 #[cfg(target_os = "macos")]
