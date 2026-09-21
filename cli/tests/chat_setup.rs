@@ -159,7 +159,8 @@ fn service_install_is_explicit_and_reversible_in_a_staged_directory() {
         assert!(content.contains("chat serve --foreground --native-bindings"));
     } else {
         assert!(content.contains("<string>serve</string>"));
-        assert!(content.contains("<string>--native-bindings</string>"));
+        assert!(content.contains("<string>--foreground</string>"));
+        assert!(!content.contains("<string>--native-bindings</string>"));
     }
     assert!(invoke("install", true).status.success());
     assert!(invoke("uninstall", true).status.success());
