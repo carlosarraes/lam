@@ -27,9 +27,15 @@ fn hook_command(client: &str, event: &str, binary: &Path) -> Result<String> {
     ))
 }
 
-fn hook_group(client: &str, event: &str, binary: &Path, matcher: Option<&str>) -> Result<Value> {
+fn hook_group(
+    client: &str,
+    event: &str,
+    binary: &Path,
+    matcher: Option<&str>,
+    timeout: u8,
+) -> Result<Value> {
     let mut group = json!({"hooks": [{
-        "type": "command", "command": hook_command(client, event, binary)?, "timeout": 3
+        "type": "command", "command": hook_command(client, event, binary)?, "timeout": timeout
     }]});
     if let Some(matcher) = matcher {
         group["matcher"] = json!(matcher);
@@ -37,7 +43,7 @@ fn hook_group(client: &str, event: &str, binary: &Path, matcher: Option<&str>) -
     Ok(group)
 }
 
-fn desired(client: &str, binary: &Path) -> Result<Vec<u8>> {
+fn desired(client: &str, binary: &Path, timeout: u8) -> Result<Vec<u8>> {
     let content = match client {
         "codex" => {
             let mut hooks = serde_json::Map::new();
@@ -56,7 +62,8 @@ fn desired(client: &str, binary: &Path) -> Result<Vec<u8>> {
                         "codex",
                         event,
                         binary,
-                        (event == "PostToolUse").then_some("Bash")
+                        (event == "PostToolUse").then_some("Bash"),
+                        timeout,
                     )?]),
                 );
             }
@@ -70,8 +77,8 @@ fn desired(client: &str, binary: &Path) -> Result<Vec<u8>> {
         "claude" => {
             let mut content = serde_json::to_vec_pretty(&json!({
                 "hooks": {
-                    "SessionStart": [hook_group("claude", "SessionStart", binary, None)?],
-                    "SessionEnd": [hook_group("claude", "SessionEnd", binary, None)?],
+                    "SessionStart": [hook_group("claude", "SessionStart", binary, None, timeout)?],
+                    "SessionEnd": [hook_group("claude", "SessionEnd", binary, None, timeout)?],
                 }
             }))?;
             content.push(b'\n');
@@ -114,8 +121,13 @@ pub fn plan(client: &str, root: &Path, remove: bool) -> Result<Vec<SetupChange>>
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    let expected = desired(client, &std::env::current_exe()?)?;
-    if before.as_ref().is_some_and(|bytes| bytes != &expected) {
+    let binary = std::env::current_exe()?;
+    let expected = desired(client, &binary, 3)?;
+    let previous = desired(client, &binary, 2)?;
+    if before
+        .as_ref()
+        .is_some_and(|bytes| bytes != &expected && bytes != &previous)
+    {
         bail!(
             "{} differs from the exact LAM Chat template; preserve it and review or merge manually",
             path.display()

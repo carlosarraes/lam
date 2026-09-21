@@ -75,6 +75,34 @@ fn setup_refuses_to_clobber_an_existing_unowned_hook() {
     );
 }
 
+#[test]
+fn setup_upgrades_the_previous_managed_codex_deadline() {
+    let root = tempfile::tempdir().unwrap();
+    let hook = root.path().join(".codex/hooks.json");
+    let invoke = || {
+        command()
+            .args(["chat", "setup", "--client", "codex", "--root"])
+            .arg(root.path())
+            .arg("--apply")
+            .output()
+            .unwrap()
+    };
+    assert!(invoke().status.success());
+    let previous = std::fs::read_to_string(&hook)
+        .unwrap()
+        .replace("\"timeout\": 3", "\"timeout\": 2");
+    assert_ne!(previous, std::fs::read_to_string(&hook).unwrap());
+    std::fs::write(&hook, previous).unwrap();
+
+    let upgraded = invoke();
+    assert!(
+        upgraded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&upgraded.stderr)
+    );
+    assert_codex_hook_deadlines(&hook);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn setup_repeat_apply_and_remove_preserve_recoverable_backups() {
