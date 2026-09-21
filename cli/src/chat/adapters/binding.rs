@@ -263,6 +263,12 @@ pub(super) fn codex_check(
 ) -> anyhow::Result<()> {
     use anyhow::Context;
     let runtime = NativeRuntime::discover(std::process::id(), deadline)?;
+    anyhow::ensure!(
+        runtime.client == "codex",
+        "native Codex hook ancestry changed"
+    );
+    #[cfg(target_os = "macos")]
+    let relay = discover_codex_relay(&runtime.process)?;
     let directory = paths
         .database
         .parent()
@@ -284,11 +290,23 @@ pub(super) fn codex_check(
             "codex",
             &runtime.version,
             input.native_id(),
-            runtime.process,
+            runtime.process.clone(),
             &project,
             &name,
         )?;
-        enroll(&files, &paths.socket, candidate, deadline)?
+        let binding = enroll(&files, &paths.socket, candidate, deadline)?;
+        #[cfg(target_os = "macos")]
+        let binding = {
+            super::codex::bind_relay(
+                &relay,
+                &runtime.process,
+                input.native_id(),
+                &binding.integration_secret,
+                deadline,
+            )?;
+            files.attach_codex_relay(&binding, relay.clone(), deadline)?
+        };
+        binding
     } else {
         let key = binding_locator("codex", input.native_id(), &runtime.process)?;
         let binding = files.load(&key)?;
@@ -298,6 +316,14 @@ pub(super) fn codex_check(
                 && binding.process == runtime.process,
             "native hook binding is missing or changed"
         );
+        #[cfg(target_os = "macos")]
+        {
+            anyhow::ensure!(
+                binding.codex_relay.as_ref() == Some(&relay),
+                "native cx relay binding is missing or changed"
+            );
+            relay.validate_for(&runtime.process)?;
+        }
         binding
     };
     if input.hook_event_name == "PostToolUse" {
@@ -332,6 +358,26 @@ pub(super) fn codex_check(
     };
     request(&paths.socket, &credential, operation, deadline)?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn discover_codex_relay(process: &ProcessEvidence) -> anyhow::Result<CodexRelay> {
+    let path = std::env::var_os("CX_LAM_RELAY")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("missing cx relay locator"))?;
+    let cx = ProcessEvidence::read(process.parent)?;
+    anyhow::ensure!(
+        is_cx_executable(&cx.executable),
+        "Codex parent is not the cx runtime"
+    );
+    let relay = CodexRelay { path, process: cx };
+    relay.validate_for(process)?;
+    Ok(relay)
+}
+
+#[cfg(target_os = "macos")]
+fn is_cx_executable(path: &std::path::Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("cx")
 }
 
 pub(super) fn claude_check(
@@ -884,6 +930,83 @@ mod macos_runtime_tests {
         assert_eq!(frame["msg_id"], attempt.id);
         assert_eq!(frame["message"]["content"], "native Mac frame");
     }
+
+    #[test]
+    fn mac_codex_relay_pins_parent_socket_and_binding_protocol() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let dir = tempfile::Builder::new()
+            .prefix("lam-chat-mac-cx-relay-")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.path().join("lam.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let child = ChildGuard(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let cx = ProcessEvidence::read(std::process::id()).unwrap();
+        let codex = ProcessEvidence::read(child.0.id()).unwrap();
+        let relay = CodexRelay {
+            path: socket.clone(),
+            process: cx.clone(),
+        };
+        relay.validate_for(&codex).unwrap();
+
+        let secret = "a".repeat(64);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = crate::chat::protocol::read_frame(&mut stream).unwrap();
+            assert_eq!(request["version"], 1);
+            assert_eq!(request["operation"], "bind");
+            assert_eq!(request["thread_id"], "11111111-1111-4111-8111-111111111111");
+            assert_eq!(request["binding"], secret);
+            crate::chat::protocol::write_frame(
+                &mut stream,
+                &serde_json::json!({"version":1,"ok":true}),
+            )
+            .unwrap();
+        });
+        super::super::codex::bind_relay(
+            &relay,
+            &codex,
+            "11111111-1111-4111-8111-111111111111",
+            &"a".repeat(64),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        let mut changed = relay.clone();
+        changed.process.start_usec += 1;
+        assert!(changed.validate_for(&codex).is_err());
+        let mut reparented = codex.clone();
+        reparented.parent = 1;
+        assert!(relay.validate_for(&reparented).is_err());
+        let alias = dir.path().join("relay-link.sock");
+        std::os::unix::fs::symlink(&socket, &alias).unwrap();
+        let linked = CodexRelay {
+            path: alias,
+            process: cx,
+        };
+        assert!(linked.validate_for(&codex).is_err());
+        assert!(is_cx_executable(std::path::Path::new(
+            "/Users/owned/.local/bin/cx"
+        )));
+        assert!(!is_cx_executable(std::path::Path::new(
+            "/Users/owned/.local/bin/codex"
+        )));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -931,6 +1054,26 @@ fn version_args(client: &str, process_args: &[Vec<u8>]) -> anyhow::Result<Vec<St
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn parse_version(client: &str, output: &str) -> anyhow::Result<String> {
+    #[cfg(target_os = "linux")]
+    let platform = NativePlatform::Linux;
+    #[cfg(target_os = "macos")]
+    let platform = NativePlatform::MacOs;
+    parse_version_for_platform(client, output, platform)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy)]
+enum NativePlatform {
+    Linux,
+    MacOs,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn parse_version_for_platform(
+    client: &str,
+    output: &str,
+    platform: NativePlatform,
+) -> anyhow::Result<String> {
     let version = match client {
         "codex" => output.trim().strip_prefix("codex-cli "),
         "claude" => output.trim().strip_suffix(" (Claude Code)"),
@@ -939,7 +1082,10 @@ fn parse_version(client: &str, output: &str) -> anyhow::Result<String> {
     }
     .ok_or_else(|| anyhow::anyhow!("unrecognized native execution version"))?;
     let supported = match client {
-        "codex" => matches!(version, "0.153.4" | "0.154.0"),
+        "codex" => match platform {
+            NativePlatform::Linux => matches!(version, "0.153.4" | "0.154.0"),
+            NativePlatform::MacOs => version == "0.155.1",
+        },
         "claude" => matches!(version, "2.1.270" | "2.1.273" | "2.1.278"),
         "pi" => matches!(version, "0.85.1" | "0.86.1"),
         _ => false,
@@ -1732,6 +1878,8 @@ struct NativeBinding {
     #[serde(default)]
     native_socket: Option<std::path::PathBuf>,
     #[serde(default)]
+    codex_relay: Option<CodexRelay>,
+    #[serde(default)]
     observation_epoch: u64,
     enrollment_secret: String,
     participant_secret: String,
@@ -1766,6 +1914,7 @@ impl NativeBinding {
             session: None,
             eligible: true,
             native_socket: None,
+            codex_relay: None,
             observation_epoch: 0,
             enrollment_secret: secret(),
             participant_secret: secret(),
@@ -1789,6 +1938,20 @@ impl NativeBinding {
                 "native socket belongs to another client"
             );
             anyhow::ensure!(path.is_absolute(), "native socket path is not absolute");
+        }
+        #[cfg(target_os = "linux")]
+        if self.codex_relay.is_some() {
+            anyhow::ensure!(self.client == "codex", "cx relay belongs to another client");
+            anyhow::bail!("cx relay is not supported on Linux");
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(relay) = &self.codex_relay {
+            anyhow::ensure!(self.client == "codex", "cx relay belongs to another client");
+            anyhow::ensure!(
+                self.version == "0.155.1" && is_cx_executable(&relay.process.executable),
+                "invalid cx relay execution"
+            );
+            relay.validate_shape()?;
         }
         protocol::validate_uuid(&self.native_id)?;
         protocol::validate_uuid(&self.process.boot_id)?;
@@ -1900,6 +2063,55 @@ impl NativeBinding {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CodexRelay {
+    pub path: std::path::PathBuf,
+    pub process: ProcessEvidence,
+}
+
+#[cfg(target_os = "macos")]
+impl CodexRelay {
+    fn validate_shape(&self) -> anyhow::Result<()> {
+        crate::chat::protocol::validate_uuid(&self.process.boot_id)?;
+        anyhow::ensure!(
+            self.path.is_absolute()
+                && self.process.pid > 0
+                && self.process.start_marker() > 0
+                && self.process.executable.is_absolute(),
+            "invalid cx relay evidence"
+        );
+        Ok(())
+    }
+
+    pub(super) fn validate_for(&self, codex: &ProcessEvidence) -> anyhow::Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        self.validate_shape()?;
+        self.process.validate()?;
+        codex.validate()?;
+        anyhow::ensure!(
+            codex.parent == self.process.pid && codex.uid == self.process.uid,
+            "Codex process is outside its cx runtime"
+        );
+        crate::chat::config::validate_path_components(&self.path)?;
+        crate::chat::daemon::validate_socket(&self.path)?;
+        let directory = self
+            .path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("missing cx relay directory"))?;
+        let metadata = directory.symlink_metadata()?;
+        anyhow::ensure!(
+            metadata.is_dir()
+                && metadata.uid() == self.process.uid
+                && metadata.permissions().mode() & 0o077 == 0,
+            "cx relay directory must be private"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_binding_key(key: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         key.len() == 64
@@ -1932,6 +2144,31 @@ impl BindingFiles {
         deadline: std::time::Instant,
     ) -> anyhow::Result<u64> {
         self.reserve_epochs(binding, 1, deadline)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn attach_codex_relay(
+        &self,
+        binding: &NativeBinding,
+        relay: CodexRelay,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<NativeBinding> {
+        relay.validate_for(&binding.process)?;
+        let key = binding.locator()?;
+        let _lock = self.lock(&key, deadline)?;
+        let mut current = self.load(&key)?;
+        anyhow::ensure!(
+            current.client == "codex"
+                && current.version == "0.155.1"
+                && current.process == binding.process
+                && current.session == binding.session
+                && current.integration_secret == binding.integration_secret,
+            "native cx relay enrollment changed"
+        );
+        current.codex_relay = Some(relay);
+        current.validate_shape()?;
+        self.replace(&key, &current)?;
+        Ok(current)
     }
 
     fn reserve_epochs(
@@ -2689,6 +2926,15 @@ mod tests {
         assert_eq!(
             parse_version("codex", "codex-cli 0.153.4\n").unwrap(),
             "0.153.4"
+        );
+        assert_eq!(
+            parse_version_for_platform("codex", "codex-cli 0.155.1\n", NativePlatform::MacOs,)
+                .unwrap(),
+            "0.155.1"
+        );
+        assert!(
+            parse_version_for_platform("codex", "codex-cli 0.155.1\n", NativePlatform::Linux,)
+                .is_err()
         );
         assert_eq!(
             parse_version("claude", "2.1.273 (Claude Code)\n").unwrap(),

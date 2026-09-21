@@ -925,8 +925,29 @@ impl<'a> DeadlineStream<'a> {
 }
 impl std::io::Read for DeadlineStream<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.remaining()?))?;
-        std::io::Read::read(self.stream, bytes)
+        if let Err(error) = self.stream.set_read_timeout(Some(self.remaining()?)) {
+            #[cfg(target_os = "macos")]
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                let mut poll = libc::pollfd {
+                    fd: self.stream.as_raw_fd(),
+                    events: libc::POLLIN | libc::POLLHUP,
+                    revents: 0,
+                };
+                let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+                if ready > 0 && poll.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                    return std::io::Read::read(self.stream, bytes).map_err(|error| {
+                        std::io::Error::new(error.kind(), format!("socket read failed: {error}"))
+                    });
+                }
+            }
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("cannot set socket read deadline: {error}"),
+            ));
+        }
+        std::io::Read::read(self.stream, bytes).map_err(|error| {
+            std::io::Error::new(error.kind(), format!("socket read failed: {error}"))
+        })
     }
 }
 impl std::io::Write for DeadlineStream<'_> {
@@ -4149,5 +4170,20 @@ pub(super) mod tests {
         assert!(started.elapsed() < Duration::from_millis(130));
         drop(server);
         writer.join().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn buffered_frame_remains_readable_after_darwin_peer_closes() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        protocol::write_frame(&mut client, &json!({"version": 1, "ok": true})).unwrap();
+        drop(client);
+
+        let response = protocol::read_frame(&mut DeadlineStream::new(
+            &mut server,
+            Duration::from_secs(1),
+        ))
+        .unwrap();
+        assert_eq!(response, json!({"version": 1, "ok": true}));
     }
 }

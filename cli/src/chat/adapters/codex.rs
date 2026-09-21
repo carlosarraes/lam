@@ -5,6 +5,101 @@ pub fn encode_untrusted_text(text: &str) -> anyhow::Result<String> {
     )?)
 }
 
+#[cfg(target_os = "macos")]
+pub(super) fn bind_relay(
+    relay: &super::binding::CodexRelay,
+    codex: &super::binding::ProcessEvidence,
+    thread_id: &str,
+    binding: &str,
+    deadline: std::time::Instant,
+) -> anyhow::Result<()> {
+    crate::chat::protocol::validate_uuid(thread_id)?;
+    anyhow::ensure!(
+        binding.len() == 64
+            && binding
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "invalid cx relay binding"
+    );
+    let response = relay_request(
+        relay,
+        codex,
+        &serde_json::json!({
+            "version": 1,
+            "operation": "bind",
+            "thread_id": thread_id,
+            "binding": binding,
+        }),
+        deadline,
+    )?;
+    let object = response
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("invalid cx relay response"))?;
+    anyhow::ensure!(
+        object.len() == 2 && response["version"] == 1 && response["ok"] == true,
+        "cx relay refused binding"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn relay_request(
+    relay: &super::binding::CodexRelay,
+    codex: &super::binding::ProcessEvidence,
+    request: &serde_json::Value,
+    deadline: std::time::Instant,
+) -> anyhow::Result<serde_json::Value> {
+    use anyhow::Context;
+    use std::io::{Read, Write};
+
+    const FRAME_LIMIT: usize = 32 * 1024;
+    relay
+        .validate_for(codex)
+        .context("cx relay evidence changed")?;
+    let mut stream = super::binding::connect_native_socket(&relay.path, deadline)
+        .context("cannot connect to cx relay")?;
+    let peer =
+        crate::chat::daemon::peer_identity(&stream).context("cannot identify cx relay peer")?;
+    anyhow::ensure!(
+        peer.pid == Some(relay.process.pid) && peer.uid == relay.process.uid,
+        "cx relay socket belongs to another process"
+    );
+    relay
+        .process
+        .validate()
+        .context("cx relay process changed")?;
+    let body = serde_json::to_vec(request).context("cannot encode cx relay request")?;
+    anyhow::ensure!(
+        !body.is_empty() && body.len() <= FRAME_LIMIT,
+        "cx relay request exceeds its bound"
+    );
+    let mut framed = crate::chat::daemon::DeadlineStream::until(&mut stream, deadline);
+    framed
+        .write_all(&(body.len() as u32).to_be_bytes())
+        .context("cannot write cx relay frame header")?;
+    framed
+        .write_all(&body)
+        .context("cannot write cx relay frame body")?;
+    let mut header = [0_u8; 4];
+    framed
+        .read_exact(&mut header)
+        .context("cannot read cx relay frame header")?;
+    let length = u32::from_be_bytes(header) as usize;
+    anyhow::ensure!(
+        (1..=FRAME_LIMIT).contains(&length),
+        "invalid cx relay response length"
+    );
+    let mut body = vec![0_u8; length];
+    framed
+        .read_exact(&mut body)
+        .context("cannot read cx relay frame body")?;
+    anyhow::ensure!(
+        std::time::Instant::now() <= deadline,
+        "cx relay request deadline expired"
+    );
+    serde_json::from_slice(&body).map_err(|_| anyhow::anyhow!("invalid cx relay response"))
+}
+
 #[cfg(target_os = "linux")]
 pub(in crate::chat) fn submit_queue_owned(
     directory: &std::path::Path,
@@ -262,10 +357,97 @@ fn write_output(fd: i32, output: &str, deadline: std::time::Instant) -> anyhow::
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn write_output(fd: i32, output: &str, deadline: std::time::Instant) -> anyhow::Result<()> {
+    use std::time::{Duration, Instant};
+
+    struct WriterChild(libc::pid_t);
+    impl Drop for WriterChild {
+        fn drop(&mut self) {
+            if self.0 > 0 {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                }
+            }
+        }
+    }
+
+    if output.is_empty() {
+        return Ok(());
+    }
+    anyhow::ensure!(output.len() <= 8192, "native hook output exceeds its bound");
+    anyhow::ensure!(
+        Instant::now() < deadline,
+        "native hook output deadline expired"
+    );
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    anyhow::ensure!(flags >= 0, "native hook output unavailable");
+    let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+    anyhow::ensure!(
+        unsafe { libc::fstat(fd, &mut metadata) } == 0
+            && metadata.st_mode & libc::S_IFMT == libc::S_IFIFO,
+        "native hook output is not a pipe"
+    );
+
+    let pid = unsafe { libc::fork() };
+    anyhow::ensure!(pid >= 0, "cannot start bounded native hook writer");
+    if pid == 0 {
+        let bytes = output.as_bytes();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let written =
+                unsafe { libc::write(fd, bytes[offset..].as_ptr().cast(), bytes.len() - offset) };
+            if written > 0 {
+                offset += written as usize;
+            } else if written < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            } else {
+                unsafe { libc::_exit(1) };
+            }
+        }
+        unsafe { libc::_exit(0) };
+    }
+
+    let mut child = WriterChild(pid);
+    let mut status = 0;
+    loop {
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if waited == pid {
+            child.0 = 0;
+            anyhow::ensure!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "native hook output unavailable"
+            );
+            break;
+        }
+        if waited < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| anyhow::anyhow!("native hook output deadline expired"))?;
+        std::thread::sleep(remaining.min(Duration::from_millis(1)));
+    }
+    let after = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    let mutable_flags = libc::O_NONBLOCK | libc::O_APPEND | libc::O_ASYNC;
+    anyhow::ensure!(
+        after & mutable_flags == flags & mutable_flags,
+        "native hook output flags changed"
+    );
+    Ok(())
+}
+
 /// Fail open for native work. Diagnostic fields are fixed labels, never native
 /// errors, bodies, credentials or transcript data. Empty checks emit no output.
 pub fn run_hook(event: &str, name: Option<String>) -> i32 {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let deadline = std::time::Instant::now() + crate::chat::delivery::HOOK_DEADLINE;
         let mut stage = "input";
@@ -283,7 +465,7 @@ pub fn run_hook(event: &str, name: Option<String>) -> i32 {
             let _ = super::hooks::record_error("codex", stage);
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (event, name);
     }
@@ -341,7 +523,7 @@ impl HookInput {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use super::write_output;
 
     #[cfg(target_os = "linux")]
@@ -621,14 +803,25 @@ mod tests {
         assert_eq!(value["untrusted_text"], hostile);
         assert!(value.get("role").is_none());
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn pipe() -> (std::fs::File, std::fs::File) {
         use std::os::fd::FromRawFd;
         let mut descriptors = [-1; 2];
+        #[cfg(target_os = "linux")]
         assert_eq!(
             unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
             0
         );
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+            for descriptor in descriptors {
+                assert_eq!(
+                    unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) },
+                    0
+                );
+            }
+        }
         unsafe {
             (
                 std::fs::File::from_raw_fd(descriptors[0]),
@@ -678,5 +871,60 @@ mod tests {
         assert!(write_output(fd, "owned", started + Duration::from_millis(20)).is_err());
         assert!(started.elapsed() < Duration::from_millis(250));
         assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) }, flags);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_hook_output_is_complete_bounded_and_preserves_parent_flags() {
+        use std::{
+            io::{Read, Write},
+            os::fd::AsRawFd,
+            time::{Duration, Instant},
+        };
+
+        let (mut reader, writer) = pipe();
+        let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+        let receiver = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let output = "x".repeat(8192);
+        write_output(
+            writer.as_raw_fd(),
+            &output,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        let after = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+        let mutable_flags = libc::O_NONBLOCK | libc::O_APPEND | libc::O_ASYNC;
+        assert_eq!(after & mutable_flags, flags & mutable_flags);
+        drop(writer);
+        assert_eq!(receiver.join().unwrap(), output.as_bytes());
+        assert!(write_output(-1, "", Instant::now()).is_ok());
+
+        let (_reader, mut writer) = pipe();
+        let fd = writer.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let block = [b'x'; 4096];
+        loop {
+            match writer.write(&block) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("filling test pipe: {error}"),
+            }
+        }
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
+        let started = Instant::now();
+        assert!(write_output(fd, "owned", started + Duration::from_millis(20)).is_err());
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFL) } & mutable_flags,
+            flags & mutable_flags
+        );
     }
 }
