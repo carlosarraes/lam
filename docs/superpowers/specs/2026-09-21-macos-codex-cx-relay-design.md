@@ -24,7 +24,7 @@ LAM remains the sole owner of:
 `cx` owns only:
 
 - the live stdio connection to its Codex app server;
-- proof that an enrollment caller descends from the exact Codex TUI it launched;
+- proof that an enrollment caller descends from the exact Codex app-server it launched;
 - three relay operations for one runtime: bind, inspect, and queue;
 - correlation and validation of Codex app-server responses.
 
@@ -32,18 +32,20 @@ The relay is not a general Codex proxy and does not store Chat history. It never
 
 ## Runtime layout
 
-Each `cx` process creates `lam.sock` beside its existing TUI socket in the private temporary runtime directory. The directory is mode `0700`; the relay socket is mode `0600`. `cx` passes its absolute path to the Codex TUI as `CX_LAM_RELAY`. The path is a locator, not a credential.
+Each `cx` process creates `lam.sock` beside its existing TUI socket in the private temporary runtime directory. The directory is mode `0700`; the relay socket is mode `0600`. `cx` passes its absolute path only to the Codex app-server as `CX_LAM_RELAY`, because that process owns hook and tool descendants. The path is a locator, not a credential.
 
 The LAM SessionStart hook discovers the nearest supported Codex process and its parent `cx` process. It verifies both exact process lifetimes, the parent-child relationship, the relay path and permissions, and the relay's kernel peer PID. It then creates the ordinary private LAM binding, enrolls with the LAM daemon, and binds that thread at the `cx` relay using the binding's integration secret.
 
 The private binding retains:
 
-- the Codex TUI process evidence;
+- the Codex app-server process evidence;
 - the exact native thread ID and LAM session incarnation;
 - the `cx` process evidence and relay path;
 - the existing three distinct LAM secrets.
 
-Codex and `cx` process evidence must still match at every later delivery. A replacement process, reparented TUI, missing relay, changed socket owner, or unsupported version makes the recipient unavailable. Messages stay attached to the original incarnation and never transfer to a replacement session.
+Codex and `cx` process evidence must still match at every later delivery. A replacement process, reparented app-server, missing relay, changed socket owner, or unsupported version makes the recipient unavailable. Messages stay attached to the original incarnation and never transfer to a replacement session.
+
+Enrollment is resumable for the same exact lifetime. If SessionStart persists the LAM incarnation but reaches its native timeout before attaching the relay, a later trusted hook repeats the idempotent Bind and completes that same private record. It cannot rotate credentials, move the incarnation, or adopt another relay.
 
 ## Relay protocol
 
@@ -62,29 +64,29 @@ The SessionStart hook sends:
 }
 ```
 
-`cx` accepts Bind only when the kernel peer belongs to the current user and descends from the exact live Codex TUI process. It sends `thread/read` to its own app server and requires the response to name the same thread before retaining the binding in memory. Repeating an identical Bind is idempotent. A different secret cannot replace a live binding for the same thread.
+`cx` accepts Bind only when the kernel peer belongs to the current user and descends from the exact live Codex app-server process. It sends `thread/read` to that server and requires the response to name the same thread before retaining the binding in memory. Repeating an identical Bind is idempotent. A different secret cannot replace a live binding for the same thread.
 
 The response is:
 
 ```json
-{"version":1,"ok":true,"thread_id":"UUID"}
+{"version":1,"ok":true}
 ```
 
 ### Inspect
 
-The LAM queue worker sends the thread ID and integration secret. `cx` checks the live binding, calls `thread/read`, and requires an exact thread ID, a status of `idle` or `active`, and `canAcceptDirectInput` other than `false`.
+The LAM queue worker sends the thread ID and integration secret. `cx` first reports `active` from its own turn tracker when a native turn is in progress. Otherwise it calls `thread/read` and requires an exact thread ID, a status of `idle` or `active`, and `canAcceptDirectInput` other than `false`.
 
 The response contains only the validated state:
 
 ```json
-{"version":1,"ok":true,"thread_id":"UUID","state":"idle"}
+{"version":1,"ok":true,"state":"idle"}
 ```
 
 LAM reserves a new observation epoch and claims from its database only after this response. No body crosses into `cx` before the durable claim.
 
 ### Queue
 
-After claiming, LAM sends:
+After claiming, LAM sends the Queue operation below. `cx` refuses it with `submission=not_started` if a native turn became active after Inspect, closing the Inspect-to-Queue race without injecting a second turn.
 
 ```json
 {

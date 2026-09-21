@@ -35,8 +35,8 @@
 - Create `src/lam_relay.rs`: strict protocol types, bounded framing, binding table, request authentication, pending app-server correlations, and fixed responses.
 - Modify `Cargo.toml`: add `cc` as a build dependency.
 - Modify `src/lib.rs`: expose only the internal modules needed by the binary and integration tests.
-- Modify `src/runtime.rs`: create `lam.sock`, export only its path to the Codex TUI, run the relay accept loop, and route three internal app-server requests without changing account switching.
-- Modify `tests/fake_codex.py`: emulate thread/read and thread/queue/add, and let the fake TUI launch an owned descendant Bind helper.
+- Modify `src/runtime.rs`: create `lam.sock`, export only its path to the Codex app-server, run the relay accept loop, and route three internal app-server requests without changing account switching.
+- Modify `tests/fake_codex.py`: emulate thread/read and thread/queue/add, and let the fake app-server launch an owned descendant Bind helper.
 - Modify `tests/runtime.rs`: exercise the real cx runtime, relay socket, fake app server, and failure cases.
 
 ### LAM repository
@@ -216,7 +216,7 @@ The fake app server must record literal requests and answer:
 {"id":"cx.lam.2","result":{"queuedSubmission":{"id":"RECEIPT","clientUserMessageId":"ATTEMPT","input":[{"type":"text","text":"BODY","text_elements":[]}]}}}
 ```
 
-The fake TUI spawns a descendant helper that reads `CX_LAM_RELAY` and performs Bind. The integration test then performs Inspect and Queue from the test process with the registered secret. Assert exact thread, attempt, and body in fake app-server events.
+The fake app-server spawns a descendant helper that reads `CX_LAM_RELAY` and performs Bind. The integration test then performs Inspect and Queue from the test process with the registered secret. Assert exact thread, attempt, and body in fake app-server events.
 
 Add separate scenarios for wrong secret, wrong thread response, conflicting Bind, missing receipt, wrong client message ID, disconnect before queue write, and disconnect after queue write. Assert `submission=not_started` only for the pre-write cases and `submission=uncertain` for every post-write case.
 
@@ -232,7 +232,7 @@ Expected: no relay socket is exported and no cx-owned request state exists.
 
 - [ ] **Step 3: Implement the relay accept loop and correlations**
 
-Create `lam.sock` beside `tui.sock`, set mode `0600`, and set `CX_LAM_RELAY` only on the Codex TUI child. Start the relay task after the TUI PID is known. Keep the existing account control socket and line protocol unchanged.
+Create `lam.sock` beside `tui.sock`, set mode `0600`, and set `CX_LAM_RELAY` only on the Codex app-server child. Capture that server's lifetime evidence after it has started, before accepting the first Bind. Keep the existing account control socket and line protocol unchanged.
 
 Use cx-owned IDs `cx.lam.<monotonic u64>`. In the app-server response branch, check `PendingRelay` before `Requests::restore`. Bind stores a secret only after an exact `thread/read`. Inspect returns only `idle` or `active`. Queue builds exactly:
 
@@ -302,12 +302,14 @@ Copy the current LAM source snapshot, lockfile, and included skill to a private 
 
 Keep relay metadata optional for schema compatibility, but require it for Mac Codex queue delivery. On SessionStart:
 
-1. discover Codex 0.155.1 and exact TUI process;
+1. discover Codex 0.155.1 and exact app-server process;
 2. read `CX_LAM_RELAY` as a locator only;
 3. validate the cx parent process and private socket;
 4. enroll with the LAM owner;
 5. send cx Bind with the integration secret;
 6. retain the relay evidence only after both owners acknowledge the same thread.
+
+If the bounded SessionStart is stopped after step 4, later trusted hooks may resume steps 5–6 only for the same exact process, native ID, session, secret, and relay. This is idempotent recovery, not re-enrollment.
 
 Compile `run_hook` for Linux and macOS. Preserve the existing fail-open exit code and fixed private diagnostics.
 
