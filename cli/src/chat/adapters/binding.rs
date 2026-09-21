@@ -1007,6 +1007,168 @@ mod macos_runtime_tests {
             "/Users/owned/.local/bin/codex"
         )));
     }
+
+    #[test]
+    fn mac_cx_relay_helper() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let Some(directory) = std::env::var_os("LAM_TEST_CX_RELAY_DIR") else {
+            return;
+        };
+        let directory = std::path::PathBuf::from(directory);
+        let socket = directory.join("lam.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let codex = ChildGuard(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        std::fs::write(directory.join("codex.pid"), codex.0.id().to_string()).unwrap();
+
+        for operation in ["inspect", "queue"] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = crate::chat::protocol::read_frame(&mut stream).unwrap();
+            assert_eq!(request["version"], 1);
+            assert_eq!(request["operation"], operation);
+            assert_eq!(request["thread_id"], "11111111-1111-4111-8111-111111111111");
+            assert_eq!(request["binding"], "a".repeat(64));
+            let response = if operation == "inspect" {
+                serde_json::json!({"version":1,"ok":true,"state":"idle"})
+            } else {
+                crate::chat::protocol::validate_uuid(request["attempt_id"].as_str().unwrap())
+                    .unwrap();
+                if std::env::var_os("LAM_TEST_EXPECT_WRAPPED_TEXT").is_some() {
+                    assert!(request["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("owned Mac relay message"));
+                } else {
+                    assert_eq!(request["text"], "owned Mac relay message");
+                }
+                serde_json::json!({
+                    "version":1,
+                    "ok":true,
+                    "receipt":"66666666-6666-4666-8666-666666666666"
+                })
+            };
+            crate::chat::protocol::write_frame(&mut stream, &response).unwrap();
+        }
+    }
+
+    #[test]
+    fn mac_codex_queue_inspects_claims_and_finishes_with_matched_receipt() {
+        struct ChildGuard(Option<std::process::Child>);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(child) = &mut self.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let dir = tempfile::Builder::new()
+            .prefix("lam-chat-mac-cx-queue-")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = dir.path().join("cx");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let helper = std::process::Command::new(&executable)
+            .args([
+                "--exact",
+                "chat::adapters::binding::macos_runtime_tests::mac_cx_relay_helper",
+                "--nocapture",
+            ])
+            .env("LAM_TEST_CX_RELAY_DIR", dir.path())
+            .spawn()
+            .unwrap();
+        let mut helper = ChildGuard(Some(helper));
+        let ready = dir.path().join("codex.pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let codex_pid = loop {
+            if let Ok(value) = std::fs::read_to_string(&ready) {
+                break value.parse::<u32>().unwrap();
+            }
+            assert!(Instant::now() < deadline, "cx test helper did not start");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let codex = ProcessEvidence::read(codex_pid).unwrap();
+        let cx = ProcessEvidence::read(helper.0.as_ref().unwrap().id()).unwrap();
+        let relay = CodexRelay {
+            path: dir.path().join("lam.sock"),
+            process: cx,
+        };
+        relay.validate_for(&codex).unwrap();
+
+        let bindings = dir.path().join("bindings");
+        let files = BindingFiles::open(&bindings).unwrap();
+        let session = crate::chat::types::SessionRef {
+            machine: "22222222-2222-4222-8222-222222222222".into(),
+            incarnation: "33333333-3333-4333-8333-333333333333".into(),
+        };
+        let mut binding = NativeBinding::new(
+            "codex",
+            "0.155.1",
+            "11111111-1111-4111-8111-111111111111",
+            codex,
+            "44444444-4444-4444-8444-444444444444",
+            "dev",
+        )
+        .unwrap();
+        binding.integration_secret = "a".repeat(64);
+        binding.codex_relay = Some(relay);
+        binding.bind(session.clone()).unwrap();
+        files
+            .create(&binding, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        let registration = crate::chat::types::Registration {
+            session,
+            project: binding.project.clone(),
+            name: binding.name.clone(),
+            client: binding.client.clone(),
+            native_id: binding.native_id.clone(),
+            process_start: binding.process_start(),
+            eligible: true,
+        };
+        let attempt = crate::chat::types::Attempt {
+            id: "55555555-5555-4555-8555-555555555555".into(),
+            recipient: registration.session.clone(),
+            batch: crate::chat::types::RenderedBatch {
+                text: "owned Mac relay message".into(),
+                ..Default::default()
+            },
+        };
+        let (claimed, outcome) = super::super::codex::submit_queue_owned(
+            &bindings,
+            &registration,
+            Instant::now() + Duration::from_secs(2),
+            |event| {
+                assert_eq!(event, crate::chat::types::ClientEvent::Idle);
+                Ok(Some(attempt.clone()))
+            },
+        )
+        .unwrap();
+        assert_eq!(claimed.id, attempt.id);
+        assert!(matches!(
+            outcome,
+            crate::chat::types::Handoff::Accepted { receipt }
+                if receipt.contains("66666666-6666-4666-8666-666666666666")
+        ));
+
+        let status = helper.0.take().unwrap().wait().unwrap();
+        assert!(status.success());
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1458,11 +1620,38 @@ fn backend_socket_path(process: &ProcessEvidence) -> anyhow::Result<std::path::P
 pub(in crate::chat) static BACKEND_SOCKET_TEST_LOCK: std::sync::Mutex<()> =
     std::sync::Mutex::new(());
 
-#[cfg(target_os = "linux")]
-pub(in crate::chat) fn codex_queue_target(
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) enum CodexQueueTarget {
+    #[cfg(target_os = "linux")]
+    Direct {
+        process: ProcessEvidence,
+        path: std::path::PathBuf,
+    },
+    #[cfg(target_os = "macos")]
+    CxRelay {
+        process: ProcessEvidence,
+        relay: CodexRelay,
+        binding: String,
+    },
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl CodexQueueTarget {
+    fn process(&self) -> &ProcessEvidence {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Direct { process, .. } => process,
+            #[cfg(target_os = "macos")]
+            Self::CxRelay { process, .. } => process,
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn codex_queue_target(
     directory: &std::path::Path,
     registration: &crate::chat::types::Registration,
-) -> anyhow::Result<(ProcessEvidence, std::path::PathBuf)> {
+) -> anyhow::Result<CodexQueueTarget> {
     use crate::chat::protocol;
     anyhow::ensure!(registration.client == "codex", "queue target is not Codex");
     protocol::validate_session(&registration.session)?;
@@ -1477,12 +1666,31 @@ pub(in crate::chat) fn codex_queue_target(
             && binding.native_id == registration.native_id
             && binding.session.as_ref() == Some(&registration.session)
             && binding.project == registration.project
-            && binding.process_start() == registration.process_start
-            && matches!(binding.version.as_str(), "0.153.4" | "0.154.0"),
+            && binding.process_start() == registration.process_start,
         "native queue binding changed"
     );
-    let path = backend_socket_path(&process)?;
-    Ok((process, path))
+    #[cfg(target_os = "linux")]
+    {
+        anyhow::ensure!(
+            matches!(binding.version.as_str(), "0.153.4" | "0.154.0"),
+            "native queue binding changed"
+        );
+        let path = backend_socket_path(&process)?;
+        Ok(CodexQueueTarget::Direct { process, path })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        anyhow::ensure!(binding.version == "0.155.1", "native queue binding changed");
+        let relay = binding
+            .codex_relay
+            .ok_or_else(|| anyhow::anyhow!("native cx relay binding is unavailable"))?;
+        relay.validate_for(&process)?;
+        Ok(CodexQueueTarget::CxRelay {
+            process,
+            relay,
+            binding: binding.integration_secret,
+        })
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1642,15 +1850,15 @@ pub(in crate::chat) fn claude_target(
     Ok((process, path))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn reserve_queue_epoch(
     directory: &std::path::Path,
     registration: &crate::chat::types::Registration,
     deadline: std::time::Instant,
 ) -> anyhow::Result<u64> {
-    let (process, _) = codex_queue_target(directory, registration)?;
+    let target = codex_queue_target(directory, registration)?;
     let files = BindingFiles::open(directory)?;
-    let key = binding_locator("codex", &registration.native_id, &process)?;
+    let key = binding_locator("codex", &registration.native_id, target.process())?;
     let binding = files.load(&key)?;
     files.next_epoch(&binding, deadline)
 }
@@ -1678,6 +1886,44 @@ pub(in crate::chat) fn install_test_binding(
         &registration.project,
         &registration.name,
     )?;
+    binding.bind(registration.session.clone())?;
+    BindingFiles::open(directory)?.create(
+        &binding,
+        std::time::Instant::now() + std::time::Duration::from_secs(1),
+    )
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(in crate::chat) fn install_test_relay_binding(
+    directory: &std::path::Path,
+    registration: &mut crate::chat::types::Registration,
+    relay_path: std::path::PathBuf,
+    cx_pid: u32,
+    codex_pid: u32,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(registration.client == "codex", "test target is not Codex");
+    let process = ProcessEvidence::read(codex_pid)?;
+    let relay = CodexRelay {
+        path: relay_path,
+        process: ProcessEvidence::read(cx_pid)?,
+    };
+    relay.validate_for(&process)?;
+    registration.process_start = format!(
+        "{}:{}:{}",
+        process.boot_id,
+        process.pid,
+        process.start_marker()
+    );
+    let mut binding = NativeBinding::new(
+        "codex",
+        "0.155.1",
+        &registration.native_id,
+        process,
+        &registration.project,
+        &registration.name,
+    )?;
+    binding.integration_secret = "a".repeat(64);
+    binding.codex_relay = Some(relay);
     binding.bind(registration.session.clone())?;
     BindingFiles::open(directory)?.create(
         &binding,
@@ -3110,7 +3356,10 @@ mod tests {
         else {
             panic!("not integration");
         };
-        let (process, selected) = codex_queue_target(&directory, &registration).unwrap();
+        let CodexQueueTarget::Direct {
+            process,
+            path: selected,
+        } = codex_queue_target(&directory, &registration).unwrap();
         assert_eq!(process, record.process);
         assert_eq!(selected, socket);
         let mut wrong = registration.clone();

@@ -31,7 +31,8 @@ pub(super) fn bind_relay(
             "binding": binding,
         }),
         deadline,
-    )?;
+    )
+    .map_err(|_| anyhow::anyhow!("cx relay binding exchange failed"))?;
     let object = response
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("invalid cx relay response"))?;
@@ -43,64 +44,64 @@ pub(super) fn bind_relay(
 }
 
 #[cfg(target_os = "macos")]
+enum RelayFailure {
+    NotStarted,
+    Uncertain,
+}
+
+#[cfg(target_os = "macos")]
 fn relay_request(
     relay: &super::binding::CodexRelay,
     codex: &super::binding::ProcessEvidence,
     request: &serde_json::Value,
     deadline: std::time::Instant,
-) -> anyhow::Result<serde_json::Value> {
-    use anyhow::Context;
+) -> Result<serde_json::Value, RelayFailure> {
     use std::io::{Read, Write};
 
     const FRAME_LIMIT: usize = 32 * 1024;
     relay
         .validate_for(codex)
-        .context("cx relay evidence changed")?;
+        .map_err(|_| RelayFailure::NotStarted)?;
     let mut stream = super::binding::connect_native_socket(&relay.path, deadline)
-        .context("cannot connect to cx relay")?;
-    let peer =
-        crate::chat::daemon::peer_identity(&stream).context("cannot identify cx relay peer")?;
-    anyhow::ensure!(
-        peer.pid == Some(relay.process.pid) && peer.uid == relay.process.uid,
-        "cx relay socket belongs to another process"
-    );
+        .map_err(|_| RelayFailure::NotStarted)?;
+    let peer = crate::chat::daemon::peer_identity(&stream).map_err(|_| RelayFailure::NotStarted)?;
+    if peer.pid != Some(relay.process.pid) || peer.uid != relay.process.uid {
+        return Err(RelayFailure::NotStarted);
+    }
     relay
         .process
         .validate()
-        .context("cx relay process changed")?;
-    let body = serde_json::to_vec(request).context("cannot encode cx relay request")?;
-    anyhow::ensure!(
-        !body.is_empty() && body.len() <= FRAME_LIMIT,
-        "cx relay request exceeds its bound"
-    );
+        .map_err(|_| RelayFailure::NotStarted)?;
+    let body = serde_json::to_vec(request).map_err(|_| RelayFailure::NotStarted)?;
+    if body.is_empty() || body.len() > FRAME_LIMIT {
+        return Err(RelayFailure::NotStarted);
+    }
     let mut framed = crate::chat::daemon::DeadlineStream::until(&mut stream, deadline);
     framed
         .write_all(&(body.len() as u32).to_be_bytes())
-        .context("cannot write cx relay frame header")?;
+        .map_err(|_| RelayFailure::NotStarted)?;
     framed
         .write_all(&body)
-        .context("cannot write cx relay frame body")?;
+        .map_err(|_| RelayFailure::NotStarted)?;
     let mut header = [0_u8; 4];
     framed
         .read_exact(&mut header)
-        .context("cannot read cx relay frame header")?;
+        .map_err(|_| RelayFailure::Uncertain)?;
     let length = u32::from_be_bytes(header) as usize;
-    anyhow::ensure!(
-        (1..=FRAME_LIMIT).contains(&length),
-        "invalid cx relay response length"
-    );
+    if !(1..=FRAME_LIMIT).contains(&length) {
+        return Err(RelayFailure::Uncertain);
+    }
     let mut body = vec![0_u8; length];
     framed
         .read_exact(&mut body)
-        .context("cannot read cx relay frame body")?;
-    anyhow::ensure!(
-        std::time::Instant::now() <= deadline,
-        "cx relay request deadline expired"
-    );
-    serde_json::from_slice(&body).map_err(|_| anyhow::anyhow!("invalid cx relay response"))
+        .map_err(|_| RelayFailure::Uncertain)?;
+    if std::time::Instant::now() > deadline {
+        return Err(RelayFailure::Uncertain);
+    }
+    serde_json::from_slice(&body).map_err(|_| RelayFailure::Uncertain)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(in crate::chat) fn submit_queue_owned(
     directory: &std::path::Path,
     registration: &crate::chat::types::Registration,
@@ -109,24 +110,148 @@ pub(in crate::chat) fn submit_queue_owned(
         crate::chat::types::ClientEvent,
     ) -> anyhow::Result<Option<crate::chat::types::Attempt>>,
 ) -> Option<(crate::chat::types::Attempt, crate::chat::types::Handoff)> {
-    let (process, path) = super::binding::codex_queue_target(directory, registration).ok()?;
-    let mut stream = super::binding::connect_native_socket(&path, deadline).ok()?;
-    submit_queue_with_claim(
-        &process,
-        &mut stream,
-        &registration.native_id,
-        deadline,
-        claim,
-    )
+    let target = super::binding::codex_queue_target(directory, registration).ok()?;
+    #[cfg(target_os = "linux")]
+    {
+        let super::binding::CodexQueueTarget::Direct { process, path } = target;
+        let mut stream = super::binding::connect_native_socket(&path, deadline).ok()?;
+        submit_queue_with_claim(
+            &process,
+            &mut stream,
+            &registration.native_id,
+            deadline,
+            claim,
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let super::binding::CodexQueueTarget::CxRelay {
+            process,
+            relay,
+            binding,
+        } = target;
+        submit_relay_with_claim(
+            &process,
+            &relay,
+            &binding,
+            &registration.native_id,
+            deadline,
+            claim,
+        )
+    }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(in crate::chat) fn reserve_queue_epoch(
     directory: &std::path::Path,
     registration: &crate::chat::types::Registration,
     deadline: std::time::Instant,
 ) -> anyhow::Result<u64> {
     super::binding::reserve_queue_epoch(directory, registration, deadline)
+}
+
+#[cfg(target_os = "macos")]
+fn submit_relay_with_claim(
+    process: &super::binding::ProcessEvidence,
+    relay: &super::binding::CodexRelay,
+    binding: &str,
+    native_id: &str,
+    deadline: std::time::Instant,
+    claim: impl FnOnce(
+        crate::chat::types::ClientEvent,
+    ) -> anyhow::Result<Option<crate::chat::types::Attempt>>,
+) -> Option<(crate::chat::types::Attempt, crate::chat::types::Handoff)> {
+    use crate::chat::{protocol, types::Handoff};
+
+    let state = relay_request(
+        relay,
+        process,
+        &serde_json::json!({
+            "version": 1,
+            "operation": "inspect",
+            "thread_id": native_id,
+            "binding": binding,
+        }),
+        deadline,
+    )
+    .ok()?;
+    let object = state.as_object()?;
+    if object.len() != 3 || state["version"] != 1 || state["ok"] != true {
+        return None;
+    }
+    let event = match state["state"].as_str()? {
+        "idle" => crate::chat::types::ClientEvent::Idle,
+        "active" => crate::chat::types::ClientEvent::Busy,
+        _ => return None,
+    };
+    let attempt = claim(event).ok()??;
+    if protocol::validate_uuid(&attempt.id).is_err() {
+        return Some((
+            attempt,
+            Handoff::NotSubmitted {
+                reason: "Codex relay rejected the local attempt before submission".into(),
+            },
+        ));
+    }
+    let response = relay_request(
+        relay,
+        process,
+        &serde_json::json!({
+            "version": 1,
+            "operation": "queue",
+            "thread_id": native_id,
+            "binding": binding,
+            "attempt_id": attempt.id,
+            "text": attempt.batch.text,
+        }),
+        deadline,
+    );
+    let outcome = match response {
+        Ok(response) if response["version"] == 1 && response["ok"] == true => {
+            let receipt = response
+                .as_object()
+                .filter(|object| object.len() == 3)
+                .and_then(|_| response["receipt"].as_str())
+                .filter(|receipt| protocol::validate_uuid(receipt).is_ok());
+            match receipt {
+                Some(receipt) => Handoff::Accepted {
+                    receipt: format!("Codex queued message {receipt} for thread {native_id}"),
+                },
+                None => Handoff::Unknown {
+                    reason: "Codex relay submission acknowledgement is unconfirmed".into(),
+                },
+            }
+        }
+        Ok(response)
+            if response.as_object().is_some_and(|object| object.len() == 4)
+                && response["version"] == 1
+                && response["ok"] == false
+                && response["submission"] == "not_started"
+                && matches!(
+                    response["error"].as_str(),
+                    Some(
+                        "invalid_request"
+                            | "unauthorized"
+                            | "conflict"
+                            | "thread_mismatch"
+                            | "unavailable"
+                            | "timeout"
+                            | "upstream_error"
+                    )
+                ) =>
+        {
+            Handoff::NotSubmitted {
+                reason: "Codex relay refused the attempt before native submission".into(),
+            }
+        }
+        Err(RelayFailure::NotStarted) => Handoff::NotSubmitted {
+            reason: "Codex relay request did not reach native submission".into(),
+        },
+        _ => Handoff::Unknown {
+            reason: "Codex relay submission acknowledgement is unconfirmed".into(),
+        },
+    };
+    Some((attempt, outcome))
 }
 
 #[cfg(target_os = "linux")]
@@ -649,6 +774,143 @@ mod tests {
                 .unwrap()
                 .contains("SENSITIVE"));
             assert!(started.elapsed() < Duration::from_millis(500));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cx_relay_queue_distinguishes_prewrite_and_uncertain_failures() {
+        use crate::chat::types::{Attempt, Handoff, RenderedBatch, SessionRef};
+        use std::{os::unix::fs::PermissionsExt, os::unix::net::UnixListener};
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        const THREAD: &str = "11111111-1111-4111-8111-111111111111";
+        const ATTEMPT: &str = "55555555-5555-4555-8555-555555555555";
+        for case in [
+            "claim-none",
+            "inspect-refused",
+            "prewrite",
+            "not-started",
+            "not-started-extra",
+            "not-started-bad-error",
+            "uncertain",
+            "lost-response",
+            "bad-receipt",
+        ] {
+            let dir = tempfile::Builder::new()
+                .prefix("lam-chat-cx-outcome-")
+                .tempdir_in("/private/tmp")
+                .unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let path = dir.path().join("lam.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let child = ChildGuard(
+                std::process::Command::new("/bin/sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap(),
+            );
+            let codex = super::super::binding::ProcessEvidence::read(child.0.id()).unwrap();
+            let relay = super::super::binding::CodexRelay {
+                path,
+                process: super::super::binding::ProcessEvidence::read(std::process::id()).unwrap(),
+            };
+            relay.validate_for(&codex).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut inspect, _) = listener.accept().unwrap();
+                let request = crate::chat::protocol::read_frame(&mut inspect).unwrap();
+                assert_eq!(request["operation"], "inspect");
+                let response = if case == "inspect-refused" {
+                    serde_json::json!({
+                        "version":1,"ok":false,"error":"unauthorized",
+                        "submission":"not_started"
+                    })
+                } else {
+                    serde_json::json!({"version":1,"ok":true,"state":"idle"})
+                };
+                crate::chat::protocol::write_frame(&mut inspect, &response).unwrap();
+                if case == "inspect-refused" {
+                    return;
+                }
+                if case == "claim-none" {
+                    listener.set_nonblocking(true).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    assert!(listener.accept().is_err(), "claim refusal still sent Queue");
+                    return;
+                }
+                if case == "prewrite" {
+                    drop(listener);
+                    return;
+                }
+                let (mut queue, _) = listener.accept().unwrap();
+                let request = crate::chat::protocol::read_frame(&mut queue).unwrap();
+                assert_eq!(request["operation"], "queue");
+                let response = match case {
+                    "not-started" => Some(serde_json::json!({
+                        "version":1,"ok":false,"error":"unavailable",
+                        "submission":"not_started"
+                    })),
+                    "not-started-extra" => Some(serde_json::json!({
+                        "version":1,"ok":false,"error":"unavailable",
+                        "submission":"not_started","extra":true
+                    })),
+                    "not-started-bad-error" => Some(serde_json::json!({
+                        "version":1,"ok":false,"error":"invented",
+                        "submission":"not_started"
+                    })),
+                    "uncertain" => Some(serde_json::json!({
+                        "version":1,"ok":false,"error":"upstream_error",
+                        "submission":"uncertain"
+                    })),
+                    "bad-receipt" => {
+                        Some(serde_json::json!({"version":1,"ok":true,"receipt":"wrong"}))
+                    }
+                    "lost-response" => None,
+                    _ => unreachable!(),
+                };
+                if let Some(response) = response {
+                    crate::chat::protocol::write_frame(&mut queue, &response).unwrap();
+                }
+            });
+            let attempt = Attempt {
+                id: ATTEMPT.into(),
+                recipient: SessionRef {
+                    machine: "22222222-2222-4222-8222-222222222222".into(),
+                    incarnation: "33333333-3333-4333-8333-333333333333".into(),
+                },
+                batch: RenderedBatch {
+                    text: "peer text".into(),
+                    ..Default::default()
+                },
+            };
+            let result = super::submit_relay_with_claim(
+                &codex,
+                &relay,
+                &"a".repeat(64),
+                THREAD,
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+                |_| Ok((case != "claim-none").then(|| attempt.clone())),
+            );
+            server.join().unwrap();
+            match case {
+                "claim-none" | "inspect-refused" => assert!(result.is_none(), "{case}"),
+                "prewrite" | "not-started" => assert!(
+                    matches!(result.unwrap().1, Handoff::NotSubmitted { .. }),
+                    "{case}"
+                ),
+                _ => assert!(
+                    matches!(result.unwrap().1, Handoff::Unknown { .. }),
+                    "{case}"
+                ),
+            }
         }
     }
 
