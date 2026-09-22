@@ -1,5 +1,5 @@
 //! Reversible native hook installation. Existing unrelated client settings are
-//! never rewritten; user-scoped Codex setup merges only exact LAM hook groups.
+//! never rewritten; user-scoped setup merges only exact LAM hook groups.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -99,54 +99,60 @@ fn desired(client: &str, binary: &Path, timeout: u8) -> Result<Vec<u8>> {
     Ok(content)
 }
 
-fn target(client: &str, root: &Path) -> Result<PathBuf> {
+fn target(client: &str, root: &Path, user_scope: bool) -> Result<PathBuf> {
     Ok(match client {
         "codex" => root.join(".codex/hooks.json"),
+        "claude" if user_scope => root.join(".claude/settings.json"),
         "claude" => root.join(".claude/settings.local.json"),
         "pi" => root.join(".pi/agent/extensions/lam-chat.ts"),
         _ => bail!("unsupported Chat client: {client}"),
     })
 }
 
-fn is_lam_codex_group(group: &Value) -> bool {
+fn is_lam_group(group: &Value, client: &str) -> bool {
     group["hooks"].as_array().is_some_and(|hooks| {
         hooks.iter().any(|hook| {
-            hook["command"]
-                .as_str()
-                .is_some_and(|command| command.contains(" chat hook --client codex --event "))
+            hook["command"].as_str().is_some_and(|command| {
+                command.contains(&format!(" chat hook --client {client} --event "))
+            })
         })
     })
 }
 
-fn user_codex_after(before: Option<&[u8]>, binary: &Path, remove: bool) -> Result<Option<Vec<u8>>> {
+fn user_hooks_after(
+    client: &str,
+    before: Option<&[u8]>,
+    binary: &Path,
+    remove: bool,
+) -> Result<Option<Vec<u8>>> {
     let Some(before) = before else {
         if remove {
             return Ok(None);
         }
-        let document: Value = serde_json::from_slice(&desired("codex", binary, 3)?)?;
+        let document: Value = serde_json::from_slice(&desired(client, binary, 3)?)?;
         let mut content = serde_json::to_vec_pretty(&json!({"hooks": document["hooks"]}))?;
         content.push(b'\n');
         return Ok(Some(content));
     };
 
-    let mut document: Value =
-        serde_json::from_slice(before).context("user Codex hooks.json is not valid JSON")?;
+    let mut document: Value = serde_json::from_slice(before)
+        .with_context(|| format!("user {client} settings are not valid JSON"))?;
     let object = document
         .as_object_mut()
-        .context("user Codex hooks.json must contain a JSON object")?;
+        .with_context(|| format!("user {client} settings must contain a JSON object"))?;
     let hooks = object
         .entry("hooks")
         .or_insert_with(|| json!({}))
         .as_object_mut()
-        .context("user Codex hooks.json field `hooks` must be an object")?;
-    let expected: Value = serde_json::from_slice(&desired("codex", binary, 3)?)?;
-    let previous: Value = serde_json::from_slice(&desired("codex", binary, 2)?)?;
+        .with_context(|| format!("user {client} settings field `hooks` must be an object"))?;
+    let expected: Value = serde_json::from_slice(&desired(client, binary, 3)?)?;
+    let previous: Value = serde_json::from_slice(&desired(client, binary, 2)?)?;
     let expected = expected["hooks"]
         .as_object()
-        .context("generated Codex hooks must be an object")?;
+        .with_context(|| format!("generated {client} hooks must be an object"))?;
     let previous = previous["hooks"]
         .as_object()
-        .context("generated previous Codex hooks must be an object")?;
+        .with_context(|| format!("generated previous {client} hooks must be an object"))?;
     let mut changed = false;
 
     for (event, expected_groups) in expected {
@@ -156,12 +162,12 @@ fn user_codex_after(before: Option<&[u8]>, binary: &Path, remove: bool) -> Resul
             .entry(event.clone())
             .or_insert_with(|| json!([]))
             .as_array_mut()
-            .with_context(|| format!("user Codex hook event `{event}` must be an array"))?;
+            .with_context(|| format!("user {client} hook event `{event}` must be an array"))?;
         if groups.iter().any(|group| {
-            is_lam_codex_group(group) && group != expected_group && group != previous_group
+            is_lam_group(group, client) && group != expected_group && group != previous_group
         }) {
             bail!(
-                "user Codex hook event `{event}` contains a modified LAM Chat group; preserve it and review manually"
+                "user {client} hook event `{event}` contains a modified LAM Chat group; preserve it and review manually"
             );
         }
         if remove {
@@ -195,7 +201,7 @@ pub fn plan(client: &str, root: &Path, user_scope: bool, remove: bool) -> Result
         .canonicalize()
         .with_context(|| format!("cannot resolve setup root {}", root.display()))?;
     ensure!(root.is_dir(), "Chat setup root must be a directory");
-    let path = target(client, &root)?;
+    let path = target(client, &root, user_scope)?;
     super::config::validate_path_components(&path)?;
     let before = match fs::read(&path) {
         Ok(bytes) => Some(bytes),
@@ -205,10 +211,10 @@ pub fn plan(client: &str, root: &Path, user_scope: bool, remove: bool) -> Result
     let binary = std::env::current_exe()?;
     let after = if user_scope {
         ensure!(
-            client == "codex",
-            "user-scoped setup is supported only for Codex"
+            matches!(client, "codex" | "claude"),
+            "user-scoped setup is supported only for Codex and Claude"
         );
-        user_codex_after(before.as_deref(), &binary, remove)?
+        user_hooks_after(client, before.as_deref(), &binary, remove)?
     } else {
         let expected = desired(client, &binary, 3)?;
         let previous = desired(client, &binary, 2)?;

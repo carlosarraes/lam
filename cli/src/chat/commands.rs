@@ -50,7 +50,7 @@ pub enum ChatCommand {
         /// Project root, or home directory with --scope user. Defaults accordingly.
         #[arg(long)]
         root: Option<PathBuf>,
-        /// Install Codex hooks for one project or every project owned by this user.
+        /// Install Codex or Claude hooks for one project or every project owned by this user.
         #[arg(long, value_enum, default_value_t = SetupScope::Project)]
         scope: SetupScope,
         #[arg(long, conflicts_with = "apply")]
@@ -212,8 +212,8 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
         #[cfg(unix)]
         {
             anyhow::ensure!(
-                *scope == SetupScope::Project || client == "codex",
-                "user-scoped Chat setup is supported only for Codex"
+                *scope == SetupScope::Project || matches!(client.as_str(), "codex" | "claude"),
+                "user-scoped Chat setup is supported only for Codex and Claude"
             );
             let root = match root {
                 Some(root) => root.clone(),

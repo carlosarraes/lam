@@ -232,6 +232,110 @@ fn user_scoped_codex_remove_is_byte_for_byte_noop_without_lam_hooks() {
 }
 
 #[test]
+fn user_scoped_claude_setup_targets_user_settings_and_preserves_existing_hooks() {
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".claude");
+    std::fs::create_dir(&directory).unwrap();
+    let settings = directory.join("settings.json");
+    let existing = serde_json::json!({
+        "permissions": {"defaultMode": "acceptEdits"},
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [{"type": "command", "command": "atuin hook claude-code"}]
+            }],
+            "PostToolUse": [{
+                "matcher": "Bash",
+                "hooks": [{"type": "command", "command": "atuin hook claude-code"}]
+            }]
+        }
+    });
+    std::fs::write(
+        &settings,
+        format!("{}\n", serde_json::to_string_pretty(&existing).unwrap()),
+    )
+    .unwrap();
+
+    let applied = command()
+        .args([
+            "chat", "setup", "--client", "claude", "--scope", "user", "--root",
+        ])
+        .arg(home.path())
+        .arg("--apply")
+        .output()
+        .unwrap();
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+
+    assert!(!directory.join(".claude/settings.local.json").exists());
+    let installed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(installed["permissions"], existing["permissions"]);
+    assert_eq!(
+        installed["hooks"]["PreToolUse"],
+        existing["hooks"]["PreToolUse"]
+    );
+    assert_eq!(
+        installed["hooks"]["PostToolUse"],
+        existing["hooks"]["PostToolUse"]
+    );
+    for event in ["SessionStart", "SessionEnd"] {
+        let groups = installed["hooks"][event].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains(" chat hook --client claude"));
+    }
+}
+
+#[test]
+fn user_scoped_claude_remove_preserves_unrelated_user_settings() {
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".claude");
+    std::fs::create_dir(&directory).unwrap();
+    let settings = directory.join("settings.json");
+    let existing = serde_json::json!({
+        "permissions": {"defaultMode": "acceptEdits"},
+        "hooks": {
+            "PostToolUse": [{
+                "matcher": "Bash",
+                "hooks": [{"type": "command", "command": "atuin hook claude-code"}]
+            }]
+        }
+    });
+    std::fs::write(
+        &settings,
+        format!("{}\n", serde_json::to_string_pretty(&existing).unwrap()),
+    )
+    .unwrap();
+    let invoke = |extra: &[&str]| {
+        command()
+            .args([
+                "chat", "setup", "--client", "claude", "--scope", "user", "--root",
+            ])
+            .arg(home.path())
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    assert!(invoke(&["--apply"]).status.success());
+
+    let removed = invoke(&["--remove", "--apply"]);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let restored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(restored, existing);
+}
+
+#[test]
 fn setup_upgrades_the_previous_managed_codex_deadline() {
     let root = tempfile::tempdir().unwrap();
     let hook = root.path().join(".codex/hooks.json");

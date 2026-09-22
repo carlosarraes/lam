@@ -65,29 +65,29 @@ The private observer and peer Unix sockets trust processes running as the same O
 
 ## Optional native setup and user service
 
-On Linux, run these commands from the *installed* LAM binary before starting new agent sessions. Codex's recommended user scope applies the integration across projects and merges LAM's exact hook groups with existing user hooks:
+On Linux, run these commands from the *installed* LAM binary before starting new agent sessions. The recommended user scope applies Codex and Claude across projects and merges LAM's exact hook groups with existing user hooks:
 
 ```sh
 lam chat setup --client codex --scope user --dry-run
 lam chat setup --client codex --scope user --apply
-lam chat setup --client claude --dry-run
-lam chat setup --client claude --apply
+lam chat setup --client claude --scope user --dry-run
+lam chat setup --client claude --scope user --apply
 lam chat setup --client pi --root "$HOME" --dry-run
 lam chat setup --client pi --root "$HOME" --apply
 ```
 
-On macOS, Codex and Claude setup can be applied. Preview the user-scoped Codex hook and project-scoped Claude hook, review the exact file changes, and then apply them for new sessions:
+On macOS, Codex and Claude setup can be applied. Preview the user-scoped hooks, review the exact file changes, and then apply them for new sessions:
 
 ```sh
 lam chat setup --client codex --scope user --dry-run
 lam chat setup --client codex --scope user --apply
-lam chat setup --client claude --dry-run
-lam chat setup --client claude --apply
+lam chat setup --client claude --scope user --dry-run
+lam chat setup --client claude --scope user --apply
 ```
 
 Mac Codex native delivery requires Codex CLI 0.155.1 launched through the matching `cx` relay build. Existing sessions do not enroll retroactively. Restart the agent through `cx` after trusting the generated hook in Codex's normal review UI. Mac Pi setup remains preview-only. Do not treat peer history synchronization as native model delivery.
 
-Codex setup supports `--scope user` at `~/.codex/hooks.json` and the default `--scope project` at `<repo>/.codex/hooks.json`; Claude remains project-scoped and Pi targets the supplied home directory. User-scoped Codex setup preserves unrelated hook groups, adds or removes only exact LAM groups, and refuses a modified LAM-looking group for manual review. Project-scoped setup refuses an existing file it cannot match *byte-for-byte* to its generated template. Every apply first writes a private recoverable backup when the target already exists. Setup never silently disables a native client trust prompt. Run the installed binary for both setup and later operation: its absolute path is embedded in generated hooks. `--remove --dry-run` previews removal and `--remove --apply` removes only the applicable owned definition. `LAM_CHAT_DISABLE=1` in a **new** agent process opts out of native registration and delivery while retaining history.
+Codex user scope targets `~/.codex/hooks.json`; Claude user scope targets `~/.claude/settings.json`. Their default project scopes target `<repo>/.codex/hooks.json` and `<repo>/.claude/settings.local.json`, respectively. Pi targets the supplied home directory. User-scoped setup preserves unrelated settings and hook groups, adds or removes only exact LAM groups, and refuses a modified LAM-looking group for manual review. Project-scoped setup refuses an existing file it cannot match *byte-for-byte* to its generated template. Every apply first writes a private recoverable backup when the target already exists. Setup never silently disables a native client trust prompt. Run the installed binary for both setup and later operation: its absolute path is embedded in generated hooks. `--remove --dry-run` previews removal and `--remove --apply` removes only the applicable owned definition. `LAM_CHAT_DISABLE=1` in a **new** agent process opts out of native registration and delivery while retaining history.
 
 `lam chat service install` previews a Linux systemd user unit (or a macOS launchd user-agent file). `--apply` writes only that owned file; it does not enable, start, restart or stop anything. Use `lam chat service status` to inspect whether the template is installed, not whether its process is running. Start the foreground service first; if you later choose to manage it through your user service manager, review the generated file and enable/start it explicitly. `lam chat service uninstall --apply` removes only an unchanged owned unit and prints its recoverable backup. Stop any running Chat service yourself before uninstalling its file. Chat config, history, the ordinary LAM cloud config, and other client hooks are not removed.
 
