@@ -76,6 +76,162 @@ fn setup_refuses_to_clobber_an_existing_unowned_hook() {
 }
 
 #[test]
+fn user_scoped_codex_setup_preserves_existing_hooks() {
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".codex");
+    std::fs::create_dir(&directory).unwrap();
+    let hook = directory.join("hooks.json");
+    let existing = serde_json::json!({
+        "hooks": {
+            "PostToolUse": [{
+                "matcher": "^Bash$",
+                "hooks": [{"type": "command", "command": "atuin hook codex"}]
+            }],
+            "PostToolUseFailure": [{
+                "matcher": "^Bash$",
+                "hooks": [{"type": "command", "command": "atuin hook codex"}]
+            }],
+            "PreToolUse": [{
+                "matcher": "^Bash$",
+                "hooks": [{"type": "command", "command": "atuin hook codex"}]
+            }]
+        }
+    });
+    std::fs::write(
+        &hook,
+        format!("{}\n", serde_json::to_string_pretty(&existing).unwrap()),
+    )
+    .unwrap();
+
+    let applied = command()
+        .args([
+            "chat", "setup", "--client", "codex", "--scope", "user", "--root",
+        ])
+        .arg(home.path())
+        .arg("--apply")
+        .output()
+        .unwrap();
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+
+    let installed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&hook).unwrap()).unwrap();
+    assert_eq!(
+        installed["hooks"]["PreToolUse"],
+        existing["hooks"]["PreToolUse"]
+    );
+    assert_eq!(
+        installed["hooks"]["PostToolUseFailure"],
+        existing["hooks"]["PostToolUseFailure"]
+    );
+    assert_eq!(
+        installed["hooks"]["PostToolUse"][0],
+        existing["hooks"]["PostToolUse"][0]
+    );
+    assert_eq!(
+        installed["hooks"]["PostToolUse"].as_array().unwrap().len(),
+        2
+    );
+    for event in [
+        "SessionStart",
+        "SubagentStart",
+        "PostToolUse",
+        "Stop",
+        "UserPromptSubmit",
+        "SubagentStop",
+        "SessionEnd",
+    ] {
+        assert!(installed["hooks"][event]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| group["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains(" chat hook --client codex")));
+    }
+}
+
+#[test]
+fn user_scoped_codex_remove_preserves_existing_hooks() {
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".codex");
+    std::fs::create_dir(&directory).unwrap();
+    let hook = directory.join("hooks.json");
+    let existing = serde_json::json!({
+        "hooks": {
+            "PostToolUse": [{
+                "matcher": "^Bash$",
+                "hooks": [{"type": "command", "command": "atuin hook codex"}]
+            }],
+            "PostToolUseFailure": [{
+                "matcher": "^Bash$",
+                "hooks": [{"type": "command", "command": "atuin hook codex"}]
+            }],
+            "PreToolUse": [{
+                "matcher": "^Bash$",
+                "hooks": [{"type": "command", "command": "atuin hook codex"}]
+            }]
+        }
+    });
+    std::fs::write(
+        &hook,
+        format!("{}\n", serde_json::to_string_pretty(&existing).unwrap()),
+    )
+    .unwrap();
+    let invoke = |extra: &[&str]| {
+        command()
+            .args([
+                "chat", "setup", "--client", "codex", "--scope", "user", "--root",
+            ])
+            .arg(home.path())
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    assert!(invoke(&["--apply"]).status.success());
+
+    let removed = invoke(&["--remove", "--apply"]);
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let restored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&hook).unwrap()).unwrap();
+    assert_eq!(restored, existing);
+}
+
+#[test]
+fn user_scoped_codex_remove_is_byte_for_byte_noop_without_lam_hooks() {
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".codex");
+    std::fs::create_dir(&directory).unwrap();
+    let hook = directory.join("hooks.json");
+    let existing = br#"{"hooks":{"PreToolUse":[{"matcher":"^Bash$","hooks":[{"command":"atuin hook codex","type":"command"}]}]}}
+"#;
+    std::fs::write(&hook, existing).unwrap();
+
+    let removed = command()
+        .args([
+            "chat", "setup", "--client", "codex", "--scope", "user", "--root",
+        ])
+        .arg(home.path())
+        .args(["--remove", "--apply"])
+        .output()
+        .unwrap();
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert_eq!(std::fs::read(&hook).unwrap(), existing);
+}
+
+#[test]
 fn setup_upgrades_the_previous_managed_codex_deadline() {
     let root = tempfile::tempdir().unwrap();
     let hook = root.path().join(".codex/hooks.json");

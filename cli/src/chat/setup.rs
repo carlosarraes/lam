@@ -1,5 +1,5 @@
-//! Reversible, project-scoped native hook installation. Existing unrelated
-//! client settings are never rewritten; an occupied target needs manual review.
+//! Reversible native hook installation. Existing unrelated client settings are
+//! never rewritten; user-scoped Codex setup merges only exact LAM hook groups.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -108,7 +108,88 @@ fn target(client: &str, root: &Path) -> Result<PathBuf> {
     })
 }
 
-pub fn plan(client: &str, root: &Path, remove: bool) -> Result<Vec<SetupChange>> {
+fn is_lam_codex_group(group: &Value) -> bool {
+    group["hooks"].as_array().is_some_and(|hooks| {
+        hooks.iter().any(|hook| {
+            hook["command"]
+                .as_str()
+                .is_some_and(|command| command.contains(" chat hook --client codex --event "))
+        })
+    })
+}
+
+fn user_codex_after(before: Option<&[u8]>, binary: &Path, remove: bool) -> Result<Option<Vec<u8>>> {
+    let Some(before) = before else {
+        if remove {
+            return Ok(None);
+        }
+        let document: Value = serde_json::from_slice(&desired("codex", binary, 3)?)?;
+        let mut content = serde_json::to_vec_pretty(&json!({"hooks": document["hooks"]}))?;
+        content.push(b'\n');
+        return Ok(Some(content));
+    };
+
+    let mut document: Value =
+        serde_json::from_slice(before).context("user Codex hooks.json is not valid JSON")?;
+    let object = document
+        .as_object_mut()
+        .context("user Codex hooks.json must contain a JSON object")?;
+    let hooks = object
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("user Codex hooks.json field `hooks` must be an object")?;
+    let expected: Value = serde_json::from_slice(&desired("codex", binary, 3)?)?;
+    let previous: Value = serde_json::from_slice(&desired("codex", binary, 2)?)?;
+    let expected = expected["hooks"]
+        .as_object()
+        .context("generated Codex hooks must be an object")?;
+    let previous = previous["hooks"]
+        .as_object()
+        .context("generated previous Codex hooks must be an object")?;
+    let mut changed = false;
+
+    for (event, expected_groups) in expected {
+        let expected_group = &expected_groups[0];
+        let previous_group = &previous[event][0];
+        let groups = hooks
+            .entry(event.clone())
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .with_context(|| format!("user Codex hook event `{event}` must be an array"))?;
+        if groups.iter().any(|group| {
+            is_lam_codex_group(group) && group != expected_group && group != previous_group
+        }) {
+            bail!(
+                "user Codex hook event `{event}` contains a modified LAM Chat group; preserve it and review manually"
+            );
+        }
+        if remove {
+            let before_len = groups.len();
+            groups.retain(|group| group != expected_group && group != previous_group);
+            changed |= groups.len() != before_len;
+        } else if let Some(index) = groups.iter().position(|group| group == previous_group) {
+            groups[index] = expected_group.clone();
+            changed = true;
+        } else if !groups.iter().any(|group| group == expected_group) {
+            groups.push(expected_group.clone());
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(Some(before.to_vec()));
+    }
+    hooks.retain(|_, groups| !groups.as_array().is_some_and(Vec::is_empty));
+
+    if remove && hooks.is_empty() && object.len() == 1 {
+        return Ok(None);
+    }
+    let mut content = serde_json::to_vec_pretty(&document)?;
+    content.push(b'\n');
+    Ok(Some(content))
+}
+
+pub fn plan(client: &str, root: &Path, user_scope: bool, remove: bool) -> Result<Vec<SetupChange>> {
     super::config::validate_path_components(root)?;
     let root = root
         .canonicalize()
@@ -122,18 +203,30 @@ pub fn plan(client: &str, root: &Path, remove: bool) -> Result<Vec<SetupChange>>
         Err(error) => return Err(error.into()),
     };
     let binary = std::env::current_exe()?;
-    let expected = desired(client, &binary, 3)?;
-    let previous = desired(client, &binary, 2)?;
-    if before
-        .as_ref()
-        .is_some_and(|bytes| bytes != &expected && bytes != &previous)
-    {
-        bail!(
-            "{} differs from the exact LAM Chat template; preserve it and review or merge manually",
-            path.display()
+    let after = if user_scope {
+        ensure!(
+            client == "codex",
+            "user-scoped setup is supported only for Codex"
         );
-    }
-    let after = if remove { None } else { Some(expected) };
+        user_codex_after(before.as_deref(), &binary, remove)?
+    } else {
+        let expected = desired(client, &binary, 3)?;
+        let previous = desired(client, &binary, 2)?;
+        if before
+            .as_ref()
+            .is_some_and(|bytes| bytes != &expected && bytes != &previous)
+        {
+            bail!(
+                "{} differs from the exact LAM Chat template; preserve it and review or merge manually",
+                path.display()
+            );
+        }
+        if remove {
+            None
+        } else {
+            Some(expected)
+        }
+    };
     if before == after {
         return Ok(Vec::new());
     }
@@ -217,8 +310,8 @@ pub fn apply_change(change: &SetupChange) -> Result<()> {
     Ok(())
 }
 
-pub fn run(client: &str, root: &Path, apply: bool, remove: bool) -> Result<()> {
-    let changes = plan(client, root, remove)?;
+pub fn run(client: &str, root: &Path, user_scope: bool, apply: bool, remove: bool) -> Result<()> {
+    let changes = plan(client, root, user_scope, remove)?;
     if changes.is_empty() {
         println!("LAM Chat {client} setup is already in the requested state.");
         return Ok(());

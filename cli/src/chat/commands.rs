@@ -5,12 +5,18 @@ use super::{
 #[cfg(not(unix))]
 use anyhow::bail;
 use anyhow::{Context, Result};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use std::io::Read;
 use std::path::PathBuf;
 
 const MAX_BODY_BYTES: u64 = 65_536;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SetupScope {
+    Project,
+    User,
+}
 
 #[derive(Args)]
 pub struct ChatArgs {
@@ -37,13 +43,16 @@ pub enum ChatCommand {
     },
     #[command(hide = true)]
     PeerStdio,
-    /// Preview or install project-scoped native Chat integration without touching unrelated settings.
+    /// Preview or install native Chat integration without touching unrelated settings.
     Setup {
         #[arg(long, value_parser = ["codex", "claude", "pi"])]
         client: String,
-        /// Project root for Codex/Claude; home directory for Pi. Defaults accordingly.
+        /// Project root, or home directory with --scope user. Defaults accordingly.
         #[arg(long)]
         root: Option<PathBuf>,
+        /// Install Codex hooks for one project or every project owned by this user.
+        #[arg(long, value_enum, default_value_t = SetupScope::Project)]
+        scope: SetupScope,
         #[arg(long, conflicts_with = "apply")]
         dry_run: bool,
         #[arg(long)]
@@ -194,6 +203,7 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
     if let Some(ChatCommand::Setup {
         client,
         root,
+        scope,
         apply,
         remove,
         ..
@@ -201,14 +211,18 @@ pub fn run_chat(args: ChatArgs) -> Result<i32> {
     {
         #[cfg(unix)]
         {
+            anyhow::ensure!(
+                *scope == SetupScope::Project || client == "codex",
+                "user-scoped Chat setup is supported only for Codex"
+            );
             let root = match root {
                 Some(root) => root.clone(),
-                None if client == "pi" => {
+                None if client == "pi" || *scope == SetupScope::User => {
                     dirs::home_dir().context("cannot find home for Pi extension")?
                 }
                 None => std::env::current_dir()?,
             };
-            super::setup::run(client, &root, *apply, *remove)?;
+            super::setup::run(client, &root, *scope == SetupScope::User, *apply, *remove)?;
         }
         #[cfg(not(unix))]
         bail!("Chat setup requires Unix platform support");

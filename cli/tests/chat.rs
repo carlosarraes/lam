@@ -24,6 +24,8 @@ fn embedded_guide_explains_inline_chat_and_attention_boundary() {
         "lam inbox",
         "Short messages arrive inline",
         "approval",
+        "lam chat setup --client codex --scope user",
+        "Mac Codex 0.155.1",
     ] {
         assert!(guide.contains(phrase), "missing guide text: {phrase}");
     }

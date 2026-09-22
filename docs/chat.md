@@ -65,32 +65,32 @@ The private observer and peer Unix sockets trust processes running as the same O
 
 ## Optional native setup and user service
 
-On Linux, run these commands from the *installed* LAM binary's project directory before starting new agent sessions:
+On Linux, run these commands from the *installed* LAM binary before starting new agent sessions. Codex's recommended user scope applies the integration across projects and merges LAM's exact hook groups with existing user hooks:
 
 ```sh
-lam chat setup --client codex --dry-run
-lam chat setup --client codex --apply
+lam chat setup --client codex --scope user --dry-run
+lam chat setup --client codex --scope user --apply
 lam chat setup --client claude --dry-run
 lam chat setup --client claude --apply
 lam chat setup --client pi --root "$HOME" --dry-run
 lam chat setup --client pi --root "$HOME" --apply
 ```
 
-On macOS, Codex and Claude setup can be applied. Preview each project-scoped hook, review the exact file changes, and then apply it for new sessions:
+On macOS, Codex and Claude setup can be applied. Preview the user-scoped Codex hook and project-scoped Claude hook, review the exact file changes, and then apply them for new sessions:
 
 ```sh
-lam chat setup --client codex --dry-run
-lam chat setup --client codex --apply
+lam chat setup --client codex --scope user --dry-run
+lam chat setup --client codex --scope user --apply
 lam chat setup --client claude --dry-run
 lam chat setup --client claude --apply
 ```
 
 Mac Codex native delivery requires Codex CLI 0.155.1 launched through the matching `cx` relay build. Existing sessions do not enroll retroactively. Restart the agent through `cx` after trusting the generated hook in Codex's normal review UI. Mac Pi setup remains preview-only. Do not treat peer history synchronization as native model delivery.
 
-Codex and Claude setup targets are project-scoped; Pi's target is the supplied home directory. Setup refuses an existing file it cannot match *byte-for-byte* to its own generated template. It prints the proposed template during a dry run so unrelated settings can be merged manually. It never rewrites a foreign hook file or silently disables a native client trust prompt. Run the installed binary for both setup and later operation: its absolute path is embedded in generated hooks. `--remove --dry-run` previews removal; `--remove --apply` moves an unchanged owned file out of the active path and prints a private backup location. A user-edited file is left alone. `LAM_CHAT_DISABLE=1` in a **new** agent process opts out of native registration and delivery while retaining history.
+Codex setup supports `--scope user` at `~/.codex/hooks.json` and the default `--scope project` at `<repo>/.codex/hooks.json`; Claude remains project-scoped and Pi targets the supplied home directory. User-scoped Codex setup preserves unrelated hook groups, adds or removes only exact LAM groups, and refuses a modified LAM-looking group for manual review. Project-scoped setup refuses an existing file it cannot match *byte-for-byte* to its generated template. Every apply first writes a private recoverable backup when the target already exists. Setup never silently disables a native client trust prompt. Run the installed binary for both setup and later operation: its absolute path is embedded in generated hooks. `--remove --dry-run` previews removal and `--remove --apply` removes only the applicable owned definition. `LAM_CHAT_DISABLE=1` in a **new** agent process opts out of native registration and delivery while retaining history.
 
 `lam chat service install` previews a Linux systemd user unit (or a macOS launchd user-agent file). `--apply` writes only that owned file; it does not enable, start, restart or stop anything. Use `lam chat service status` to inspect whether the template is installed, not whether its process is running. Start the foreground service first; if you later choose to manage it through your user service manager, review the generated file and enable/start it explicitly. `lam chat service uninstall --apply` removes only an unchanged owned unit and prints its recoverable backup. Stop any running Chat service yourself before uninstalling its file. Chat config, history, the ordinary LAM cloud config, and other client hooks are not removed.
 
 ## Current platform boundary
 
-The native participant adapters are implemented and live-probed on Linux. The peer replay path has both an isolated two-daemon test and a staged real SSH exchange between this PC and the Mac, including an offline replay after restarting only the staged Mac daemon. macOS Codex 0.155.1 delivery through `cx` passed an isolated live gate for busy inline delivery, idle native queueing, and a LAM daemon restart. The production Mac service now runs with native bindings, and its project-scoped Codex hook enrolls new `cx` sessions; existing sessions remain on their current transport. The relay is private, authenticates the exact Codex descendant, and exposes only Bind, Inspect, and Queue operations. It is version-gated and experimental. macOS Claude's startup binding and private-socket handoff have isolated checks, but authenticated model delivery has not passed because the installed Claude CLI was logged out. Mac Pi native delivery is unavailable. Mac CLI sends and replies require explicit `--as-human`; agent sessions must not use that flag to mislabel their origin. This is an attribution safeguard within a trusted same-user account, not proof of human intent. Treat `lam chat status --json` and an actual directed exchange as the authority for an installation; a message stored or imported remotely is not automatically model-visible. Existing LAM requests, FYIs and Articles are independent of Chat.
+The native participant adapters are implemented and live-probed on Linux. The peer replay path has both an isolated two-daemon test and a staged real SSH exchange between this PC and the Mac, including an offline replay after restarting only the staged Mac daemon. macOS Codex 0.155.1 delivery through `cx` passed an isolated live gate for busy inline delivery, idle native queueing, and a LAM daemon restart. The production Mac service runs with native bindings, and its user-scoped Codex hook enrolls new `cx` sessions across projects; existing sessions remain on their current transport. The relay is private, authenticates the exact Codex descendant, and exposes only Bind, Inspect, and Queue operations. It is version-gated and experimental. macOS Claude's startup binding and private-socket handoff have isolated checks, but authenticated model delivery has not passed because the installed Claude CLI was logged out. Mac Pi native delivery is unavailable. Mac CLI sends and replies require explicit `--as-human`; agent sessions must not use that flag to mislabel their origin. This is an attribution safeguard within a trusted same-user account, not proof of human intent. Treat `lam chat status --json` and an actual directed exchange as the authority for an installation; a message stored or imported remotely is not automatically model-visible. Existing LAM requests, FYIs and Articles are independent of Chat.
