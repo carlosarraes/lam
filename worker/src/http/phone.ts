@@ -5,6 +5,7 @@ import { Items } from "../services/Items";
 import { Auth } from "../services/Auth";
 import { Notify } from "../services/Notify";
 import { Events } from "../services/Events";
+import { Push } from "../services/Push";
 import { background } from "./api";
 
 const IdParam = Schema.Struct({ id: Schema.String });
@@ -112,6 +113,7 @@ const pressButton = Effect.gen(function* () {
       const label = decodeURIComponent(choice);
       const item = yield* (yield* Items).close(id, { status: "resolved", choice: label === "Done" ? undefined : label, by: "phone" });
       yield* background((yield* Notify).itemClosed(item));
+      yield* background((yield* Push).deliver("item.closed", item));
       return HttpServerResponse.text(`ok: ${item.title} → ${label}`);
     });
 
@@ -145,6 +147,7 @@ export const phone = HttpRouter.empty.pipe(
       const { item, changed } = yield* (yield* Items).seen(id, version);
       if (changed) {
         yield* background((yield* Events).publish({ event: "item.closed", item_id: item.id, version: item.version, status: item.status }));
+        yield* background((yield* Push).deliver("item.closed", item));
       }
       return HttpServerResponse.text(`Seen: ${item.title}`);
     }),
@@ -155,6 +158,7 @@ export const phone = HttpRouter.empty.pipe(
       const { id } = yield* HttpRouter.schemaPathParams(IdParam);
       const item = yield* (yield* Items).close(id, { status: "dismissed", by: "phone" });
       yield* background((yield* Notify).itemClosed(item));
+      yield* background((yield* Push).deliver("item.closed", item));
       return HttpServerResponse.text(`Dismissed: ${item.title}`);
     }),
   ),
@@ -167,8 +171,10 @@ export const phone = HttpRouter.empty.pipe(
       const item = yield* (yield* Items).setCheck(id, index, done === "true", "phone");
       if (item.status !== "open") {
         yield* background((yield* Notify).itemClosed(item));
+        yield* background((yield* Push).deliver("item.closed", item));
         return HttpServerResponse.text(`done: ${item.title}`);
       }
+      yield* background((yield* Push).deliver("item.changed", item));
       return HttpServerResponse.empty({ status: 303, headers: Headers.fromInput({ location: `/r/${id}?t=${t ?? ""}` }) });
     }),
   ),
@@ -179,6 +185,7 @@ export const phone = HttpRouter.empty.pipe(
       const { text } = yield* HttpServerRequest.schemaBodyUrlParams(Schema.Struct({ text: ReplyText }));
       const item = yield* (yield* Items).close(id, { status: "resolved", text: text.trim(), by: "phone" });
       yield* background((yield* Notify).itemClosed(item));
+      yield* background((yield* Push).deliver("item.closed", item));
       return HttpServerResponse.text(`sent: ${text}`);
     }),
   ),

@@ -22,6 +22,7 @@ class PairingRepository(
     private val credentials: CredentialStore,
     private val reconcile: suspend () -> Boolean,
     private val identity: DeviceIdentity,
+    private val pushToken: suspend () -> String? = { null },
     private val claim: suspend (String, String, PairingClaimRequestDto) -> PairingClaimResponseDto = { origin, session, request ->
         OkHttpLamApi(origin.toHttpUrl(), credentialProvider = { null }).claimPairing(session, request)
     },
@@ -29,9 +30,16 @@ class PairingRepository(
     fun observePairing() = credentials.observe()
 
     suspend fun pair(payload: PairingPayload): PairingResult {
+        val fcmToken = try {
+            pushToken()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            null
+        }
         val response = try {
             claim(payload.serverUrl, payload.session, PairingClaimRequestDto(
-                requireNotNull(payload.secret), identity.name, null, identity.appVersion, identity.androidVersion,
+                requireNotNull(payload.secret), identity.name, fcmToken, identity.appVersion, identity.androidVersion,
             ))
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -57,7 +65,7 @@ class PairingRepository(
         val device = response.device
         if (response.credential.isBlank() || device.id.isBlank() || device.name != identity.name ||
             device.appVersion != identity.appVersion || device.androidVersion != identity.androidVersion ||
-            device.pushRegistered || !validInstant(device.createdAt) ||
+            device.pushRegistered != (fcmToken != null) || !validInstant(device.createdAt) ||
             (device.lastSeenAt != null && !validInstant(device.lastSeenAt))) {
             return PairingResult(problem = PairingProblem.WRONG_SERVER)
         }

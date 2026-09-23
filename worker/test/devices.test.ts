@@ -43,6 +43,30 @@ const summaryKeys = ["android_version", "app_version", "created_at", "id", "last
 const registrationKeys = ["android_version", "app_version", "created_at", "id", "last_seen_at", "name", "push_registered"];
 
 describe("Devices", () => {
+  it("lists push targets only for active devices with tokens", async () => {
+    const active = await seedDevice({ fcmToken: "active-token" });
+    await seedDevice({ fcmToken: null });
+    await seedDevice({ fcmToken: "revoked-token", revokedAt: "2026-09-23T00:00:00.000Z" });
+    const service = await run(Devices);
+
+    expect(await run(service.pushTargets())).toContainEqual({ id: active.id, token: "active-token" });
+    expect(await run(service.pushTargets())).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ token: "revoked-token" }),
+    ]));
+  });
+
+  it("clears an invalid token without erasing a concurrent rotation", async () => {
+    const stale = await seedDevice({ fcmToken: "stale-token" });
+    const rotated = await seedDevice({ fcmToken: "new-token" });
+    const service = await run(Devices);
+
+    await run(service.clearPushToken(stale.id, "stale-token"));
+    await run(service.clearPushToken(rotated.id, "old-token"));
+
+    expect(await env.DB.prepare("SELECT fcm_token FROM devices WHERE id = ?").bind(stale.id).first()).toEqual({ fcm_token: null });
+    expect(await env.DB.prepare("SELECT fcm_token FROM devices WHERE id = ?").bind(rotated.id).first()).toEqual({ fcm_token: "new-token" });
+  });
+
   it("get returns an owner-safe summary", async () => {
     const seeded = await seedDevice();
     const service = await run(Devices);

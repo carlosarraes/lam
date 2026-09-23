@@ -33,6 +33,14 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ItemRepositoryTest {
+    @Test fun `rotated push token is uploaded through the current authenticated session`() = runTest {
+        val f = fixture()
+
+        assertTrue(f.repo.updatePushToken("rotated-token"))
+
+        assertEquals(FcmTokenUpdate.Set("rotated-token"), f.api.deviceUpdate?.fcmToken)
+    }
+
     @Test fun `new generation exposes coherent account while null pairing replay is held`() = runTest {
         assertCoherentSnapshot(null)
     }
@@ -793,6 +801,7 @@ internal class FakeCredentials : CredentialStore {
 }
 
 internal class FakeApi : LamApi {
+    var deviceUpdate: DeviceUpdateDto? = null
     override suspend fun markSeen(id: String, version: Long) = write("seen:$id:$version")
     var beforeRevoke: suspend () -> Unit = {}
     var revokeError: ApiError? = null
@@ -820,7 +829,10 @@ internal class FakeApi : LamApi {
     override suspend fun dismiss(id: String) = write("dismiss:$id")
     override suspend fun setCheck(id: String, index: Int, done: Boolean) = write("check:$id:$index:$done")
     override suspend fun getDevice(): DeviceRegistrationDto = error("unused")
-    override suspend fun updateDevice(update: DeviceUpdateDto): DeviceRegistrationDto = error("unused")
+    override suspend fun updateDevice(update: DeviceUpdateDto): DeviceRegistrationDto {
+        deviceUpdate = update
+        return DeviceRegistrationDto("device", "Phone", "1", "16", "2026-09-04T09:00:00Z", null, true)
+    }
     override suspend fun revokeDevice(): DeviceSummaryDto {
         revocations++; beforeRevoke(); revokeError?.let { throw it }
         return DeviceSummaryDto("device", "Phone", "1", "16", "2026-09-04T09:00:00Z", null, false, "2026-09-04T12:00:00Z")

@@ -154,6 +154,13 @@
     <string name="settings_notifications_enabled">Notifications are allowed.</string>
     <string name="settings_notifications_disabled">Notifications are disabled. Requests still sync when you open or refresh the app.</string>
     <string name="settings_notifications_link">Android notification settings</string>
+    <string name="notification_channel_critical">Critical lams</string>
+    <string name="notification_channel_critical_description">Sound and vibration for critical LAM requests and FYIs</string>
+    <string name="notification_public_title">Critical lam</string>
+    <string name="notification_permission_title">Critical lam notifications</string>
+    <string name="notification_permission_explanation">Allow lam to alert you when an agent sends a critical request or FYI.</string>
+    <string name="notification_permission_allow">Allow notifications</string>
+    <string name="notification_permission_not_now">Not now</string>
     <string name="settings_version">App version</string>
     <string name="settings_diagnostics">Copy diagnostics</string>
     <string name="settings_unpair">Unpair this device</string>

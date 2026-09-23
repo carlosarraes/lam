@@ -3,6 +3,7 @@
   "name": "lam-api",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-01",
+  "vars": { "FCM_PROJECT_ID": "lam-push-carraes" },
   "observability": { "enabled": true },
   "triggers": { "crons": ["* * * * *"] },
   "r2_buckets": [{ "binding": "ARTICLE_BUCKET", "bucket_name": "lam-articles", "remote": false }],

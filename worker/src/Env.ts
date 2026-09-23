@@ -8,6 +8,8 @@ export interface Bindings {
   LAM_TOKEN: string;
   LAM_HMAC_SECRET: string;
   NTFY_TOPIC: string;
+  FCM_PROJECT_ID?: string;
+  FCM_SERVICE_ACCOUNT_JSON?: string;
   TOPIC: DurableObjectNamespace<Topic>;
   EVENTS: DurableObjectNamespace<EventStream>;
 }

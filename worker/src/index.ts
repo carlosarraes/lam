@@ -11,6 +11,8 @@ import { Pairings } from "./services/Pairings";
 import { TopicClient } from "./services/TopicClient";
 import { Articles } from "./services/Articles";
 import { ArticleNotifications } from "./services/ArticleNotifications";
+import { Push } from "./services/Push";
+import { FcmClientLive } from "./services/FcmClient";
 
 type Handler = (request: Request, context?: Context.Context<never>) => Promise<Response>;
 
@@ -20,7 +22,10 @@ const handlers = new WeakMap<Bindings, Handler>();
 function handlerFor(env: Bindings): Handler {
   let h = handlers.get(env);
   if (!h) {
-    const services = Layer.mergeAll(Items.Default, Devices.Default, Pairings.Default, Auth.Default, TopicClient.Default, Notify.Default, Events.Default);
+    const services = Layer.mergeAll(
+      Items.Default, Devices.Default, Pairings.Default, Auth.Default, TopicClient.Default, Notify.Default, Events.Default,
+      Push.Default, FcmClientLive,
+    );
     h = HttpApp.toWebHandlerLayer(app, services.pipe(Layer.provideMerge(Layer.succeed(Env, env)))).handler;
     handlers.set(env, h);
   }

@@ -47,6 +47,11 @@ export interface DeviceSelfUpdate {
   readonly android_version?: string;
 }
 
+export interface PushTarget {
+  readonly id: string;
+  readonly token: string;
+}
+
 export class Devices extends Effect.Service<Devices>()("lam/Devices", {
   succeed: {
     /** Compares the presented digest with every active candidate before selecting a match. */
@@ -80,6 +85,19 @@ export class Devices extends Effect.Service<Devices>()("lam/Devices", {
       db((d) => d.prepare("SELECT * FROM devices ORDER BY created_at DESC, id DESC").all()).pipe(
         Effect.flatMap(({ results }) => Effect.forEach(results, decodeRow)),
         Effect.map((rows) => rows.map(toSummary)),
+      ),
+
+    pushTargets: () =>
+      db((d) => d.prepare("SELECT id, fcm_token FROM devices WHERE revoked_at IS NULL AND fcm_token IS NOT NULL").all<{
+        id: string;
+        fcm_token: string;
+      }>()).pipe(
+        Effect.map(({ results }) => results.map(({ id, fcm_token }) => ({ id, token: fcm_token }) satisfies PushTarget)),
+      ),
+
+    clearPushToken: (id: string, token: string) =>
+      db((d) => d.prepare("UPDATE devices SET fcm_token = NULL WHERE id = ? AND fcm_token = ?").bind(id, token).run()).pipe(
+        Effect.asVoid,
       ),
 
     rename: (id: string, name: string) =>

@@ -23,15 +23,21 @@ import dev.carraes.lam.ui.detail.*
 import dev.carraes.lam.R
 import kotlinx.coroutines.launch
 import dev.carraes.lam.articles.*
+import dev.carraes.lam.notifications.CriticalNotificationPermission
 
 @Composable
-fun LamApp(container: AppContainer, pairing: PairingViewModel, articleRoute: String? = null, onArticleRouteConsumed: (String) -> Unit = {}) {
+fun LamApp(container: AppContainer, pairing: PairingViewModel, articleRoute: String? = null,
+    onArticleRouteConsumed: (String) -> Unit = {}, itemRoute: String? = null,
+    onItemRouteConsumed: (String) -> Unit = {}) {
     val session by container.deviceSettings.reconciliationSession.collectAsStateWithLifecycle()
+    CriticalNotificationPermission(session != null)
     val owner = viewModel { PairedViewModels() }
     owner.bind(session)
     PairingScreen(pairing) {
         key(session) {
-            CompositionLocalProvider(LocalViewModelStoreOwner provides owner) { PairedApp(container, articleRoute, onArticleRouteConsumed) }
+            CompositionLocalProvider(LocalViewModelStoreOwner provides owner) {
+                PairedApp(container, articleRoute, onArticleRouteConsumed, itemRoute, onItemRouteConsumed)
+            }
         }
     }
 }
@@ -47,7 +53,8 @@ internal class PairedViewModels : ViewModel(), ViewModelStoreOwner {
 }
 
 @Composable
-private fun PairedApp(container: AppContainer, articleRoute: String?, onArticleRouteConsumed: (String) -> Unit) {
+private fun PairedApp(container: AppContainer, articleRoute: String?, onArticleRouteConsumed: (String) -> Unit,
+    itemRoute: String?, onItemRouteConsumed: (String) -> Unit) {
         val requests = viewModel { RequestsViewModel(container.itemRepository, container.lifecycleReconciler::refresh) }
         val history = viewModel { HistoryViewModel(container.itemRepository, container.lifecycleReconciler.completedReconciliations) }
         val articles = viewModel { ArticleViewModel(container.articleRepository) }
@@ -57,6 +64,7 @@ private fun PairedApp(container: AppContainer, articleRoute: String?, onArticleR
         val feedbackScope = rememberCoroutineScope()
         LamNav(state, requests::setQuery, requests::setType, requests::setPriority, requests::clearFilters, requests::refresh,
             articleRoute = articleRoute, onArticleRouteConsumed = onArticleRouteConsumed,
+            itemRoute = itemRoute, onItemRouteConsumed = onItemRouteConsumed,
             onRequestAction = { id, dismiss -> action = id to dismiss },
             historyContent = { onRequests, onSettings ->
                 LifecycleStartEffect(history) {

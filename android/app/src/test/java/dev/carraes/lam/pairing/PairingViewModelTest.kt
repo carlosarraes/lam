@@ -75,6 +75,25 @@ class PairingViewModelTest {
         assertEquals(PairingState.Paired(false), vm.state.value)
     }
 
+    @Test fun pairsWithTheCurrentPushTokenAndRequiresItsRegistrationInTheResponse() = runTest {
+        val store = Store()
+        val repo = PairingRepository(
+            store,
+            { true },
+            DeviceIdentity("Pixel", "0.1.0", "16"),
+            claim = { _, _, request ->
+                assertEquals("fcm-registration", request.fcmToken)
+                response().copy(device = response().device.copy(pushRegistered = true))
+            },
+            pushToken = { "fcm-registration" },
+        )
+
+        val result = repo.pair(PairingPayload.parse(qr(), false))
+
+        assertNull(result.problem)
+        assertEquals("device-credential", store.credential)
+    }
+
     @Test fun claimFailuresHaveDistinctSafeMessagesAndRequireHumanRetry() = runTest {
         val failures = listOf(
             ApiError.Server(409, null, ApiConflictCode.PAIRING_EXPIRED) to PairingProblem.EXPIRED,
@@ -205,7 +224,7 @@ class PairingViewModelTest {
         val api = FakeApi().apply { readError = ApiError.Unauthorized(null) }
         val items = DefaultItemRepository(MemoryStorage(), { api }, store, backgroundScope)
         val pairing = PairingRepository(items.credentialStore, items::refresh, DeviceIdentity("Pixel", "0.1.0", "16"),
-            { _, _, _ -> response() })
+            claim = { _, _, _ -> response() })
         val vm = PairingViewModel(pairing, false, items.syncState)
         runCurrent(); vm.permissionResult(true); vm.onQr(qr()); advanceUntilIdle()
         assertEquals(PairingState.Revoked, vm.state.value)
@@ -248,7 +267,7 @@ class PairingViewModelTest {
 
     private fun repository(store: Store, refresh: suspend () -> Boolean = { true },
         claim: suspend (String, String, PairingClaimRequestDto) -> PairingClaimResponseDto = { _, _, _ -> response() },
-    ) = PairingRepository(store, refresh, DeviceIdentity("Pixel", "0.1.0", "16"), claim)
+    ) = PairingRepository(store, refresh, DeviceIdentity("Pixel", "0.1.0", "16"), claim = claim)
 
     private class Store(val failSave: Boolean = false, emitInitial: Boolean = true) : CredentialStore {
         val server = MutableStateFlow<PairedServer?>(null)

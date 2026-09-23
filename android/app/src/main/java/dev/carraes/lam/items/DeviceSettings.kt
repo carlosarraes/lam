@@ -14,4 +14,5 @@ interface DeviceSettings {
     suspend fun revoke(expectedSession: Long): UnpairResult
     suspend fun eraseLocal(expectedSession: Long): Boolean
     suspend fun diagnosticData(): DiagnosticData
+    suspend fun updatePushToken(token: String): Boolean
 }

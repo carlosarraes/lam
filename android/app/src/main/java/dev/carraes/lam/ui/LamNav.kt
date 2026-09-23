@@ -33,6 +33,8 @@ fun LamNav(state: RequestsState, onQuery: (String) -> Unit, onType: (ItemTypeDto
     articleContent: @Composable (String, () -> Unit) -> Unit = { _, onBack -> androidx.compose.material3.TextButton(onBack) { androidx.compose.material3.Text("Back") } },
     articleRoute: String? = null,
     onArticleRouteConsumed: (String) -> Unit = {},
+    itemRoute: String? = null,
+    onItemRouteConsumed: (String) -> Unit = {},
     detailContent: @Composable (String, () -> Unit) -> Unit = { _, onBack ->
         DecisionDetailScreen(DecisionState(loading = false, loadFailed = true), onBack)
     }) {
@@ -41,6 +43,12 @@ fun LamNav(state: RequestsState, onQuery: (String) -> Unit, onType: (ItemTypeDto
         articleRoute?.let { id ->
             nav.navigate("article/${Uri.encode(id)}") { launchSingleTop = true }
             onArticleRouteConsumed(id)
+        }
+    }
+    LaunchedEffect(itemRoute) {
+        itemRoute?.let { id ->
+            nav.navigate("item/${Uri.encode(id)}") { launchSingleTop = true }
+            onItemRouteConsumed(id)
         }
     }
     fun queue(route: String) { nav.navigate(route) { popUpTo("requests") { saveState = true }; launchSingleTop = true; restoreState = true } }

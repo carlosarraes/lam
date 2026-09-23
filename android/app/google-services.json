@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "273773536447",
+    "project_id": "lam-push-carraes",
+    "storage_bucket": "lam-push-carraes.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:273773536447:android:3a415760c105850975520a",
+        "android_client_info": {
+          "package_name": "dev.carraes.lam"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAiIKz7NNdRDz1MOOCBzgf5nYZ6t6v-F5U"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:273773536447:android:3125c99b01ec0e8075520a",
+        "android_client_info": {
+          "package_name": "dev.carraes.lam.debug"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAiIKz7NNdRDz1MOOCBzgf5nYZ6t6v-F5U"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

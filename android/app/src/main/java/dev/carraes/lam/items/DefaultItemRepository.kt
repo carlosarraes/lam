@@ -39,6 +39,13 @@ internal class DefaultItemRepository(
     private val clock: Clock = Clock.systemUTC(),
     private val connectivity: StateFlow<ConnectivityStatus> = MutableStateFlow(ConnectivityStatus(true, 0)),
 ) : ItemRepository, DeviceSettings {
+    override suspend fun updatePushToken(token: String): Boolean {
+        if (token.isBlank()) return false
+        return operation { session ->
+            session.api.updateDevice(DeviceUpdateDto(fcmToken = FcmTokenUpdate.Set(token))).pushRegistered
+        }
+    }
+
     override suspend fun diagnosticData(): DiagnosticData {
         initialized.await()
         return stateLock.withLock { DiagnosticData(paired?.serverUrl, lastSuccess, storage.counts(), recentErrors.toList()) }

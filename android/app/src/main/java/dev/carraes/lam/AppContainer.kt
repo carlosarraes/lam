@@ -1,26 +1,26 @@
 package dev.carraes.lam
 
 import android.content.Context
-import androidx.room.Room
+import android.util.Log
 import androidx.lifecycle.ProcessLifecycleOwner
-import dev.carraes.lam.items.DefaultItemRepository
-import dev.carraes.lam.items.ItemRepository
-import dev.carraes.lam.items.LamApi
-import dev.carraes.lam.items.LamDatabase
-import dev.carraes.lam.items.RoomItemStorage
+import androidx.room.Room
+import dev.carraes.lam.articles.*
+import dev.carraes.lam.diagnostics.Diagnostics
+import dev.carraes.lam.items.*
+import dev.carraes.lam.notifications.LamNotifications
+import dev.carraes.lam.notifications.currentFirebaseInstallationId
+import dev.carraes.lam.pairing.DeviceIdentity
+import dev.carraes.lam.pairing.PairingRepository
 import dev.carraes.lam.security.CredentialComposition
 import dev.carraes.lam.security.CredentialStore
 import dev.carraes.lam.security.createCredentialComposition
-import dev.carraes.lam.pairing.DeviceIdentity
-import dev.carraes.lam.pairing.PairingRepository
+import dev.carraes.lam.sync.AndroidConnectivityMonitor
+import dev.carraes.lam.sync.LifecycleReconciler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import dev.carraes.lam.sync.LifecycleReconciler
-import dev.carraes.lam.sync.AndroidConnectivityMonitor
-import dev.carraes.lam.items.DeviceSettings
-import dev.carraes.lam.diagnostics.Diagnostics
-import dev.carraes.lam.articles.*
+import kotlinx.coroutines.flow.dropWhile
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 class AppContainer(
@@ -52,6 +52,9 @@ class AppContainer(
         applicationScope.launch {
             items.pairedSession.collect { articleRepository.sessionChanged() }
         }
+        applicationScope.launch {
+            currentFirebaseInstallationId()?.let { Log.i("LamPush", "Startup installation upload: ${items.updatePushToken(it)}") }
+        }
     }
 
     val lifecycleReconciler = LifecycleReconciler(
@@ -61,11 +64,27 @@ class AppContainer(
         synchronizeForeground = articleRepository::reconcileForeground,
     )
 
+    init {
+        applicationScope.launch {
+            lifecycleReconciler.completedReconciliations.dropWhile { it == 0L }.collect {
+                val openCriticalIds = items.openItems.first()
+                    .filter { item -> item.priority == PriorityDto.CRITICAL }
+                    .mapTo(mutableSetOf()) { item -> item.id }
+                LamNotifications(applicationContext).reconcile(openCriticalIds)
+            }
+        }
+    }
+
     val pairingRepository = PairingRepository(
         credentialStore,
         lifecycleReconciler::refresh,
         DeviceIdentity(android.os.Build.MODEL, BuildConfig.VERSION_NAME, android.os.Build.VERSION.RELEASE),
+        pushToken = ::currentFirebaseInstallationId,
     )
+
+    fun registerPushToken(token: String) {
+        applicationScope.launch { Log.i("LamPush", "Callback installation upload: ${items.updatePushToken(token)}") }
+    }
 
     internal fun authenticatedApi(): LamApi? = credentials.api()
 }

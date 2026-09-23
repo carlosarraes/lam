@@ -6,6 +6,7 @@ import { Items } from "../services/Items";
 import { Auth, RequestAuthority } from "../services/Auth";
 import { Events } from "../services/Events";
 import { Notify } from "../services/Notify";
+import { Push } from "../services/Push";
 
 const WAIT_MS = 25_000;
 const POLL_MS = 2_000;
@@ -81,6 +82,7 @@ export const api = HttpRouter.empty.pipe(
       const baseUrl = yield* origin;
       yield* background((yield* Events).publish({ event: "item.created", item_id: item.id, version: item.version, status: item.status }));
       yield* background((yield* Notify).itemCreated(item, baseUrl));
+      yield* background((yield* Push).deliver("item.created", item));
       return yield* HttpServerResponse.json(item, { status: 201 });
     }),
   ),
@@ -96,6 +98,7 @@ export const api = HttpRouter.empty.pipe(
       const { item, changed } = yield* (yield* Items).seen(id, version);
       if (changed) {
         yield* background((yield* Events).publish({ event: "item.closed", item_id: item.id, version: item.version, status: item.status }));
+        yield* background((yield* Push).deliver("item.closed", item));
       }
       return yield* HttpServerResponse.json(item);
     }),
@@ -113,6 +116,7 @@ export const api = HttpRouter.empty.pipe(
       const item = yield* items.create(input);
       const baseUrl = yield* origin;
       yield* background((yield* Notify).itemCreated(item, baseUrl));
+      yield* background((yield* Push).deliver("item.created", item));
       return yield* HttpServerResponse.json(item, { status: 201 });
     }),
   ),
@@ -187,6 +191,7 @@ export const api = HttpRouter.empty.pipe(
       const res = req.source instanceof Request && req.source.body === null ? ({} as Resolution) : yield* HttpServerRequest.schemaBodyJson(Resolution);
       const item = yield* (yield* Items).close(id, { status: "resolved", choice: res.choice, text: res.text, by: authority.kind === "device" ? "phone" : "cli" });
       yield* background((yield* Notify).itemClosed(item));
+      yield* background((yield* Push).deliver("item.closed", item));
       return yield* HttpServerResponse.json(item);
     }),
   ),
@@ -200,6 +205,7 @@ export const api = HttpRouter.empty.pipe(
       const item = yield* (yield* Items).addCheck(id, label);
       const baseUrl = yield* origin;
       yield* background((yield* Notify).checkAdded(item, label, baseUrl));
+      yield* background((yield* Push).deliver("item.changed", item));
       return yield* HttpServerResponse.json(item);
     }),
   ),
@@ -210,7 +216,12 @@ export const api = HttpRouter.empty.pipe(
       const { id, index } = yield* HttpRouter.schemaPathParams(Schema.Struct({ id: Schema.String, index: Schema.NumberFromString }));
       const { done } = yield* HttpServerRequest.schemaBodyJson(Schema.Struct({ done: Schema.Boolean }));
       const item = yield* (yield* Items).setCheck(id, index, done, authority.kind === "device" ? "phone" : "cli");
-      if (item.status !== "open") yield* background((yield* Notify).itemClosed(item));
+      if (item.status !== "open") {
+        yield* background((yield* Notify).itemClosed(item));
+        yield* background((yield* Push).deliver("item.closed", item));
+      } else {
+        yield* background((yield* Push).deliver("item.changed", item));
+      }
       return yield* HttpServerResponse.json(item);
     }),
   ),
@@ -222,6 +233,7 @@ export const api = HttpRouter.empty.pipe(
       const { id } = yield* HttpRouter.schemaPathParams(IdParam);
       const item = yield* (yield* Items).close(id, { status: "retracted", by: "cli" });
       yield* background((yield* Notify).itemClosed(item));
+      yield* background((yield* Push).deliver("item.closed", item));
       return yield* HttpServerResponse.json(item);
     }),
   ),
@@ -232,6 +244,7 @@ export const api = HttpRouter.empty.pipe(
       const { id } = yield* HttpRouter.schemaPathParams(IdParam);
       const item = yield* (yield* Items).close(id, { status: "dismissed", by: authority.kind === "device" ? "phone" : "cli" });
       yield* background((yield* Notify).itemClosed(item));
+      yield* background((yield* Push).deliver("item.closed", item));
       return yield* HttpServerResponse.json(item);
     }),
   ),

@@ -15,6 +15,9 @@ camerax = "1.6.2"
 mlkit-barcode = "17.3.0"
 browser = "1.10.0"
 markdown = "0.41.0"
+firebase-bom = "34.19.0"
+google-services = "4.5.0"
+work = "2.11.2"
 androidx-test-ext = "1.3.0"
 androidx-test-core = "1.7.0"
 espresso = "3.7.0"
@@ -51,6 +54,9 @@ mlkit-barcode = { module = "com.google.mlkit:barcode-scanning", version.ref = "m
 browser = { module = "androidx.browser:browser", version.ref = "browser" }
 markdown-core = { module = "com.mikepenz:multiplatform-markdown-renderer", version.ref = "markdown" }
 markdown-material3 = { module = "com.mikepenz:multiplatform-markdown-renderer-m3", version.ref = "markdown" }
+firebase-bom = { module = "com.google.firebase:firebase-bom", version.ref = "firebase-bom" }
+firebase-messaging = { module = "com.google.firebase:firebase-messaging" }
+work-runtime = { module = "androidx.work:work-runtime-ktx", version.ref = "work" }
 androidx-test-ext-junit = { module = "androidx.test.ext:junit", version.ref = "androidx-test-ext" }
 androidx-test-core = { module = "androidx.test:core", version.ref = "androidx-test-core" }
 espresso-core = { module = "androidx.test.espresso:espresso-core", version.ref = "espresso" }
@@ -61,3 +67,4 @@ android-application = { id = "com.android.application", version.ref = "agp" }
 compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
 ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }
+google-services = { id = "com.google.gms.google-services", version.ref = "google-services" }
