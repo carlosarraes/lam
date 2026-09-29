@@ -120,7 +120,7 @@ fun DecisionDetailScreen(
                         Text(stringResource(R.string.fyi_seen_failed), color = Amber)
                         TextButton(onRefresh, enabled = !state.refreshing && !state.markingSeen) { Text(stringResource(R.string.pairing_retry_sync)) }
                     }
-                    if (item.status == StatusDto.OPEN) {
+                    if (item.status == StatusDto.OPEN || item.canReply) {
                         if (!state.sync.mutationsEnabled || state.loadFailed) {
                             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                 Text(stringResource(when {
@@ -135,8 +135,11 @@ fun DecisionDetailScreen(
                                 TextButton(onRefresh, enabled = !state.refreshing) { Text(stringResource(R.string.pairing_retry_sync)) }
                             }
                         }
-                        if (state.answerFailed) Text(stringResource(if (item.isFyi) R.string.fyi_dismiss_failed else R.string.detail_answer_failed), color = Amber)
-                        if (state.submitting) Text(stringResource(if (item.isFyi) R.string.fyi_dismissing else R.string.detail_sending), modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+                        if (state.answerFailed) Text(stringResource(if (item.isFyi) R.string.fyi_action_failed else R.string.detail_answer_failed), color = Amber)
+                        if (state.submitting) Text(stringResource(R.string.detail_sending), modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+                    }
+                    if (item.isFyi && item.canReply) {
+                        TextButton(onWriteReply, enabled = state.replyEnabled, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.fyi_write_reply)) }
                     }
                     if (item.status != StatusDto.OPEN) {
                         CanonicalOutcome(item)
@@ -185,8 +188,9 @@ fun DecisionActionSheets(state: DecisionState, checklist: ChecklistState?, onCho
     if (confirmation != null) {
         if (confirmation.answer == FinalAnswer.Dismiss) {
             DismissConfirmation(state.actionsEnabled, { onConfirm(confirmation) }, onDismissConfirmation)
-        } else if (state.item?.isFyi == false) AnswerConfirmationSheet(confirmation, state.actionsEnabled, { onConfirm(confirmation) }, onDismissConfirmation)
-    } else if (state.item?.isFyi == false && state.replyOpen) ReplySheet(state, onEditReply, onReviewReply, onDismissReply)
+        } else AnswerConfirmationSheet(confirmation, if (confirmation.answer is FinalAnswer.Text) state.replyEnabled else state.actionsEnabled,
+            { onConfirm(confirmation) }, onDismissConfirmation, isFyi = state.item?.isFyi == true)
+    } else if (state.replyOpen) ReplySheet(state, onEditReply, onReviewReply, onDismissReply)
     else if (state.item?.isFyi == false && state.quickOpen) QuickResponseSheet(state, checklist?.actionsEnabled == true, onChoice, onCheck, onWriteReply, onCloseQuick, snackbar)
 }
 
@@ -196,7 +200,7 @@ private fun CanonicalOutcome(item: Item) {
         verticalArrangement = Arrangement.spacedBy(8.dp)) {
         val status = stringResource(when (item.status) {
             StatusDto.RESOLVED -> R.string.detail_resolved
-            StatusDto.DISMISSED -> if (item.seenAt != null) R.string.detail_seen else R.string.detail_dismissed
+            StatusDto.DISMISSED -> if (item.isFyi && item.responseText != null) R.string.fyi_replied else if (item.seenAt != null) R.string.detail_seen else R.string.detail_dismissed
             StatusDto.RETRACTED -> R.string.detail_retracted
             StatusDto.EXPIRED -> R.string.detail_expired
             StatusDto.OPEN -> R.string.request_open

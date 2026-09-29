@@ -206,13 +206,15 @@ internal class DefaultItemRepository(
 
     override suspend fun answer(id: String, answer: FinalAnswer): Boolean = operation(mutation = true) { session ->
         val canonical = session.api.getItem(id)
-        if (canonical.kind == ItemKindDto.FYI && answer != FinalAnswer.Dismiss) return@operation false
-        var open = false
+        if (canonical.kind == ItemKindDto.FYI && answer != FinalAnswer.Dismiss && answer !is FinalAnswer.Text) return@operation false
+        if (answer is FinalAnswer.Text && (answer.value.isBlank() || answer.value.toByteArray(Charsets.UTF_8).size > 8192)) return@operation false
+        var allowed = false
         if (!commit(session) {
             storage.upsert(listOf(ItemMapper.toEntity(canonical)))
-            open = storage.get(id)?.canonical?.status == StatusDto.OPEN
+            val stored = storage.get(id)?.let(ItemMapper::toItem)
+            allowed = if (answer is FinalAnswer.Text) stored?.canReply == true else stored?.status == StatusDto.OPEN
         }) return@operation false
-        if (!open) {
+        if (!allowed) {
             errorEvents.trySend(ApiError.AlreadyClosed(null))
             return@operation false
         }
@@ -344,7 +346,9 @@ internal class DefaultItemRepository(
             if (session.generation != generation) return false
             observedItems.keys.filter { id ->
                 id != unresolved && items.none { it.canonical.id == id } &&
-                    storage.get(id)?.canonical?.status == StatusDto.OPEN
+                    storage.get(id)?.let { row ->
+                        row.canonical.status == StatusDto.OPEN || ItemMapper.toItem(row).let { it.isFyi && it.canReply }
+                    } == true
             }
         }
         for (id in observedMissing) {

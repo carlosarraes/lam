@@ -315,7 +315,7 @@ impl App {
                     lines.push(Line::from(Span::styled(
                         format!(
                             "{} via {}: {answer}",
-                            i.status,
+                            i.status_label(),
                             i.response_by.as_deref().unwrap_or("?")
                         ),
                         outcome(i).1,
@@ -397,7 +397,7 @@ impl App {
                 ]),
                 Line::from([key("Enter", "keep"), key("Esc", "clear")].concat()),
             ],
-            (Mode::Reply(t), _) => vec![
+            (Mode::Reply { text: t, .. }, _) => vec![
                 Line::from(vec![
                     Span::styled("reply› ", ACCENT),
                     Span::raw(t.clone()),
@@ -405,12 +405,15 @@ impl App {
                 ]),
                 Line::from([key("Enter", "send"), key("Esc", "cancel")].concat()),
             ],
-            (_, Some(i)) if i.is_fyi() && i.status == "open" => {
-                let mut spans = key("Enter", "seen");
+            (_, Some(i)) if i.is_fyi() && i.can_reply() => {
+                let mut spans = key("r", "reply");
+                if i.status == "open" {
+                    spans.extend(key("Enter", "seen"));
+                    spans.extend(key("d", "dismiss"));
+                }
                 if !i.link.is_empty() {
                     spans.extend(key("o", "open"));
                 }
-                spans.extend(key("d", "dismiss"));
                 vec![Line::from(spans), self.nav_line()]
             }
             (_, Some(i)) if i.is_actionable() => {
@@ -536,6 +539,21 @@ fn ellipsis(s: &str, max: usize) -> String {
 pub(super) fn outcome(i: &Item) -> (&'static str, Style, String) {
     if i.status_label() == "Seen" {
         return ("✓", META, "Seen".into());
+    }
+    if i.status_label() == "Replied" {
+        return (
+            "✓",
+            META,
+            ellipsis(
+                i.response_text
+                    .as_deref()
+                    .unwrap_or_default()
+                    .lines()
+                    .next()
+                    .unwrap_or_default(),
+                24,
+            ),
+        );
     }
     let answer = i
         .response_choice
@@ -719,14 +737,14 @@ mod tests {
     }
 
     #[test]
-    fn fyi_renders_information_without_recommendation_or_answer_controls() {
+    fn fyi_renders_optional_reply_without_recommendation_or_completion_controls() {
         let mut a = App::new("host".into());
         a.set_items(vec![super::super::tests::fyi()]);
         let text = screen_text(&render(&a, 120, 24));
         assert!(text.contains("FYI"), "{text}");
         assert!(!text.contains("recommendation missing"), "{text}");
         assert!(!text.contains("Recommendation"), "{text}");
-        assert!(!text.contains("reply"), "{text}");
+        assert!(text.contains("reply"), "{text}");
         assert!(!text.contains("done"), "{text}");
         assert!(text.contains("dismiss"), "{text}");
         assert!(text.contains("0 requests"), "{text}");
@@ -738,6 +756,16 @@ mod tests {
             text.contains("The deployment completed successfully."),
             "{text}"
         );
+    }
+
+    #[test]
+    fn fyi_history_shows_the_saved_reply() {
+        let mut i = super::super::tests::fyi();
+        i.status = "dismissed".into();
+        i.seen_at = Some("2026-09-29T12:00:00Z".into());
+        i.response_text = Some("Keep going".into());
+        assert_eq!(i.status_label(), "Replied");
+        assert_eq!(outcome(&i).2, "Keep going");
     }
 
     #[test]

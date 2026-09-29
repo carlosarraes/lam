@@ -69,7 +69,10 @@ enum Focus {
 #[derive(Debug, PartialEq)]
 enum Mode {
     Normal,
-    Reply(String),
+    Reply {
+        id: String,
+        text: String,
+    },
     /// Live-filtering by title, agent display name, or body.
     Filter,
     ArticleDate(String),
@@ -371,6 +374,14 @@ impl App {
     }
 
     fn reconcile_item(&mut self, item: Item) {
+        if let Some(row) = self
+            .history
+            .items
+            .iter_mut()
+            .find(|row| row.id == item.id && row.version <= item.version)
+        {
+            *row = item.clone();
+        }
         if self
             .reader_item
             .as_ref()
@@ -449,7 +460,7 @@ impl App {
     pub fn handle(&mut self, key: KeyEvent) -> Option<Action> {
         if !matches!(
             self.mode,
-            Mode::Filter | Mode::Reply(_) | Mode::ArticleDate(_)
+            Mode::Filter | Mode::Reply { .. } | Mode::ArticleDate(_)
         ) && key.code == KeyCode::Char('4')
             && key.modifiers.contains(KeyModifiers::CONTROL)
         {
@@ -457,7 +468,7 @@ impl App {
         }
         if !matches!(
             self.mode,
-            Mode::Filter | Mode::Reply(_) | Mode::ArticleDate(_)
+            Mode::Filter | Mode::Reply { .. } | Mode::ArticleDate(_)
         ) && key.code == KeyCode::Char('3')
             && key.modifiers.contains(KeyModifiers::CONTROL)
         {
@@ -518,13 +529,22 @@ impl App {
             }
             return None;
         }
-        if let Mode::Reply(text) = &mut self.mode {
+        if let Mode::Reply { id, text } = &mut self.mode {
             match key.code {
                 KeyCode::Esc => self.mode = Mode::Normal,
                 KeyCode::Enter if !text.trim().is_empty() => {
                     let text = std::mem::take(text);
+                    let id = id.clone();
                     self.mode = Mode::Normal;
-                    let id = self.current()?.id.clone();
+                    if !self
+                        .current()
+                        .is_some_and(|item| item.id == id && item.can_reply())
+                    {
+                        self.set_status(
+                            "Item changed while composing. Refresh and review before replying.",
+                        );
+                        return None;
+                    }
                     return Some(Action::Resolve {
                         id,
                         choice: None,
@@ -663,8 +683,11 @@ impl App {
                 .filter(|i| !i.link.is_empty())
                 .map(|i| Action::OpenLink(i.link.clone())),
             KeyCode::Char('r') => {
-                if self.actionable_current().is_some() {
-                    self.mode = Mode::Reply(String::new());
+                if let Some(item) = self.current().filter(|item| item.can_reply()) {
+                    self.mode = Mode::Reply {
+                        id: item.id.clone(),
+                        text: String::new(),
+                    };
                 }
                 None
             }
@@ -802,6 +825,11 @@ fn refresh_items(app: &mut App, items: Vec<Item>, jobs: &mpsc::Sender<Job>) {
         reader.status == "open" && !app.requests.items.iter().any(|item| item.id == reader.id)
     }) {
         let _ = jobs.send(Job::ReloadItem(reader.id.clone()));
+    } else if let Some(item) = app
+        .current()
+        .filter(|item| item.is_fyi() && item.status != "open" && item.can_reply())
+    {
+        let _ = jobs.send(Job::ReloadItem(item.id.clone()));
     }
     app.set_busy(false);
     app.set_connection_status("live".into());
@@ -929,7 +957,9 @@ pub fn run(silent: bool) -> Result<i32> {
                 Job::Refresh => Ok(()),
                 Job::Resolve { id, choice, text } => client
                     .resolve(&id, &Resolution { choice, text })
-                    .map(|_| ()),
+                    .map(|item| {
+                        let _ = net_tx.send(Msg::Item(Box::new(item)));
+                    }),
                 Job::Dismiss(id) => dismiss(&client, &id, &net_tx),
                 Job::Seen { id, version } => {
                     mark_seen(&client, &id, version, &net_tx);
@@ -1225,7 +1255,7 @@ mod tests {
         for c in ['h', 'l', 'a'] {
             a.handle(key(c));
         }
-        assert_eq!(a.mode, Mode::Reply("hla".into()));
+        assert!(matches!(&a.mode, Mode::Reply { text, .. } if text == "hla"));
         assert_eq!(a.tab, Tab::Requests);
     }
     use super::*;
@@ -1295,12 +1325,71 @@ mod tests {
     }
 
     #[test]
+    fn fyi_reply_is_optional_and_available_after_seen() {
+        for seen in [false, true] {
+            let mut a = app();
+            let mut i = fyi();
+            if seen {
+                i.status = "dismissed".into();
+                i.seen_at = Some("2026-09-29T12:00:00Z".into());
+                a.tab = Tab::History;
+                a.add_history(vec![i.clone()], true);
+            } else {
+                a.set_items(vec![i.clone()]);
+            }
+            a.handle(key('r'));
+            assert!(matches!(a.mode, Mode::Reply { .. }));
+            a.handle(key('y'));
+            assert_eq!(
+                a.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Some(Action::Resolve {
+                    id: i.id,
+                    choice: None,
+                    text: Some("y".into()),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn fyi_reply_never_moves_to_the_next_item_after_refresh() {
+        let mut a = app();
+        a.set_items(vec![fyi(), item("next", "open", &[], "")]);
+        a.handle(key('r'));
+        a.handle(key('y'));
+        a.set_items(vec![item("next", "open", &[], "")]);
+        assert_eq!(a.handle(KeyEvent::from(KeyCode::Enter)), None);
+    }
+
+    #[test]
+    fn seen_fyi_in_history_refreshes_and_reconciles_a_remote_reply() {
+        let mut a = app();
+        let mut i = fyi();
+        i.status = "dismissed".into();
+        i.seen_at = Some("2026-09-29T12:00:00Z".into());
+        a.tab = Tab::History;
+        a.add_history(vec![i.clone()], true);
+        let (tx, rx) = mpsc::channel();
+        refresh_items(&mut a, vec![], &tx);
+        assert!(matches!(rx.try_recv(), Ok(Job::ReloadItem(id)) if id == i.id));
+        i.response_text = Some("Thanks".into());
+        i.version += 1;
+        a.reconcile_item(i);
+        a.handle(key('r'));
+        assert_eq!(a.mode, Mode::Normal);
+        assert_eq!(
+            a.current().unwrap().response_text.as_deref(),
+            Some("Thanks")
+        );
+    }
+
+    #[test]
     fn fyi_selection_is_inert_and_explicit_reader_open_marks_seen() {
         for open in [key('m'), KeyEvent::from(KeyCode::Enter)] {
             let mut a = App::new("host".into());
             a.set_items(vec![item("first", "open", &[], ""), fyi()]);
             assert_eq!(a.handle(key('j')), None);
-            for c in ['1', '2', '3', 'r', ' '] {
+            for c in ['1', '2', '3', ' '] {
                 assert_eq!(a.handle(key(c)), None);
                 assert_eq!(a.mode, Mode::Normal);
             }

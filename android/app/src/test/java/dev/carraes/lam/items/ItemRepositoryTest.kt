@@ -153,17 +153,43 @@ class ItemRepositoryTest {
         assertEquals(1, f.api.submissions)
     }
 
-    @Test fun `FYI answer and check calls are rejected locally while dismiss remains valid`() = runTest {
+    @Test fun `FYI completion choice and check calls are rejected locally while dismiss remains valid`() = runTest {
         val f = fixture()
         f.api.fetched = item().copy(kind = ItemKindDto.FYI)
         f.api.open = listOf(f.api.fetched)
         f.repo.refresh()
         assertFalse(f.repo.answer("a", FinalAnswer.Complete))
         assertFalse(f.repo.answer("a", FinalAnswer.Choice("done")))
-        assertFalse(f.repo.answer("a", FinalAnswer.Text("reply")))
         assertFalse(f.repo.setCheck("a", 0, true))
         assertEquals(0, f.api.submissions)
         assertTrue(f.repo.answer("a", FinalAnswer.Dismiss))
+    }
+
+    @Test fun `seen FYI reply is submitted and stored without reopening the queue`() = runTest {
+        val f = fixture()
+        f.api.fetched = item().copy(kind = ItemKindDto.FYI, status = StatusDto.DISMISSED,
+            seenAt = "2026-09-29T12:00:00Z", responseText = null)
+        f.api.result = f.api.fetched.copy(responseText = "Thanks", responseBy = ResponseByDto.PHONE, version = 2)
+        f.repo.refresh()
+        assertTrue(f.repo.answer("a", FinalAnswer.Text("Thanks")))
+        assertEquals("Thanks", f.repo.item("a").first()!!.responseText)
+        assertEquals(StatusDto.DISMISSED, f.repo.item("a").first()!!.status)
+        f.api.fetched = f.api.result
+        assertFalse(f.repo.answer("a", FinalAnswer.Text("overwrite")))
+        assertEquals(1, f.api.submissions)
+    }
+
+    @Test fun `refresh catches a remote reply while viewing an already seen FYI`() = runTest {
+        val f = fixture()
+        val seen = item().copy(kind = ItemKindDto.FYI, status = StatusDto.DISMISSED,
+            seenAt = "2026-09-29T12:00:00Z", responseText = null)
+        f.store.upsert(listOf(ItemMapper.toEntity(seen)))
+        f.api.open = emptyList()
+        val observer = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { f.repo.item("a").collect {} }
+        f.api.fetched = seen.copy(responseText = "From desktop", version = 2)
+        f.repo.refresh()
+        assertEquals("From desktop", f.repo.item("a").first()!!.responseText)
+        observer.cancel()
     }
     @Test fun `VPN startup waits for observed physical membership then permits fresh reconciliation`() = runTest {
         val network = ConnectivityTracker(null, false)

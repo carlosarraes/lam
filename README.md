@@ -43,6 +43,8 @@ Every item records **who asked**. `lam push` resolves the name in this order: `-
 
 ## CLI
 
+FYIs accept one optional text reply from Android's **Reply** action, `r` in the TUI, or `lam done ID -m "reply"`. Seen FYIs can still be replied to in History. They stay out of the pending queue; Enter still only marks seen. Agents retrieve the saved reply through `lam show ID` → `response_text`. Replies do not automatically wake the sending agent. Retracted, expired, explicitly dismissed, and already-replied FYIs cannot receive another reply.
+
 | cmd | |
 |---|---|
 | `lam push <title> [-n name] [-b body] [-p low\|normal\|critical] [--recommendation TEXT] [-c choice]… [--recommended-choice CHOICE] \| [--check part]… [--link URL] [--ttl 2h] [--wait]` | prints id; every decision requires `--recommendation` (the action and rationale); choices also require an exact `--recommended-choice`; `--check` makes a checklist that resolves when all parts are ticked and is the only exception |

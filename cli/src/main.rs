@@ -116,7 +116,7 @@ enum Cmd {
     },
     /// Show one item as JSON
     Show { id: String },
-    /// Resolve an item from this machine
+    /// Resolve a request, or send an optional FYI reply with --message
     Done {
         id: String,
         choice: Option<String>,

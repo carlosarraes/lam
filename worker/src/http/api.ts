@@ -190,6 +190,9 @@ export const api = HttpRouter.empty.pipe(
       // Older callers send an empty POST to mark an item done. A present body must still decode.
       const res = req.source instanceof Request && req.source.body === null ? ({} as Resolution) : yield* HttpServerRequest.schemaBodyJson(Resolution);
       const item = yield* (yield* Items).close(id, { status: "resolved", choice: res.choice, text: res.text, by: authority.kind === "device" ? "phone" : "cli" });
+      if (item.kind === "fyi") {
+        yield* background((yield* Events).publish({ event: "item.changed", item_id: item.id, version: item.version, status: item.status }));
+      }
       yield* background((yield* Notify).itemClosed(item));
       yield* background((yield* Push).deliver("item.closed", item));
       return yield* HttpServerResponse.json(item);

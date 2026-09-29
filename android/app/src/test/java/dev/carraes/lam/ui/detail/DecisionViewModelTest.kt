@@ -76,17 +76,37 @@ class DecisionViewModelTest {
         assertFalse(vm.state.value.seenFailed)
     }
 
-    @Test fun fyiRejectsReplyChoiceCompletionAndQuickResponseButAllowsExplicitDismiss() = runTest {
+    @Test fun fyiRejectsChoiceCompletionAndQuickResponseButAllowsExplicitDismiss() = runTest {
         val repo = DetailFakeRepository().apply { current.value = detailItem.copy(kind = ItemKindDto.FYI) }
         val vm = DecisionViewModel("request", repo)
         runCurrent()
-        vm.choose("Approve"); vm.complete(); vm.quickResponse(); vm.writeReply()
+        vm.choose("Approve"); vm.complete(); vm.quickResponse()
         assertNull(vm.state.value.confirmation)
         assertFalse(vm.state.value.quickOpen)
         assertFalse(vm.state.value.replyOpen)
         vm.dismissRequest()
         assertEquals(FinalAnswer.Dismiss, vm.state.value.confirmation?.answer)
         assertTrue(repo.seen.isEmpty())
+    }
+
+    @Test fun seenFyiAcceptsOneConfirmedReplyAndClearsComposerAfterRemoteReply() = runTest {
+        val repo = DetailFakeRepository().apply {
+            current.value = detailItem.copy(kind = ItemKindDto.FYI, status = StatusDto.DISMISSED,
+                seenAt = "2026-09-29T12:00:00Z", choices = emptyList())
+        }
+        val vm = DecisionViewModel("request", repo)
+        runCurrent()
+        vm.writeReply()
+        assertTrue(vm.state.value.replyOpen)
+        vm.editReply("Keep going")
+        vm.reviewReply()
+        val confirmation = vm.state.value.confirmation!!
+        vm.confirm(confirmation); vm.confirm(confirmation); runCurrent()
+        assertEquals(listOf(FinalAnswer.Text("Keep going")), repo.answers)
+        repo.current.value = repo.current.value!!.copy(responseText = "From desktop", version = 3)
+        runCurrent()
+        vm.writeReply()
+        assertFalse(vm.state.value.replyOpen)
     }
     @Before fun setup() { Dispatchers.setMain(StandardTestDispatcher()) }
     @After fun teardown() { Dispatchers.resetMain() }

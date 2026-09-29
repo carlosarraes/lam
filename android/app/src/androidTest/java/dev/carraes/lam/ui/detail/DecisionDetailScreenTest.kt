@@ -64,14 +64,14 @@ class DecisionDetailScreenTest {
         compose.onNodeWithText("Quick response").assertDoesNotExist()
         compose.onNodeWithText("Dismiss").performClick()
         compose.onNodeWithText("Dismiss request").performClick()
-        compose.onNodeWithText("Could not confirm dismissal. Refresh to check this FYI before trying again.").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Could not confirm this action. Refresh to check this FYI before trying again.").performScrollTo().assertIsDisplayed()
         compose.onNodeWithTag("markdown-body").assertExists()
         compose.onNodeWithTag("recommendation").assertDoesNotExist()
         compose.onNodeWithText("Done").assertDoesNotExist()
         compose.onNodeWithText("Write another reply").assertDoesNotExist()
         compose.runOnIdle { assertEquals(listOf(FinalAnswer.Dismiss), repository.answers) }
     }
-    @Test fun openingFyiMarksSeenKeepsBodyAndOffersNoReplyControls() {
+    @Test fun openingFyiMarksSeenAndAllowsOneOptionalReply() {
         val repository = DeviceDetailRepository().apply {
             current.value = example.copy(title = "Production rollout update", kind = ItemKindDto.FYI, choices = emptyList(), recommendation = null, recommendedChoice = null)
         }
@@ -86,6 +86,13 @@ class DecisionDetailScreenTest {
         compose.onNodeWithText("Done").assertDoesNotExist()
         compose.onNodeWithText("Write another reply").assertDoesNotExist()
         compose.runOnIdle { assertEquals(1, repository.seen); assertTrue(repository.answers.isEmpty()) }
+        compose.onNodeWithText("Reply").performScrollTo().performClick()
+        compose.onNodeWithTag("reply-input").performTextInput("Thanks, keep going")
+        compose.onNodeWithText("Review reply").performScrollTo().performClick()
+        compose.onNodeWithText("Send reply").performClick()
+        compose.onNodeWithText("Thanks, keep going").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Reply").assertDoesNotExist()
+        compose.runOnIdle { assertEquals(listOf(FinalAnswer.Text("Thanks, keep going")), repository.answers) }
         screenshot("task3-fyi-detail.png")
     }
     @Test fun plainDoneRequiresConfirmationAndCompletesWithoutInventingAReply() {
@@ -285,8 +292,9 @@ private class DeviceDetailRepository : ItemRepository {
     override suspend fun answer(id: String, answer: FinalAnswer): Boolean {
         answers += answer
         if (!answerSucceeds) return false
-        current.value = current.value!!.copy(status = StatusDto.RESOLVED, responseText = (answer as? FinalAnswer.Text)?.value,
-            responseChoice = (answer as? FinalAnswer.Choice)?.value, responseBy = ResponseByDto.PHONE, version = 2)
+        current.value = current.value!!.copy(status = if (current.value!!.isFyi) StatusDto.DISMISSED else StatusDto.RESOLVED,
+            responseText = (answer as? FinalAnswer.Text)?.value,
+            responseChoice = (answer as? FinalAnswer.Choice)?.value, responseBy = ResponseByDto.PHONE, version = current.value!!.version + 1)
         return true
     }
     override suspend fun refresh() = true

@@ -69,6 +69,14 @@ impl Item {
         !self.is_fyi() && self.status == "open"
     }
 
+    pub fn can_reply(&self) -> bool {
+        if !self.is_fyi() {
+            return self.is_actionable();
+        }
+        self.response_text.is_none()
+            && (self.status == "open" || (self.status == "dismissed" && self.seen_at.is_some()))
+    }
+
     pub fn has_recommendation_section(&self) -> bool {
         !self.is_fyi() && self.checks.is_empty()
     }
@@ -84,7 +92,9 @@ impl Item {
     }
 
     pub fn status_label(&self) -> &str {
-        if self.is_fyi() && self.seen_at.is_some() {
+        if self.is_fyi() && self.response_text.is_some() {
+            "Replied"
+        } else if self.is_fyi() && self.seen_at.is_some() {
             "Seen"
         } else {
             &self.status

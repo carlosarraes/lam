@@ -25,5 +25,8 @@ data class Item(
     val seenAt: String? = null,
 ) {
     val isFyi: Boolean get() = kind == ItemKindDto.FYI
+    val canReply: Boolean get() = if (isFyi) responseText == null &&
+        (status == StatusDto.OPEN || (status == StatusDto.DISMISSED && seenAt != null))
+        else status == StatusDto.OPEN
     val agentDisplay: String get() = name?.takeIf(String::isNotBlank) ?: "$sourceHost:$sourceProject"
 }

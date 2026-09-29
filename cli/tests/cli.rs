@@ -99,6 +99,43 @@ fn fyi(id: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn fyi_reply_uses_text_and_show_returns_saved_reply() {
+    let (server, dir) = setup().await;
+    let mut replied = fyi("news1");
+    replied["status"] = "dismissed".into();
+    replied["seen_at"] = "2026-09-29T12:00:00Z".into();
+    replied["response_text"] = "Keep going".into();
+    replied["response_by"] = "cli".into();
+    replied["version"] = 2.into();
+    Mock::given(method("POST"))
+        .and(path("/items/news1/resolve"))
+        .and(header("authorization", "Bearer tok"))
+        .and(body_json(serde_json::json!({"text": "Keep going"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&replied))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/items/news1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&replied))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let reply = lam(&dir, &["done", "news1", "-m", "Keep going"]);
+    assert!(
+        reply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reply.stderr)
+    );
+    let shown = lam(&dir, &["show", "news1"]);
+    assert!(shown.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(value["response_text"], "Keep going");
+    assert_eq!(value["kind"], "fyi");
+    assert_eq!(value["status"], "dismissed");
+}
+
+#[tokio::test]
 async fn fyi_push_omits_decision_fields_and_never_waits() {
     let (server, dir) = setup().await;
     Mock::given(method("POST"))

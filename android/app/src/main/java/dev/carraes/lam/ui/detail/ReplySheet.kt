@@ -23,13 +23,13 @@ fun ReplySheet(state: DecisionState, onEdit: (String) -> Unit, onReview: () -> U
     val focus = remember { FocusRequester() }
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), shape = RoundedCornerShape(topStart = 12.dp, topEnd = 12.dp)) {
         Column(Modifier.fillMaxWidth().imePadding().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text(stringResource(R.string.detail_write_reply), style = MaterialTheme.typography.titleLarge)
-            Text(stringResource(R.string.detail_reply_resolves), style = MaterialTheme.typography.bodyMedium)
+            Text(stringResource(if (state.item?.isFyi == true) R.string.fyi_write_reply else R.string.detail_write_reply), style = MaterialTheme.typography.titleLarge)
+            Text(stringResource(if (state.item?.isFyi == true) R.string.fyi_reply_optional else R.string.detail_reply_resolves), style = MaterialTheme.typography.bodyMedium)
             OutlinedTextField(state.reply, onEdit, modifier = Modifier.fillMaxWidth().testTag("reply-input").focusRequester(focus),
                 label = { Text(stringResource(R.string.detail_reply_label)) }, minLines = 4, maxLines = 10,
                 enabled = !state.submitting, isError = state.replyBytes > 8192, shape = RoundedCornerShape(8.dp),
                 supportingText = { Text(stringResource(R.string.detail_reply_bytes, state.replyBytes)) })
-            Button(onReview, enabled = state.actionsEnabled && state.replyValid, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+            Button(onReview, enabled = state.replyEnabled && state.replyValid, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
                 Text(stringResource(R.string.detail_review_reply))
             }
         }
@@ -39,7 +39,7 @@ fun ReplySheet(state: DecisionState, onEdit: (String) -> Unit, onReview: () -> U
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AnswerConfirmationSheet(confirmation: AnswerConfirmation, enabled: Boolean, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+fun AnswerConfirmationSheet(confirmation: AnswerConfirmation, enabled: Boolean, onConfirm: () -> Unit, onDismiss: () -> Unit, isFyi: Boolean = false) {
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), shape = RoundedCornerShape(topStart = 12.dp, topEnd = 12.dp)) {
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             Text(when (val answer = confirmation.answer) {
@@ -48,7 +48,7 @@ fun AnswerConfirmationSheet(confirmation: AnswerConfirmation, enabled: Boolean, 
                 else -> stringResource(R.string.detail_confirm_reply)
             }, style = MaterialTheme.typography.titleLarge)
             if (confirmation.answer is FinalAnswer.Text) Text(confirmation.answer.value)
-            Text(stringResource(R.string.detail_reply_resolves), style = MaterialTheme.typography.bodyMedium)
+            Text(stringResource(if (isFyi) R.string.fyi_reply_optional else R.string.detail_reply_resolves), style = MaterialTheme.typography.bodyMedium)
             Button(onConfirm, enabled = enabled, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(8.dp)) {
                 Text(stringResource(if (confirmation.answer == FinalAnswer.Complete) R.string.detail_send_done else R.string.detail_send_reply))
             }

@@ -359,14 +359,27 @@ export class Items extends Effect.Service<Items>()("lam/Items", {
           : Effect.succeed({ checks: [...item.checks, { label, done: false, at: null }], resolve: false, by: "cli" as const }),
       ),
 
-    /** Transitions an open, unexpired item; NotFound if missing, AlreadyClosed otherwise. */
+    /** Closes an open item, or saves the first text reply on an open/seen FYI. */
     close: (id: string, c: Closing) =>
       Effect.gen(function* () {
         const current = yield* Items.get(id);
-        if (current.kind === "fyi" && c.status === "resolved") {
-          return yield* new BadRequest({ message: "FYIs cannot be answered" });
-        }
         const now = new Date().toISOString();
+        if (current.kind === "fyi" && c.status === "resolved") {
+          const text = c.text?.trim();
+          if (c.choice !== undefined || !text) {
+            return yield* new BadRequest({ message: "FYIs accept only a nonblank text reply" });
+          }
+          // A read FYI is already in history. Keep it informational, and never overwrite a reply.
+          const result = yield* db((d) => d.prepare(
+            `UPDATE items SET status = 'dismissed', response_text = ?, response_by = ?,
+                seen_at = COALESCE(seen_at, ?), resolved_at = COALESCE(resolved_at, ?), version = version + 1
+             WHERE id = ? AND kind = 'fyi' AND response_text IS NULL
+               AND ((status = 'open' AND (expires_at IS NULL OR expires_at > ?))
+                 OR (status = 'dismissed' AND seen_at IS NOT NULL))`,
+          ).bind(text, c.by, now, now, id, now).run());
+          if (!result.meta.changes) return yield* new AlreadyClosed({ id });
+          return yield* Items.get(id);
+        }
         const result = yield* db((d) =>
           d
             .prepare(

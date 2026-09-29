@@ -367,13 +367,68 @@ describe("FYI lifecycle", () => {
     expect(stored).toEqual({ status: "open", version: 0, seen_at: null });
   });
 
-  it("rejects every answering and check mutation for an FYI while preserving explicit dismiss", async () => {
+  it.each([false, true])("stores one optional FYI reply, including after seen=%s", async (seen) => {
+    const fyi = await createFyi();
+    if (seen) await SELF.fetch(`http://lam/v2/items/${fyi.id}/seen`, typedJson({ version: 0 }));
+    const response = await SELF.fetch(`http://lam/items/${fyi.id}/resolve`, typedJson({ text: "Thanks, keep going" }));
+    expect(response.status).toBe(200);
+    const replied = await response.json<any>();
+    expect(replied).toMatchObject({ kind: "fyi", status: "dismissed", response_text: "Thanks, keep going", response_choice: null, response_by: "cli", version: seen ? 2 : 1 });
+    expect(replied.seen_at).not.toBeNull();
+    expect((await SELF.fetch(`http://lam/items/${fyi.id}/resolve`, typedJson({ text: "overwrite" }))).status).toBe(409);
+    const canonical = await SELF.fetch(`http://lam/items/${fyi.id}`, { headers: AUTH });
+    expect(await canonical.json()).toMatchObject({ response_text: "Thanks, keep going", version: replied.version });
+  });
+
+  it("publishes an FYI reply event for paired clients", async () => {
+    const fyi = await createFyi();
+    await SELF.fetch(`http://lam/v2/items/${fyi.id}/seen`, typedJson({ version: 0 }));
+    const socket = await connectEvents();
+    const event = nextEvent(socket);
+    const response = await SELF.fetch(`http://lam/items/${fyi.id}/resolve`, { ...typedJson({ text: "Thanks" }), headers: { ...await registerDevice(), "Content-Type": "application/json" } });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ response_by: "phone" });
+    expect(await event).toMatchObject({ item_id: fyi.id, event: "item.changed", version: 2 });
+    socket.close();
+  });
+
+  it("accepts only one concurrent FYI reply", async () => {
+    const fyi = await createFyi();
+    const results = await Promise.all(["first", "second"].map(text =>
+      SELF.fetch(`http://lam/items/${fyi.id}/resolve`, typedJson({ text }))));
+    expect(results.map(response => response.status).sort()).toEqual([200, 409]);
+    const winner = await results.find(response => response.status === 200)!.json<any>();
+    const stored = await env.DB.prepare("SELECT response_text, version FROM items WHERE id = ?").bind(fyi.id).first();
+    expect(stored).toEqual({ response_text: winner.response_text, version: 1 });
+  });
+
+  it("accepts an item-token FYI reply after seen and preserves the seen timestamp", async () => {
+    const fyi = await createFyi();
+    const seen = await (await SELF.fetch(`http://lam/v2/items/${fyi.id}/seen`, typedJson({ version: 0 }))).json<any>();
+    const response = await SELF.fetch(`http://lam/r/${fyi.id}?t=${await itemToken(fyi.id)}`, {
+      method: "POST", body: new URLSearchParams({ text: "Thanks" }),
+    });
+    expect(response.status).toBe(200);
+    const canonical = await (await SELF.fetch(`http://lam/items/${fyi.id}`, { headers: AUTH })).json<any>();
+    expect(canonical).toMatchObject({ response_text: "Thanks", response_by: "phone", seen_at: seen.seen_at, resolved_at: seen.resolved_at });
+  });
+
+  it.each([{}, { text: " \n " }, { choice: "Done" }, { text: "reply", choice: "Done" }])("rejects non-text FYI answers: %j", async (body) => {
+    const fyi = await createFyi();
+    expect((await SELF.fetch(`http://lam/items/${fyi.id}/resolve`, typedJson(body))).status).toBe(400);
+  });
+
+  it.each(["retracted", "expired", "dismissed"])("does not reply to an unseen %s FYI", async (status) => {
+    const fyi = await createFyi();
+    await env.DB.prepare("UPDATE items SET status = ? WHERE id = ?").bind(status, fyi.id).run();
+    expect((await SELF.fetch(`http://lam/items/${fyi.id}/resolve`, typedJson({ text: "reply" }))).status).toBe(409);
+  });
+
+  it("rejects choice and check mutations for an FYI while preserving explicit dismiss", async () => {
     const endpoints: Array<(id: string, token: string) => Promise<Response>> = [
-      (id) => SELF.fetch(`http://lam/items/${id}/resolve`, typedJson({ text: "answer" })),
       (id) => SELF.fetch(`http://lam/items/${id}/checks`, typedJson({ label: "check" })),
       (id) => SELF.fetch(`http://lam/items/${id}/checks/0`, typedJson({ done: true })),
       (id, token) => SELF.fetch(`http://lam/a/${id}/Done?t=${token}`, { method: "POST" }),
-      (id, token) => SELF.fetch(`http://lam/r/${id}?t=${token}`, { method: "POST", body: new URLSearchParams({ text: "answer" }) }),
       (id, token) => SELF.fetch(`http://lam/r/${id}/checks/0?t=${token}`, { method: "POST", body: new URLSearchParams({ done: "true" }) }),
     ];
 

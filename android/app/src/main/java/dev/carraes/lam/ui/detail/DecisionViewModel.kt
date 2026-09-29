@@ -26,6 +26,7 @@ data class DecisionState(
 ) {
     val missing: Boolean get() = item == null && !loading && !loadFailed
     val actionsEnabled: Boolean get() = item?.status == StatusDto.OPEN && sync.mutationsEnabled && !submitting && !markingSeen && !loadFailed
+    val replyEnabled: Boolean get() = item?.canReply == true && sync.mutationsEnabled && !submitting && !markingSeen && !loadFailed
     val replyBytes: Int get() = reply.toByteArray(Charsets.UTF_8).size
     val replyValid: Boolean get() = reply.isNotBlank() && replyBytes <= 8 * 1024
 }
@@ -47,10 +48,13 @@ class DecisionViewModel(
                 mutableState.update { old ->
                     val closed = item?.status != StatusDto.OPEN
                     old.copy(item = item, sync = sync,
-                        confirmation = old.confirmation?.takeIf { !closed && sync.mutationsEnabled && it.version == item.version },
-                        replyOpen = old.replyOpen && !closed,
+                        confirmation = old.confirmation?.takeIf {
+                            (if (it.answer is FinalAnswer.Text) item?.canReply == true else !closed) &&
+                                sync.mutationsEnabled && it.version == item?.version
+                        },
+                        replyOpen = old.replyOpen && item?.canReply == true,
                         quickOpen = old.quickOpen && !closed && sync.mutationsEnabled,
-                        reply = if (closed) "" else old.reply)
+                        reply = if (item?.canReply == true) old.reply else "")
                 }
             }
         }
@@ -132,7 +136,7 @@ class DecisionViewModel(
     }
 
     fun writeReply() {
-        if (canAnswer()) mutableState.update { it.copy(replyOpen = true, answerFailed = false) }
+        if (state.value.replyEnabled) mutableState.update { it.copy(replyOpen = true, answerFailed = false) }
     }
 
     fun editReply(text: String) {
@@ -141,7 +145,7 @@ class DecisionViewModel(
 
     fun reviewReply() {
         val current = state.value
-        if (!canAnswer() || !current.replyOpen || !current.replyValid) return
+        if (!current.replyEnabled || !current.replyOpen || !current.replyValid) return
         requestConfirmation(FinalAnswer.Text(current.reply), current.item!!.version)
     }
 
@@ -155,8 +159,9 @@ class DecisionViewModel(
 
     fun confirm(confirmation: AnswerConfirmation) {
         val current = state.value
-        if (!current.actionsEnabled || !repository.syncState.value.mutationsEnabled ||
-            (current.item?.isFyi == true && confirmation.answer != FinalAnswer.Dismiss) ||
+        val enabled = if (confirmation.answer is FinalAnswer.Text) current.replyEnabled else current.actionsEnabled
+        if (!enabled || !repository.syncState.value.mutationsEnabled ||
+            (current.item?.isFyi == true && confirmation.answer != FinalAnswer.Dismiss && confirmation.answer !is FinalAnswer.Text) ||
             current.confirmation != confirmation || current.item?.version != confirmation.version) return
         // Consume synchronously, before launching, so two taps cannot start two repository operations.
         mutableState.update { it.copy(confirmation = null, replyOpen = false, quickOpen = false, submitting = true, answerFailed = false) }

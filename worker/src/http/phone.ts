@@ -184,6 +184,9 @@ export const phone = HttpRouter.empty.pipe(
       const { id } = yield* HttpRouter.schemaPathParams(IdParam);
       const { text } = yield* HttpServerRequest.schemaBodyUrlParams(Schema.Struct({ text: ReplyText }));
       const item = yield* (yield* Items).close(id, { status: "resolved", text: text.trim(), by: "phone" });
+      if (item.kind === "fyi") {
+        yield* background((yield* Events).publish({ event: "item.changed", item_id: item.id, version: item.version, status: item.status }));
+      }
       yield* background((yield* Notify).itemClosed(item));
       yield* background((yield* Push).deliver("item.closed", item));
       return HttpServerResponse.text(`sent: ${text}`);

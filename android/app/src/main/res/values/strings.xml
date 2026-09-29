@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="fyi_write_reply">Reply</string>
+    <string name="fyi_action_failed">Could not confirm this action. Refresh to check this FYI before trying again.</string>
+    <string name="fyi_replied">Replied</string>
+    <string name="fyi_reply_optional">Save an optional reply with this FYI. This does not notify the agent automatically.</string>
     <string name="articles_title">Articles</string>
     <string name="articles_search">Search articles</string>
     <string name="articles_all">All</string>
