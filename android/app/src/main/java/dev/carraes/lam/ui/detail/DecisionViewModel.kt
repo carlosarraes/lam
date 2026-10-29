@@ -23,10 +23,12 @@ data class DecisionState(
     val confirmation: AnswerConfirmation? = null,
     val markingSeen: Boolean = false,
     val seenFailed: Boolean = false,
+    val movingPending: Boolean = false,
+    val pendingFailed: Boolean = false,
 ) {
     val missing: Boolean get() = item == null && !loading && !loadFailed
-    val actionsEnabled: Boolean get() = item?.status == StatusDto.OPEN && sync.mutationsEnabled && !submitting && !markingSeen && !loadFailed
-    val replyEnabled: Boolean get() = item?.canReply == true && sync.mutationsEnabled && !submitting && !markingSeen && !loadFailed
+    val actionsEnabled: Boolean get() = item?.status == StatusDto.OPEN && sync.mutationsEnabled && !submitting && !markingSeen && !movingPending && !loadFailed
+    val replyEnabled: Boolean get() = item?.canReply == true && sync.mutationsEnabled && !submitting && !markingSeen && !movingPending && !loadFailed
     val replyBytes: Int get() = reply.toByteArray(Charsets.UTF_8).size
     val replyValid: Boolean get() = reply.isNotBlank() && replyBytes <= 8 * 1024
 }
@@ -62,7 +64,7 @@ class DecisionViewModel(
     }
 
     fun refresh() {
-        if (state.value.refreshing || state.value.submitting || state.value.markingSeen) return
+        if (state.value.refreshing || state.value.submitting || state.value.markingSeen || state.value.movingPending) return
         mutableState.update { it.copy(refreshing = true, loading = it.item == null, confirmation = null) }
         viewModelScope.launch {
             var succeeded = false
@@ -104,6 +106,26 @@ class DecisionViewModel(
             succeeded = false
         } finally {
             mutableState.update { it.copy(markingSeen = false, seenFailed = !succeeded) }
+        }
+    }
+
+    fun togglePending() {
+        val current = state.value
+        if (!current.actionsEnabled || current.refreshing || !repository.syncState.value.mutationsEnabled) return
+        val pending = current.item!!.pendingAt == null
+        mutableState.update { it.copy(movingPending = true, pendingFailed = false,
+            confirmation = null, replyOpen = false, quickOpen = false) }
+        viewModelScope.launch {
+            var succeeded = false
+            try {
+                succeeded = repository.setPending(id, pending)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // The repository reconciles writes whose server outcome is uncertain.
+            } finally {
+                mutableState.update { it.copy(movingPending = false, pendingFailed = !succeeded) }
+            }
         }
     }
 

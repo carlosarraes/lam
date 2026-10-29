@@ -852,6 +852,7 @@ internal class FakeCredentials : CredentialStore {
 
 internal class FakeApi : LamApi {
     var deviceUpdate: DeviceUpdateDto? = null
+    override suspend fun setPending(id: String, pending: Boolean) = write("pending:$id:$pending")
     override suspend fun markSeen(id: String, version: Long) = write("seen:$id:$version")
     var beforeRevoke: suspend () -> Unit = {}
     var revokeError: ApiError? = null

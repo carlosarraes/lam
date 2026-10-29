@@ -41,7 +41,8 @@ fun DecisionDetailScreen(viewModel: DecisionViewModel, onBack: () -> Unit, check
         onQuickResponse = viewModel::quickResponse, onDismissRequest = viewModel::dismissRequest,
         onCloseQuick = viewModel::closeQuickResponse, checklist = checks,
         onCheck = { index, done -> checklist?.setCheck(index, done) },
-        onConsumeFailure = { checklist?.consumeFailure(it) }, onComplete = viewModel::complete)
+        onConsumeFailure = { checklist?.consumeFailure(it) }, onComplete = viewModel::complete,
+        onTogglePending = viewModel::togglePending)
 }
 
 @Composable
@@ -64,6 +65,7 @@ fun DecisionDetailScreen(
     onCheck: (Int, Boolean) -> Unit = { _, _ -> },
     onConsumeFailure: (Long) -> Unit = {},
     onComplete: () -> Unit = {},
+    onTogglePending: () -> Unit = {},
 ) {
     val context = LocalContext.current
     var destination by rememberSaveable(state.item?.id) { mutableStateOf<String?>(null) }
@@ -84,12 +86,17 @@ fun DecisionDetailScreen(
             Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 IconButton(onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.back)) }
                 Text(stringResource(if (state.item?.isFyi == true) R.string.fyi_detail else R.string.request_detail), style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-                TextButton(onRefresh, enabled = !state.refreshing && !state.submitting) { Text(stringResource(R.string.detail_refresh)) }
+                TextButton(onRefresh, enabled = !state.refreshing && !state.submitting && !state.movingPending) { Text(stringResource(R.string.detail_refresh)) }
                 Box {
                     IconButton({ menu = true }, enabled = state.actionsEnabled && checklist?.saving != true) {
                         Icon(Icons.Default.MoreVert, stringResource(R.string.more_actions))
                     }
                     DropdownMenu(menu, { menu = false }) {
+                        if (state.item?.status == StatusDto.OPEN) DropdownMenuItem(
+                            text = { Text(stringResource(if (state.item.pendingAt == null) R.string.move_to_pending else R.string.back_to_requests)) },
+                            enabled = state.actionsEnabled && !state.refreshing && checklist?.saving != true,
+                            onClick = { menu = false; onTogglePending() },
+                        )
                         if (state.item?.isFyi == false) DropdownMenuItem(text = { Text(stringResource(R.string.quick_response)) }, onClick = { menu = false; onQuickResponse() })
                         DropdownMenuItem(text = { Text(stringResource(R.string.dismiss)) }, onClick = { menu = false; onDismissRequest() })
                     }
@@ -136,6 +143,8 @@ fun DecisionDetailScreen(
                             }
                         }
                         if (state.answerFailed) Text(stringResource(if (item.isFyi) R.string.fyi_action_failed else R.string.detail_answer_failed), color = Amber)
+                        if (state.pendingFailed) Text(stringResource(R.string.pending_action_failed), color = Amber)
+                        if (state.movingPending) Text(stringResource(R.string.pending_moving), modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
                         if (state.submitting) Text(stringResource(R.string.detail_sending), modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
                     }
                     if (item.isFyi && item.canReply) {

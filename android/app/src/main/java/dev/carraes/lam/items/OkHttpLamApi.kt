@@ -94,6 +94,12 @@ class OkHttpLamApi(
         serializer = ItemDto.serializer(),
     )
 
+    override suspend fun setPending(id: String, pending: Boolean): ItemDto = postJson(
+        segments = arrayOf("v2", "items", id, "pending"),
+        body = buildJsonObject { put("pending", pending) }.toString(),
+        serializer = ItemDto.serializer(),
+    )
+
     override suspend fun markSeen(id: String, version: Long): ItemDto = postJson(
         segments = arrayOf("v2", "items", id, "seen"),
         body = buildJsonObject { put("version", version) }.toString(),

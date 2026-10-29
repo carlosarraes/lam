@@ -279,6 +279,25 @@ internal class DefaultItemRepository(
         }
     }
 
+    override suspend fun setPending(id: String, pending: Boolean): Boolean = operation(mutation = true) { session ->
+        val snapshot = stateLock.withLock {
+            if (session.generation != generation) null else storage.get(id)?.canonical
+        } ?: return@operation false
+        if (snapshot.status != StatusDto.OPEN || !prepareSubmission(session, id)) return@operation false
+        try {
+            val canonical = session.api.setPending(id, pending)
+            commit(session) {
+                storage.upsert(listOf(ItemMapper.toEntity(canonical)))
+                unresolvedFinalAnswer = null
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            mutationFailed(session, id, error, finalAnswer = true)
+            false
+        }
+    }
+
     override suspend fun markSeen(id: String, version: Long): Boolean = operation(mutation = true) { session ->
         val snapshot = stateLock.withLock {
             if (session.generation != generation) null else storage.get(id)?.canonical

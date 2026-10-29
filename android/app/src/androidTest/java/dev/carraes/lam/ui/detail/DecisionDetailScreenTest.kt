@@ -301,6 +301,7 @@ private class DeviceDetailRepository : ItemRepository {
     override fun history(query: HistoryQuery) = flowOf(emptyList<Item>())
     override val cachedHistory = flowOf(emptyList<Item>())
     override suspend fun refreshHistory(query: HistoryQuery, cursor: String?) = HistoryResult(false, null)
+    override suspend fun setPending(id: String, pending: Boolean) = false
     override suspend fun setCheck(id: String, index: Int, done: Boolean) = false
     override suspend fun unpair() = Unit
     var seen = 0

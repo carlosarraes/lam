@@ -162,6 +162,7 @@ internal class GestureRepository : ItemRepository {
             responseText = (answer as? FinalAnswer.Text)?.value, version = current.value!!.version + 1)
         return true
     }
+    override suspend fun setPending(id: String, pending: Boolean) = false
     override suspend fun setCheck(id: String, index: Int, done: Boolean): Boolean {
         if (!checkSucceeds) return false
         val item = current.value!!

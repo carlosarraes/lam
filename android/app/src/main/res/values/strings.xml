@@ -6,6 +6,10 @@
     <string name="fyi_reply_optional">Save an optional reply with this FYI. This does not notify the agent automatically.</string>
     <string name="app_name">lam</string>
     <string name="pending_title">Pending</string>
+    <string name="move_to_pending">Move to pending</string>
+    <string name="back_to_requests">Back to requests</string>
+    <string name="pending_action_failed">Could not confirm the move. Refresh to check the current item before trying again.</string>
+    <string name="pending_moving">Moving item…</string>
     <string name="pending_search">Search pending</string>
     <string name="pending_refresh">Refresh pending</string>
     <string name="pending_loading">Loading pending items…</string>

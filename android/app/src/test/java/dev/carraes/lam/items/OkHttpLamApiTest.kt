@@ -19,6 +19,45 @@ import org.junit.Before
 import org.junit.Test
 
 class OkHttpLamApiTest {
+    @Test fun `moving to pending posts authenticated boolean and parses canonical item`() = runTest {
+        val timestamp = "2026-09-04T12:00:00Z"
+        server.enqueue(jsonResponse(body = ITEM_JSON.replace("\"id\":", "\"pending_at\":\"$timestamp\",\"id\":")))
+
+        val result = api.setPending("item /?#", true)
+
+        assertEquals(ITEM.copy(pendingAt = timestamp), result)
+        server.takeRequest().apply {
+            assertEquals("POST", method)
+            assertEquals("/api/v2/items/item%20%2F%3F%23/pending", target)
+            assertEquals("{\"pending\":true}", body!!.utf8())
+            assertEquals("Bearer device-credential", headers["Authorization"])
+            assertEquals("application/json; charset=utf-8", headers["Content-Type"])
+        }
+        assertEquals(1, server.requestCount)
+    }
+
+    @Test fun `back to requests posts false and parses cleared timestamp`() = runTest {
+        server.enqueue(jsonResponse(body = ITEM_JSON.replace("\"id\":", "\"pending_at\":null,\"id\":")))
+
+        assertEquals(ITEM, api.setPending("request", false))
+
+        server.takeRequest().apply {
+            assertEquals("POST", method)
+            assertEquals("/api/v2/items/request/pending", target)
+            assertEquals("{\"pending\":false}", body!!.utf8())
+        }
+    }
+
+    @Test fun `pending server error is surfaced without replay and redacts credentials`() = runTest {
+        server.enqueue(jsonResponse(503, "device-credential unavailable"))
+
+        val error = expectError<ApiError.Server> { api.setPending("request", true) }
+
+        assertEquals(503, error.statusCode)
+        assertEquals("[redacted] unavailable", error.responseBody)
+        assertEquals(1, server.requestCount)
+    }
+
     @Test fun `pending listing selects open pending items and retains their timestamp`() = runTest {
         val timestamp = "2026-09-04T12:00:00Z"
         val pendingJson = ITEM_JSON.replace("\"id\":", "\"pending_at\":\"$timestamp\",\"id\":")

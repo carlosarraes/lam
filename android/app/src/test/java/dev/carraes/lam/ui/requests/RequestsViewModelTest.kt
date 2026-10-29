@@ -176,6 +176,7 @@ internal class RequestsFakeRepository : ItemRepository {
     override suspend fun refreshItem(id: String) = false
     override suspend fun refreshHistory(query: HistoryQuery, cursor: String?) = HistoryResult(false, null)
     override suspend fun answer(id: String, answer: FinalAnswer) = false
+    override suspend fun setPending(id: String, pending: Boolean) = false
     override suspend fun setCheck(id: String, index: Int, done: Boolean) = false
     override suspend fun unpair() = Unit
     override suspend fun markSeen(id: String, version: Long) = false

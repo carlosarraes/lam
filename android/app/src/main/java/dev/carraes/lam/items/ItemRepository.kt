@@ -30,6 +30,7 @@ interface ItemRepository {
     suspend fun refresh(): Boolean
     suspend fun refreshItem(id: String): Boolean
     suspend fun markSeen(id: String, version: Long): Boolean
+    suspend fun setPending(id: String, pending: Boolean): Boolean
     suspend fun refreshHistory(query: HistoryQuery = HistoryQuery(), cursor: String? = null): HistoryResult
     suspend fun answer(id: String, answer: FinalAnswer): Boolean
     suspend fun setCheck(id: String, index: Int, done: Boolean): Boolean
