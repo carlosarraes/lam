@@ -58,17 +58,26 @@ private fun PairedApp(container: AppContainer, itemRoute: String?, onItemRouteCo
         var action by remember { mutableStateOf<Pair<String, Boolean>?>(null) }
         val snackbar = remember { SnackbarHostState() }
         val feedbackScope = rememberCoroutineScope()
+        val pendingFailed = stringResource(R.string.pending_action_failed)
+        LaunchedEffect(requests) {
+            requests.pendingFailures.collect { snackbar.showSnackbar(pendingFailed) }
+        }
         LamNav(state, requests::setQuery, requests::setType, requests::setPriority, requests::clearFilters, requests::refresh,
             itemRoute = itemRoute, onItemRouteConsumed = onItemRouteConsumed,
             onRequestAction = { id, dismiss -> action = id to dismiss },
+            onTogglePending = requests::togglePending,
             pendingContent = { onRequests, onHistory, onSettings, onItem ->
                 val pending = viewModel(key = "pending") {
                     RequestsViewModel(container.itemRepository, container.lifecycleReconciler::refresh, pending = true)
                 }
                 val pendingState by pending.state.collectAsStateWithLifecycle()
+                LaunchedEffect(pending) {
+                    pending.pendingFailures.collect { snackbar.showSnackbar(pendingFailed) }
+                }
                 dev.carraes.lam.ui.requests.RequestsScreen(pendingState, pending::setQuery, pending::setType, pending::setPriority,
                     pending::clearFilters, pending::refresh, onHistory, onSettings, onItem,
-                    onQuickResponse = { action = it to false }, onDismiss = { action = it to true }, onRequests = onRequests)
+                    onQuickResponse = { action = it to false }, onDismiss = { action = it to true }, onRequests = onRequests,
+                    onTogglePending = pending::togglePending)
             },
             historyContent = { onRequests, onSettings ->
                 LifecycleStartEffect(history) {

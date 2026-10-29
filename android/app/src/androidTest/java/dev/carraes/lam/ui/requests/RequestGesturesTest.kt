@@ -27,7 +27,43 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 @OptIn(ExperimentalTestApi::class)
 class RequestGesturesTest {
-    @Test fun fyiHasOnlyDismissAccessibilityAndSwipeAction() {
+    @Test fun longPressMovesUnseenFyiBetweenListsWithoutOpeningDetail() {
+        val repo = GestureRepository().apply { current.value = gestureItem.copy(kind = ItemKindDto.FYI) }
+        var pending by mutableStateOf(false)
+        var opens = 0
+        compose.setContent {
+            val requests = remember { RequestsViewModel(repo, { true }) }
+            val pendingItems = remember { RequestsViewModel(repo, { true }, pending = true) }
+            val vm = if (pending) pendingItems else requests
+            val state by vm.state.collectAsState()
+            LamTheme {
+                RequestsScreen(state, {}, {}, {}, {}, {}, {}, {}, { opens++ }, onTogglePending = vm::togglePending)
+            }
+        }
+        val card = compose.onNodeWithTag("request-card-request")
+        card.performTouchInput { longClick() }
+        compose.onNodeWithText("Move to pending").performClick()
+        card.assertDoesNotExist()
+        compose.runOnIdle {
+            assertEquals(listOf("request" to true), repo.pendingCalls)
+            assertEquals(0, repo.seenCalls)
+            assertEquals(0, opens)
+            pending = true
+        }
+        card.performTouchInput { longClick() }
+        compose.onNodeWithText("Move to pending").assertDoesNotExist()
+        compose.onNodeWithText("Back to requests").performClick()
+        card.assertDoesNotExist()
+        compose.runOnIdle {
+            assertEquals(listOf("request" to true, "request" to false), repo.pendingCalls)
+            assertEquals(0, repo.seenCalls)
+            assertEquals(0, opens)
+            assertEquals(StatusDto.OPEN, repo.current.value?.status)
+            assertNull(repo.current.value?.seenAt)
+        }
+    }
+
+    @Test fun fyiHasPendingAndDismissAccessibilityButOnlyDismissSwipeAction() {
         var quick = 0; var dismiss = 0; var opens = 0
         compose.setContent { LamTheme {
             RequestCard(gestureItem.copy(kind = ItemKindDto.FYI, recommendation = null), gestureNow,
@@ -36,7 +72,7 @@ class RequestGesturesTest {
         val card = compose.onNodeWithTag("request-card-request")
         card.assert(hasContentDescription("Normal priority", substring = true))
         val actions = card.fetchSemanticsNode().config[SemanticsActions.CustomActions]
-        assertEquals(listOf("Dismiss"), actions.map { it.label })
+        assertEquals(listOf("Move to pending", "Dismiss"), actions.map { it.label })
         card.performTouchInput { swipe(Offset(width * .85f, centerY), Offset(width * .15f, centerY)) }
         compose.runOnIdle { assertEquals(0, quick); assertEquals(0, opens) }
         card.performTouchInput { swipe(Offset(width * .15f, centerY), Offset(width * .85f, centerY)) }
@@ -77,7 +113,7 @@ class RequestGesturesTest {
         compose.onNodeWithTag("request-card-0").assertIsNotDisplayed()
     }
 
-    @Test fun longPressAndTalkBackExposeBothActionsAndStaleStillOpens() {
+    @Test fun longPressAndTalkBackExposeRowActionsAndStaleStillOpens() {
         var quick = 0; var dismiss = 0; var opens = 0; var enabled by mutableStateOf(true)
         compose.setContent { LamTheme { RequestCard(gestureItem, gestureNow, actionsEnabled = enabled,
             onQuickResponse = { quick++ }, onDismiss = { dismiss++ }, onOpen = { opens++ }) } }
@@ -88,7 +124,7 @@ class RequestGesturesTest {
         compose.onNodeWithText("Dismiss").performClick()
         val actions = card.fetchSemanticsNode().config[SemanticsActions.CustomActions]
         compose.runOnIdle {
-            assertEquals(setOf("Quick response", "Dismiss"), actions.map { it.label }.toSet())
+            assertEquals(setOf("Quick response", "Move to pending", "Dismiss"), actions.map { it.label }.toSet())
             actions.forEach { assertTrue(it.action()) }
         }
         compose.runOnIdle { assertEquals(2, quick); assertEquals(2, dismiss); assertEquals(0, opens); enabled = false }
@@ -162,7 +198,13 @@ internal class GestureRepository : ItemRepository {
             responseText = (answer as? FinalAnswer.Text)?.value, version = current.value!!.version + 1)
         return true
     }
-    override suspend fun setPending(id: String, pending: Boolean) = false
+    val pendingCalls = mutableListOf<Pair<String, Boolean>>()
+    var seenCalls = 0
+    override suspend fun setPending(id: String, pending: Boolean): Boolean {
+        pendingCalls += id to pending
+        current.value = current.value!!.copy(pendingAt = if (pending) gestureNow.toString() else null)
+        return true
+    }
     override suspend fun setCheck(id: String, index: Int, done: Boolean): Boolean {
         if (!checkSucceeds) return false
         val item = current.value!!
@@ -175,5 +217,5 @@ internal class GestureRepository : ItemRepository {
     override val cachedHistory = flowOf(emptyList<Item>())
     override suspend fun refreshHistory(query: HistoryQuery, cursor: String?) = HistoryResult(false, null)
     override suspend fun unpair() = Unit
-    override suspend fun markSeen(id: String, version: Long) = false
+    override suspend fun markSeen(id: String, version: Long): Boolean { seenCalls++; return false }
 }

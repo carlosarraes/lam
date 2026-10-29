@@ -22,6 +22,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.IntOffset
 import dev.carraes.lam.R
 import dev.carraes.lam.items.Item
+import dev.carraes.lam.items.StatusDto
 import dev.carraes.lam.ui.agentColor
 import dev.carraes.lam.ui.components.priorityLabel
 import dev.carraes.lam.ui.theme.Amber
@@ -31,7 +32,7 @@ import kotlin.math.roundToInt
 
 @Composable
 fun RequestCard(item: Item, now: Instant, actionsEnabled: Boolean = false,
-    onQuickResponse: () -> Unit = {}, onDismiss: () -> Unit = {}, onOpen: () -> Unit) {
+    onQuickResponse: () -> Unit = {}, onDismiss: () -> Unit = {}, onTogglePending: () -> Unit = {}, onOpen: () -> Unit) {
     val priority = priorityLabel(item.priority, item.kind)
     val progress = when {
         item.isFyi -> stringResource(R.string.item_fyi)
@@ -46,6 +47,8 @@ fun RequestCard(item: Item, now: Instant, actionsEnabled: Boolean = false,
     val description = stringResource(R.string.request_accessibility, item.title, item.agentDisplay, priority, details, open)
     val quick = stringResource(R.string.quick_response)
     val dismiss = stringResource(R.string.dismiss)
+    val pendingAction = stringResource(if (item.pendingAt == null) R.string.move_to_pending else R.string.back_to_requests)
+    val moreActions = stringResource(R.string.more_actions)
     var menu by remember(item.id) { mutableStateOf(false) }
     var drag by remember(item.id) { mutableFloatStateOf(0f) }
     val threshold = with(LocalDensity.current) { 88.dp.toPx() }
@@ -90,9 +93,10 @@ fun RequestCard(item: Item, now: Instant, actionsEnabled: Boolean = false,
             role = Role.Button
             onClick(label = open) { onOpen(); true }
             if (actionsEnabled) {
-                onLongClick(label = if (item.isFyi) dismiss else quick) { menu = true; true }
+                onLongClick(label = moreActions) { menu = true; true }
                 customActions = buildList {
                     if (!item.isFyi) add(CustomAccessibilityAction(quick) { onQuickResponse(); true })
+                    if (item.status == StatusDto.OPEN) add(CustomAccessibilityAction(pendingAction) { onTogglePending(); true })
                     add(CustomAccessibilityAction(dismiss) { onDismiss(); true })
                 }
             }
@@ -116,6 +120,8 @@ fun RequestCard(item: Item, now: Instant, actionsEnabled: Boolean = false,
     }
         DropdownMenu(menu, onDismissRequest = { menu = false }) {
             if (!item.isFyi) DropdownMenuItem(text = { Text(quick) }, onClick = { menu = false; onQuickResponse() })
+            if (item.status == StatusDto.OPEN) DropdownMenuItem(text = { Text(pendingAction) },
+                enabled = actionsEnabled, onClick = { menu = false; onTogglePending() })
             DropdownMenuItem(text = { Text(dismiss) }, onClick = { menu = false; onDismiss() })
         }
     }

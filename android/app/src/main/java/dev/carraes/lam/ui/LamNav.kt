@@ -19,6 +19,7 @@ import dev.carraes.lam.ui.detail.DecisionState
 fun LamNav(state: RequestsState, onQuery: (String) -> Unit, onType: (ItemTypeDto?) -> Unit,
     onPriority: (PriorityDto?) -> Unit, onClearFilters: () -> Unit, onRefresh: () -> Unit,
     onRequestAction: (String, Boolean) -> Unit = { _, _ -> },
+    onTogglePending: (String) -> Unit = {},
     historyContent: @Composable (() -> Unit, () -> Unit) -> Unit = { onRequests, onSettings ->
         HistoryScreen(HistoryState(), {}, {}, {}, {}, {}, {}, onRequests, onSettings)
     },
@@ -48,7 +49,8 @@ fun LamNav(state: RequestsState, onQuery: (String) -> Unit, onType: (ItemTypeDto
             RequestsScreen(state, onQuery, onType, onPriority, onClearFilters, onRefresh,
                 onHistory = { queue("history") }, onSettings = { nav.navigate("settings") },
                 onItem = { nav.navigate("item/${Uri.encode(it)}") },
-                onQuickResponse = { onRequestAction(it, false) }, onDismiss = { onRequestAction(it, true) })
+                onQuickResponse = { onRequestAction(it, false) }, onDismiss = { onRequestAction(it, true) },
+                onTogglePending = onTogglePending)
         }
         composable("pending") {
             pendingContent({ queue("requests") }, { queue("history") }, { nav.navigate("settings") }, { nav.navigate("item/${Uri.encode(it)}") })

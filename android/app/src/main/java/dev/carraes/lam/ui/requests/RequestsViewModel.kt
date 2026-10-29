@@ -7,6 +7,8 @@ import java.time.Clock
 import java.time.Instant
 import java.time.Duration
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
@@ -27,9 +29,12 @@ data class RequestsState(
     val informationalCount: Int get() = items.count { it.isFyi }
 }
 
-class RequestsViewModel(repository: ItemRepository, private val reconcile: suspend () -> Boolean, clock: Clock = Clock.systemUTC(), private val pending: Boolean = false) : ViewModel() {
+class RequestsViewModel(private val repository: ItemRepository, private val reconcile: suspend () -> Boolean, clock: Clock = Clock.systemUTC(), private val pending: Boolean = false) : ViewModel() {
     private data class Filters(val query: String = "", val type: ItemTypeDto? = null, val priority: PriorityDto? = null)
     private val filters = MutableStateFlow(Filters())
+    private val movingPending = MutableStateFlow(false)
+    private val pendingFailureEvents = Channel<Unit>(Channel.BUFFERED)
+    val pendingFailures = pendingFailureEvents.receiveAsFlow()
     // This updates labels only while a screen collects state. It never performs network work.
     private val time = flow {
         while (true) {
@@ -37,7 +42,7 @@ class RequestsViewModel(repository: ItemRepository, private val reconcile: suspe
             delay(60_000)
         }
     }
-    val state: StateFlow<RequestsState> = combine(repository.openItems, repository.syncState, filters, time) { items, sync, filter, now ->
+    val state: StateFlow<RequestsState> = combine(repository.openItems, repository.syncState, filters, time, movingPending) { items, sync, filter, now, moving ->
         val query = filter.query.trim()
         val visible = items.filter { item ->
             item.status == StatusDto.OPEN &&
@@ -51,7 +56,7 @@ class RequestsViewModel(repository: ItemRepository, private val reconcile: suspe
             refreshing = sync == SyncState.Refreshing,
             stale = sync is SyncState.Stale,
             lastSuccess = when (sync) { is SyncState.Current -> sync.lastSuccess; is SyncState.Stale -> sync.lastSuccess; else -> null },
-            actionsEnabled = sync.mutationsEnabled,
+            actionsEnabled = sync.mutationsEnabled && !moving,
             now = now, pending = pending)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(), RequestsState(now = clock.instant(), pending = pending))
 
@@ -60,6 +65,24 @@ class RequestsViewModel(repository: ItemRepository, private val reconcile: suspe
     fun setPriority(priority: PriorityDto?) { filters.update { it.copy(priority = priority) } }
     fun clearFilters() { filters.update { it.copy(type = null, priority = null) } }
     fun refresh() { viewModelScope.launch { reconcile() } }
+
+    fun togglePending(id: String) {
+        val item = state.value.items.find { it.id == id } ?: return
+        if (movingPending.value || !repository.syncState.value.mutationsEnabled) return
+        movingPending.value = true
+        viewModelScope.launch {
+            val succeeded = try {
+                repository.setPending(id, item.pendingAt == null)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                false
+            } finally {
+                movingPending.value = false
+            }
+            if (!succeeded) pendingFailureEvents.trySend(Unit)
+        }
+    }
 }
 
 val Item.requestType: ItemTypeDto get() = when {

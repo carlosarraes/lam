@@ -31,7 +31,8 @@ import java.time.format.FormatStyle
 fun RequestsScreen(state: RequestsState, onQuery: (String) -> Unit, onType: (ItemTypeDto?) -> Unit,
     onPriority: (PriorityDto?) -> Unit, onClearFilters: () -> Unit, onRefresh: () -> Unit,
     onHistory: () -> Unit, onSettings: () -> Unit, onItem: (String) -> Unit,
-    onQuickResponse: (String) -> Unit = {}, onDismiss: (String) -> Unit = {}, onRequests: () -> Unit = {}) {
+    onQuickResponse: (String) -> Unit = {}, onDismiss: (String) -> Unit = {}, onRequests: () -> Unit = {},
+    onTogglePending: (String) -> Unit = {}) {
     var search by rememberSaveable { mutableStateOf(false) }
     var filters by rememberSaveable { mutableStateOf(false) }
     val activeFilters = listOfNotNull(state.type, state.priority).size
@@ -90,7 +91,8 @@ fun RequestsScreen(state: RequestsState, onQuery: (String) -> Unit, onType: (Ite
                     }
                     items(state.items, key = { "request:${it.id}" }) { item ->
                         RequestCard(item, state.now, actionsEnabled = state.actionsEnabled,
-                            onQuickResponse = { onQuickResponse(item.id) }, onDismiss = { onDismiss(item.id) }) { onItem(item.id) }
+                            onQuickResponse = { onQuickResponse(item.id) }, onDismiss = { onDismiss(item.id) },
+                            onTogglePending = { onTogglePending(item.id) }) { onItem(item.id) }
                     }
                 }
             }

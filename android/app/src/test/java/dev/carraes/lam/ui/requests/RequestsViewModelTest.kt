@@ -16,6 +16,89 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class RequestsViewModelTest {
+    @Test fun rowMoveToPendingKeepsFyiUnseenAndUpdatesBothLists() = runTest {
+        val repo = RequestsFakeRepository().apply {
+            openItems.value = listOf(request("notice").copy(kind = ItemKindDto.FYI))
+            syncState.value = SyncState.Current(now)
+        }
+        val requests = RequestsViewModel(repo, { true }, fixedClock)
+        val pending = RequestsViewModel(repo, { true }, fixedClock, pending = true)
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { requests.state.collect() }
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { pending.state.collect() }
+        runCurrent()
+
+        requests.togglePending("notice")
+        runCurrent()
+
+        assertEquals(listOf("notice" to true), repo.pendingCalls)
+        assertEquals(0, repo.seenCalls)
+        assertTrue(requests.state.value.items.isEmpty())
+        assertEquals("notice", pending.state.value.items.single().id)
+        assertEquals(StatusDto.OPEN, pending.state.value.items.single().status)
+        assertNull(pending.state.value.items.single().seenAt)
+
+        pending.togglePending("notice")
+        runCurrent()
+
+        assertEquals(listOf("notice" to true, "notice" to false), repo.pendingCalls)
+        assertEquals(0, repo.seenCalls)
+        assertTrue(pending.state.value.items.isEmpty())
+        assertNull(requests.state.value.items.single().pendingAt)
+    }
+
+    @Test fun rowMoveBlocksDuplicateTapsAndStaleOrMissingItems() = runTest {
+        val repo = RequestsFakeRepository().apply {
+            openItems.value = listOf(request("request"))
+            syncState.value = SyncState.Current(now)
+            pendingGate = CompletableDeferred()
+        }
+        val vm = RequestsViewModel(repo, { true }, fixedClock)
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { vm.state.collect() }
+        runCurrent()
+
+        vm.togglePending("missing")
+        vm.togglePending("request")
+        vm.togglePending("request")
+        runCurrent()
+
+        assertEquals(listOf("request" to true), repo.pendingCalls)
+        assertFalse(vm.state.value.actionsEnabled)
+        repo.pendingGate!!.complete(Unit)
+        runCurrent()
+        assertTrue(vm.state.value.actionsEnabled)
+
+        repo.openItems.value = listOf(request("request"))
+        runCurrent()
+        repo.syncState.value = SyncState.Stale(now, ApiError.Transport("offline"))
+        vm.togglePending("request")
+        runCurrent()
+        assertEquals(1, repo.pendingCalls.size)
+        assertEquals(0, repo.seenCalls)
+    }
+
+    @Test fun failedRowMoveEmitsFeedbackAndRetainsItemForFalseAndThrownFailures() = runTest {
+        for (error in listOf(null, IllegalStateException("local failure"))) {
+            val repo = RequestsFakeRepository().apply {
+                openItems.value = listOf(request("request"))
+                syncState.value = SyncState.Current(now)
+                pendingSucceeds = false
+                pendingError = error
+            }
+            val vm = RequestsViewModel(repo, { true }, fixedClock)
+            backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { vm.state.collect() }
+            runCurrent()
+            val feedback = backgroundScope.async(start = CoroutineStart.UNDISPATCHED) { vm.pendingFailures.first() }
+
+            vm.togglePending("request")
+            runCurrent()
+
+            assertEquals(Unit, feedback.await())
+            assertNull(vm.state.value.items.single().pendingAt)
+            assertTrue(vm.state.value.actionsEnabled)
+            assertEquals(0, repo.seenCalls)
+        }
+    }
+
     @Test fun requestsAndPendingShowSeparateOpenLanes() = runTest {
         val repo = RequestsFakeRepository().apply { openItems.value = listOf(
             request("request"), request("pending").copy(pendingAt = "2026-09-04T12:00:00Z"),
@@ -176,8 +259,21 @@ internal class RequestsFakeRepository : ItemRepository {
     override suspend fun refreshItem(id: String) = false
     override suspend fun refreshHistory(query: HistoryQuery, cursor: String?) = HistoryResult(false, null)
     override suspend fun answer(id: String, answer: FinalAnswer) = false
-    override suspend fun setPending(id: String, pending: Boolean) = false
+    val pendingCalls = mutableListOf<Pair<String, Boolean>>()
+    var pendingGate: CompletableDeferred<Unit>? = null
+    var pendingSucceeds = true
+    var pendingError: Exception? = null
+    var seenCalls = 0
+    override suspend fun setPending(id: String, pending: Boolean): Boolean {
+        pendingCalls += id to pending
+        pendingGate?.await()
+        pendingError?.let { throw it }
+        if (pendingSucceeds) openItems.value = openItems.value.map {
+            if (it.id == id) it.copy(pendingAt = if (pending) now.toString() else null) else it
+        }
+        return pendingSucceeds
+    }
     override suspend fun setCheck(id: String, index: Int, done: Boolean) = false
     override suspend fun unpair() = Unit
-    override suspend fun markSeen(id: String, version: Long) = false
+    override suspend fun markSeen(id: String, version: Long): Boolean { seenCalls++; return false }
 }
