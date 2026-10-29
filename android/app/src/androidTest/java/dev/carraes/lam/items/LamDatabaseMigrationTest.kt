@@ -12,6 +12,42 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class LamDatabaseMigrationTest {
+    @Test fun shippedV4DropsSavedContentAndPreservesPendingItems() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val name = "v4-migration-${java.util.UUID.randomUUID()}.db"
+        val schema = InstrumentationRegistry.getInstrumentation().context.assets
+            .open("dev.carraes.lam.items.LamDatabase/4.json").bufferedReader().use { JSONObject(it.readText()).getJSONObject("database") }
+        try {
+            context.openOrCreateDatabase(name, Context.MODE_PRIVATE, null).use { old ->
+                val entities = schema.getJSONArray("entities")
+                for (index in 0 until entities.length()) {
+                    val entity = entities.getJSONObject(index)
+                    val table = entity.getString("tableName")
+                    old.execSQL(entity.getString("createSql").replace("\${TABLE_NAME}", table))
+                    entity.optJSONArray("indices")?.let { indices ->
+                        for (i in 0 until indices.length()) old.execSQL(indices.getJSONObject(i).getString("createSql").replace("\${TABLE_NAME}", table))
+                    }
+                }
+                val setup = schema.getJSONArray("setupQueries")
+                for (i in 0 until setup.length()) old.execSQL(setup.getString(i))
+                old.execSQL("INSERT INTO articles VALUES ('account','saved','{}','Private content',NULL)")
+                old.execSQL("""INSERT INTO items (createdAtEpoch,id,title,body,sourceHost,sourceProject,priority,choices,checks,link,status,createdAt,version,kind,pendingAt)
+                    VALUES (0,'pending','Tracked work','Preserve this','host','lam','NORMAL','[]','[]','','OPEN','2026-09-04T00:00:00Z',7,'FYI','2026-09-04T12:00:00Z')""")
+                old.version = 4
+            }
+            val database = Room.databaseBuilder(context, LamDatabase::class.java, name).addMigrations(LamDatabase.MIGRATION_4_5).build()
+            try {
+                val item = RoomItemStorage(database).get("pending")!!.canonical
+                assertEquals("Preserve this", item.body)
+                assertEquals("2026-09-04T12:00:00Z", item.pendingAt)
+                assertEquals(7L, item.version)
+                database.openHelper.writableDatabase.query("SELECT name FROM sqlite_master WHERE type='table' AND name='articles'").use {
+                    assertEquals(0, it.count)
+                }
+            } finally { database.close() }
+        } finally { context.deleteDatabase(name) }
+    }
+
     @Test fun shippedV1UpgradesWithoutLosingLegacyChecklistHistoryOrSyncData() = runTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val name = "fyi-migration-${java.util.UUID.randomUUID()}.db"
@@ -37,7 +73,7 @@ class LamDatabaseMigrationTest {
                 old.execSQL("INSERT INTO history_membership VALUES ('saved-query', 'closed')")
                 old.version = 1
             }
-            val database = Room.databaseBuilder(context, LamDatabase::class.java, name).addMigrations(LamDatabase.MIGRATION_1_2, LamDatabase.MIGRATION_2_3, LamDatabase.MIGRATION_3_4).build()
+            val database = Room.databaseBuilder(context, LamDatabase::class.java, name).addMigrations(LamDatabase.MIGRATION_1_2, LamDatabase.MIGRATION_2_3, LamDatabase.MIGRATION_3_4, LamDatabase.MIGRATION_4_5).build()
             try {
                 val store = RoomItemStorage(database)
                 val legacy = store.get("legacy")!!.canonical

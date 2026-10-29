@@ -1,8 +1,6 @@
 import { HttpRouter, HttpServerResponse } from "@effect/platform";
 import { Effect } from "effect";
 import { api, bearer } from "./api";
-import { articles } from "./articles";
-import { articleViewer, articleViewerSessions } from "./article-viewer";
 import { devices } from "./devices";
 import { events } from "./events";
 import { ntfy } from "./ntfy";
@@ -14,9 +12,8 @@ const error = (status: number, message: string) => HttpServerResponse.unsafeJson
 /** Maps domain/tagged errors to HTTP responses; anything else is a 500 with the cause logged. */
 export const app = HttpRouter.empty.pipe(
   HttpRouter.concat(api.pipe(HttpRouter.use(bearer))),
-  HttpRouter.concat(articles.pipe(HttpRouter.use(bearer))),
-  HttpRouter.concat(articleViewerSessions),
-  HttpRouter.concat(articleViewer),
+  HttpRouter.all("/v2/articles", HttpServerResponse.unsafeJson({ error: "articles removed" }, { status: 410 })),
+  HttpRouter.all("/v2/articles/*", HttpServerResponse.unsafeJson({ error: "articles removed" }, { status: 410 })),
   HttpRouter.concat(devices.pipe(HttpRouter.use(bearer))),
   HttpRouter.concat(pairingAdmin.pipe(HttpRouter.use(bearer))),
   HttpRouter.concat(pairingClaims),
@@ -35,6 +32,5 @@ export const app = HttpRouter.empty.pipe(
     RequestError: (e) => Effect.succeed(error(400, e.message)),
     RouteNotFound: () => Effect.succeed(error(404, "no such route")),
     DbError: (e) => Effect.logError("db error", e.cause).pipe(Effect.as(error(500, "database error"))),
-    ArticleStorageError: (e) => Effect.logError("article storage error", e.cause).pipe(Effect.as(error(503, "article storage unavailable"))),
   }),
 );

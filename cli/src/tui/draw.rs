@@ -81,9 +81,8 @@ impl App {
             (Tab::Requests, "requests"),
             (Tab::Pending, "pending"),
             (Tab::History, "history"),
-            (Tab::Articles, "articles"),
         ];
-        let full = 38;
+        let full = 28;
         if width >= full + HEADER_SIDES {
             return labels
                 .iter()
@@ -103,7 +102,6 @@ impl App {
             Tab::Requests => "[requests]",
             Tab::Pending => "[pending]",
             Tab::History => "[history]",
-            Tab::Articles => "[articles]",
         };
         if width >= active.len() as u16 + HEADER_SIDES {
             return vec![Span::styled(active.to_string(), ACCENT)];
@@ -172,10 +170,6 @@ impl App {
     }
 
     pub(super) fn draw(&self, f: &mut Frame) {
-        if self.tab == Tab::Articles {
-            self.draw_articles(f);
-            return;
-        }
         let visible = self.visible();
         let [header, body, footer] = Layout::vertical([
             Constraint::Length(1),
@@ -191,7 +185,6 @@ impl App {
                 (visible.len() as u16 + 1).clamp(3, (f.area().height / 3).max(3))
             }
             Tab::History => body.height.saturating_sub(HISTORY_DETAIL).max(3),
-            Tab::Articles => unreachable!("other tabs draw separately"),
         };
         let (list, detail) = if self.reader {
             let [l, r] =
@@ -330,7 +323,6 @@ impl App {
                     Tab::Requests => "nothing here — all caught up",
                     Tab::Pending => "nothing pending",
                     Tab::History => "nothing closed yet",
-                    Tab::Articles => "no articles",
                 },
                 META,
             ))],
@@ -1162,14 +1154,14 @@ mod tests {
                 .map(|s| s.content.chars().count())
                 .sum()
         };
-        assert_eq!(width(&a, 100), 38);
+        assert_eq!(width(&a, 100), 28);
         a.handle(super::super::tests::key('l'));
-        assert_eq!(width(&a, 100), 38, "all tab states keep the bar width");
+        assert_eq!(width(&a, 100), 28, "all tab states keep the bar width");
 
         a.handle(super::super::tests::key('l'));
-        assert_eq!(width(&a, 100), 38);
+        assert_eq!(width(&a, 100), 28);
         a.handle(super::super::tests::key('l'));
-        assert_eq!(width(&a, 100), 38);
+        assert_eq!(width(&a, 100), 28);
         assert_eq!(width(&a, 60), 10, "squeezed down to the active label");
         assert_eq!(width(&a, 40), 0, "and out entirely rather than colliding");
     }
@@ -1188,10 +1180,10 @@ mod tests {
             head.trim_end().ends_with("archlinux  ● connecting"),
             "{head:?}"
         );
-        // 100 columns less the 38-column bar leaves 31 on each side.
+        // 100 columns less the 28-column bar leaves 36 on each side.
         assert_eq!(
-            head.chars().skip(31).take(38).collect::<String>(),
-            "[requests] pending  history  articles ",
+            head.chars().skip(36).take(28).collect::<String>(),
+            "[requests] pending  history ",
             "{head:?}"
         );
     }

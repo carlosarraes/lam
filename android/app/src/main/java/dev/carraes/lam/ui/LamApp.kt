@@ -14,20 +14,18 @@ import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
 import dev.carraes.lam.AppContainer
+import dev.carraes.lam.R
 import dev.carraes.lam.pairing.PairingScreen
 import dev.carraes.lam.pairing.PairingViewModel
 import dev.carraes.lam.ui.requests.RequestsViewModel
 import dev.carraes.lam.ui.history.*
 import dev.carraes.lam.ui.settings.*
 import dev.carraes.lam.ui.detail.*
-import dev.carraes.lam.R
 import kotlinx.coroutines.launch
-import dev.carraes.lam.articles.*
 import dev.carraes.lam.notifications.CriticalNotificationPermission
 
 @Composable
-fun LamApp(container: AppContainer, pairing: PairingViewModel, articleRoute: String? = null,
-    onArticleRouteConsumed: (String) -> Unit = {}, itemRoute: String? = null,
+fun LamApp(container: AppContainer, pairing: PairingViewModel, itemRoute: String? = null,
     onItemRouteConsumed: (String) -> Unit = {}) {
     val session by container.deviceSettings.reconciliationSession.collectAsStateWithLifecycle()
     CriticalNotificationPermission(session != null)
@@ -36,7 +34,7 @@ fun LamApp(container: AppContainer, pairing: PairingViewModel, articleRoute: Str
     PairingScreen(pairing) {
         key(session) {
             CompositionLocalProvider(LocalViewModelStoreOwner provides owner) {
-                PairedApp(container, articleRoute, onArticleRouteConsumed, itemRoute, onItemRouteConsumed)
+                PairedApp(container, itemRoute, onItemRouteConsumed)
             }
         }
     }
@@ -53,17 +51,14 @@ internal class PairedViewModels : ViewModel(), ViewModelStoreOwner {
 }
 
 @Composable
-private fun PairedApp(container: AppContainer, articleRoute: String?, onArticleRouteConsumed: (String) -> Unit,
-    itemRoute: String?, onItemRouteConsumed: (String) -> Unit) {
+private fun PairedApp(container: AppContainer, itemRoute: String?, onItemRouteConsumed: (String) -> Unit) {
         val requests = viewModel { RequestsViewModel(container.itemRepository, container.lifecycleReconciler::refresh) }
         val history = viewModel { HistoryViewModel(container.itemRepository, container.lifecycleReconciler.completedReconciliations) }
-        val articles = viewModel { ArticleViewModel(container.articleRepository) }
         val state by requests.state.collectAsStateWithLifecycle()
         var action by remember { mutableStateOf<Pair<String, Boolean>?>(null) }
         val snackbar = remember { SnackbarHostState() }
         val feedbackScope = rememberCoroutineScope()
         LamNav(state, requests::setQuery, requests::setType, requests::setPriority, requests::clearFilters, requests::refresh,
-            articleRoute = articleRoute, onArticleRouteConsumed = onArticleRouteConsumed,
             itemRoute = itemRoute, onItemRouteConsumed = onItemRouteConsumed,
             onRequestAction = { id, dismiss -> action = id to dismiss },
             pendingContent = { onRequests, onHistory, onSettings, onItem ->
@@ -83,16 +78,6 @@ private fun PairedApp(container: AppContainer, articleRoute: String?, onArticleR
                 val historyState by history.state.collectAsStateWithLifecycle()
                 HistoryScreen(historyState, history::setQuery, history::setType, history::setPriority,
                     history::clearFilters, history::refresh, history::loadMore, onRequests, onSettings)
-            }, articlesContent = { onRequests, onHistory, onSettings, onArticle ->
-                val articleState by articles.state.collectAsStateWithLifecycle()
-                LaunchedEffect(articles) { articles.refresh() }
-                ArticlesScreen(articleState, articles::query, articles::filter, articles::refresh, articles::more,
-                    { id -> articles.open(id); onArticle(id) }, articles::unread, onRequests, onHistory, onSettings,
-                    articles::day, articles::allUnread)
-            }, articleContent = { id, onBack ->
-                val reader by articles.reader.collectAsStateWithLifecycle()
-                LaunchedEffect(id) { if (reader.id != id) articles.open(id) }
-                ArticleReader(reader, container.articleRepository, articles::visible, { articles.close(); onBack() }, articles::reload)
             }, settingsContent = { onBack ->
                 val settings = viewModel { SettingsViewModel(container.deviceSettings, container.diagnostics) }
                 SettingsScreen(settings, onBack)
@@ -100,11 +85,6 @@ private fun PairedApp(container: AppContainer, articleRoute: String?, onArticleR
             val detail = viewModel(key = "decision:$id") { DecisionViewModel(id, container.itemRepository, container.lifecycleReconciler::refresh) }
             val checklist = viewModel(key = "checks:$id") { ChecklistViewModel(id, container.itemRepository) }
             DecisionDetailScreen(detail, onBack, checklist)
-        }
-        val articleFeedback by articles.feedback.collectAsStateWithLifecycle()
-        val articleMessage = articleFeedback?.let { stringResource(readMessage(it)) }
-        LaunchedEffect(articleMessage) {
-            articleMessage?.let { snackbar.showSnackbar(it); articles.consumeFeedback() }
         }
         action?.let { (id, dismiss) -> key(id, dismiss) {
             RequestActionHost(container, id, dismiss, snackbar, { message -> feedbackScope.launch { snackbar.showSnackbar(message) } }) { action = null }

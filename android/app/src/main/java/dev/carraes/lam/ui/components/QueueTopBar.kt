@@ -17,8 +17,6 @@ import dev.carraes.lam.R
 
 val LocalPendingNavigation = staticCompositionLocalOf<(() -> Unit)?> { null }
 
-val LocalArticlesNavigation = staticCompositionLocalOf<(() -> Unit)?> { null }
-
 @Composable
 fun QueueTopBar(title: String, onRequests: () -> Unit, onHistory: () -> Unit, onSettings: () -> Unit, onSearch: (() -> Unit)? = null,
     searchLabel: String = stringResource(R.string.search_requests)) {
@@ -38,9 +36,6 @@ fun QueueTopBar(title: String, onRequests: () -> Unit, onHistory: () -> Unit, on
                     DropdownMenuItem(text = { Text(stringResource(R.string.pending_title)) }, onClick = { queueMenu = false; onPending() })
                 }
                 DropdownMenuItem(text = { Text(stringResource(R.string.history_title)) }, onClick = { queueMenu = false; onHistory() })
-                LocalArticlesNavigation.current?.let { onArticles ->
-                    DropdownMenuItem(text = { Text(stringResource(R.string.articles_title)) }, onClick = { queueMenu = false; onArticles() })
-                }
             }
         }
         if (onSearch != null) IconButton(onSearch) { Icon(Icons.Default.Search, searchLabel) }

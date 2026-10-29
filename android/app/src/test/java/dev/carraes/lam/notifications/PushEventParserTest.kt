@@ -39,9 +39,9 @@ class PushEventParserTest {
             valid + ("item_id" to ""),
             valid + ("version" to "-1"),
             valid + ("version" to "nope"),
-            valid + ("event" to "article.published"),
+            valid + ("event" to "unknown.event"),
             valid + ("status" to "unknown"),
-            valid + ("kind" to "article"),
+            valid + ("kind" to "unknown"),
             valid + ("priority" to "normal"),
             valid + ("title" to ""),
         ).forEach { assertNull(PushEventParser.parse(it)) }

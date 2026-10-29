@@ -7,16 +7,19 @@ import androidx.room.RoomDatabase
 import androidx.room.TypeConverters
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
-import dev.carraes.lam.articles.ArticleEntity
-import dev.carraes.lam.articles.ArticleDao
 
 @Entity(tableName = "history_membership", primaryKeys = ["queryKey", "itemId"], indices = [Index("itemId")])
 data class HistoryMembership(val queryKey: String, val itemId: String)
 
-@Database(entities = [ItemEntity::class, SyncMetadata::class, HistoryMembership::class, ArticleEntity::class], version = 4, exportSchema = true)
+@Database(entities = [ItemEntity::class, SyncMetadata::class, HistoryMembership::class], version = 5, exportSchema = true)
 @TypeConverters(ItemConverters::class)
 abstract class LamDatabase : RoomDatabase() {
     companion object {
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("DROP TABLE IF EXISTS articles")
+            }
+        }
         val MIGRATION_3_4 = object : Migration(3, 4) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE items ADD COLUMN pendingAt TEXT")
@@ -36,5 +39,4 @@ abstract class LamDatabase : RoomDatabase() {
     }
     abstract fun itemDao(): ItemDao
     abstract fun syncMetadataDao(): SyncMetadataDao
-    abstract fun articleDao(): ArticleDao
 }

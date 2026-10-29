@@ -5,8 +5,6 @@
   "compatibility_date": "2026-08-01",
   "vars": { "FCM_PROJECT_ID": "lam-push-carraes" },
   "observability": { "enabled": true },
-  "triggers": { "crons": ["* * * * *"] },
-  "r2_buckets": [{ "binding": "ARTICLE_BUCKET", "bucket_name": "lam-articles", "remote": false }],
   "durable_objects": { "bindings": [
     { "name": "TOPIC", "class_name": "Topic" },
     { "name": "EVENTS", "class_name": "EventStream" }

@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { Either, Schema } from "effect";
 import type { Bindings } from "../Env";
-import { ItemEvent, VersionedEvent } from "../domain/Event";
+import { ItemEvent } from "../domain/Event";
 
 /** Live invalidations for the owner's private queue, with no item storage or replay. */
 export class EventStream extends DurableObject<Bindings> {
@@ -11,13 +11,13 @@ export class EventStream extends DurableObject<Bindings> {
     this.broadcast(decoded.right);
   }
 
-  async publishV2(event: VersionedEvent): Promise<void> {
-    const decoded = Schema.decodeUnknownEither(VersionedEvent)(event);
+  async publishV2(event: ItemEvent): Promise<void> {
+    const decoded = Schema.decodeUnknownEither(ItemEvent)(event);
     if (Either.isLeft(decoded)) throw new Error("Invalid versioned event");
     this.broadcast(decoded.right, "v2");
   }
 
-  private broadcast(event: VersionedEvent, tag?: string): void {
+  private broadcast(event: ItemEvent, tag?: string): void {
     const frame = JSON.stringify(event);
     for (const socket of this.ctx.getWebSockets(tag)) {
       try {

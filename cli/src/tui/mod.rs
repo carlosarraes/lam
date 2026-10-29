@@ -12,7 +12,6 @@ use crate::client::{Client, Item, Resolution};
 use crate::config::Config;
 use crate::watch;
 
-mod articles;
 mod draw;
 
 const REFRESH: Duration = Duration::from_secs(30);
@@ -21,18 +20,6 @@ const HISTORY_PAGE: usize = 50;
 /// What the UI asks the outside world to do; keeps `App` free of I/O so it is unit-testable.
 #[derive(Debug, PartialEq)]
 pub enum Action {
-    LoadArticles {
-        query: String,
-        read: String,
-        day: Option<String>,
-        cursor: Option<String>,
-        generation: u64,
-    },
-    OpenArticle(String),
-    ArticleUnread {
-        id: String,
-        version: u64,
-    },
     Quit,
     Refresh,
     /// The history tab wants the page older than `before` (None asks for the newest page). The
@@ -78,7 +65,6 @@ enum Mode {
     },
     /// Live-filtering by title, agent display name, or body.
     Filter,
-    ArticleDate(String),
 }
 
 /// The queue you answer, and the record of what you already answered.
@@ -87,7 +73,6 @@ pub enum Tab {
     Requests,
     Pending,
     History,
-    Articles,
 }
 
 /// One tab's list and its cursor. The tabs are independent views, so each keeps your place.
@@ -99,7 +84,6 @@ struct Pane {
 
 pub struct App {
     tab: Tab,
-    articles: articles::ArticlesPane,
     requests: Pane,
     pending: Pane,
     history: Pane,
@@ -135,7 +119,6 @@ impl App {
     pub fn new(host: String) -> Self {
         Self {
             tab: Tab::Requests,
-            articles: articles::ArticlesPane::default(),
             requests: Pane::default(),
             pending: Pane::default(),
             history: Pane::default(),
@@ -167,7 +150,6 @@ impl App {
             Tab::Requests => &self.requests,
             Tab::Pending => &self.pending,
             Tab::History => &self.history,
-            Tab::Articles => &self.requests,
         }
     }
 
@@ -176,7 +158,6 @@ impl App {
             Tab::Requests => &mut self.requests,
             Tab::Pending => &mut self.pending,
             Tab::History => &mut self.history,
-            Tab::Articles => &mut self.requests,
         }
     }
 
@@ -275,7 +256,6 @@ impl App {
             Tab::Requests => &mut self.requests,
             Tab::Pending => &mut self.pending,
             Tab::History => &mut self.history,
-            Tab::Articles => return,
         };
         pane.selected = pane.selected.min(n.saturating_sub(1));
         if self.tab == tab && self.reader_item.is_none() {
@@ -335,7 +315,6 @@ impl App {
             Tab::Requests => &self.requests.items,
             Tab::Pending => &self.pending.items,
             Tab::History => &self.history.items,
-            Tab::Articles => return vec![],
         };
         if self.filter.is_empty() {
             return items.iter().collect();
@@ -455,9 +434,6 @@ impl App {
         }
         self.leave_fyi_reader();
         self.tab = tab;
-        if matches!(tab, Tab::Articles) {
-            self.reader = false;
-        }
         self.check_sel = 0;
         self.scroll = 0;
         self.focus = Focus::List;
@@ -467,9 +443,6 @@ impl App {
     /// Asks for the next history page when the tab is empty or the cursor nears the bottom.
     /// Prefetching three rows early means the list never visibly dead-ends.
     fn load_more(&mut self) -> Option<Action> {
-        if self.tab == Tab::Articles {
-            return self.articles.load(false);
-        }
         if self.tab != Tab::History || self.history_loading || self.history_end {
             return None;
         }
@@ -485,23 +458,6 @@ impl App {
 
     /// Translates a key press into an Action. Returns None when only internal state changed.
     pub fn handle(&mut self, key: KeyEvent) -> Option<Action> {
-        if !matches!(
-            self.mode,
-            Mode::Filter | Mode::Reply { .. } | Mode::ArticleDate(_)
-        ) && key.code == KeyCode::Char('4')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
-            return self.set_tab(Tab::Articles);
-        }
-        if self.tab == Tab::Articles {
-            let global = !matches!(self.mode, Mode::Filter | Mode::ArticleDate(_))
-                && (matches!(key.code, KeyCode::Char('h' | 'l' | 'q') | KeyCode::Esc)
-                    || (key.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(key.code, KeyCode::Char('1' | '2' | '3' | 'c'))));
-            if !global {
-                return self.handle_articles(key);
-            }
-        }
         if matches!(self.mode, Mode::Filter) {
             match key.code {
                 KeyCode::Esc => {
@@ -625,16 +581,14 @@ impl App {
                 Some(action)
             }
             KeyCode::Char('h') => self.set_tab(match self.tab {
-                Tab::Requests => Tab::Articles,
+                Tab::Requests => Tab::History,
                 Tab::Pending => Tab::Requests,
                 Tab::History => Tab::Pending,
-                Tab::Articles => Tab::History,
             }),
             KeyCode::Char('l') => self.set_tab(match self.tab {
                 Tab::Requests => Tab::Pending,
                 Tab::Pending => Tab::History,
-                Tab::History => Tab::Articles,
-                Tab::Articles => Tab::Requests,
+                Tab::History => Tab::Requests,
             }),
             KeyCode::Char('m') => {
                 if self.reader {
@@ -735,18 +689,6 @@ enum Job {
         id: String,
         pending: bool,
     },
-    Articles {
-        query: String,
-        read: String,
-        day: Option<String>,
-        cursor: Option<String>,
-        generation: u64,
-    },
-    OpenArticle(String),
-    ArticleUnread {
-        id: String,
-        version: u64,
-    },
     Refresh,
     ReloadItem(String),
     History {
@@ -770,20 +712,6 @@ enum Job {
 }
 
 enum Msg {
-    ArticleInvalidated,
-    Articles {
-        page: crate::client::ArticlePage,
-        generation: u64,
-        first: bool,
-    },
-    Article {
-        article: Option<Box<crate::client::Article>>,
-        error: Option<String>,
-    },
-    ArticlesFailed {
-        error: String,
-        generation: u64,
-    },
     Items(Vec<Item>),
     Item(Box<Item>),
     Seen {
@@ -846,45 +774,6 @@ fn reload_item(client: &Client, id: &str, tx: &mpsc::Sender<Msg>) {
     });
 }
 
-fn mark_article_unread(
-    client: &Client,
-    id: &str,
-    version: u64,
-) -> (Option<Box<crate::client::Article>>, Option<String>) {
-    match client.set_article_read(id, false, version) {
-        Ok(crate::client::ArticleReadResult::Updated(article)) => (Some(article), None),
-        Ok(crate::client::ArticleReadResult::Conflict) => match client.article(id) {
-            Ok(article) => (Some(Box::new(article)), Some("Read state changed elsewhere; canonical state reloaded. Press u again to mark unread.".into())),
-            Err(error) => (None, Some(format!("Read state changed elsewhere; could not reload canonical state: {error}. Press R to refresh."))),
-        },
-        Err(error) => (None, Some(format!("unread failed: {error}"))),
-    }
-}
-
-fn refresh_articles(app: &mut App, jobs: &mpsc::Sender<Job>) {
-    if app.articles.loading {
-        app.articles.invalidated = true;
-        return;
-    }
-    app.articles.invalidated = false;
-    if let Some(Action::LoadArticles {
-        query,
-        read,
-        day,
-        cursor,
-        generation,
-    }) = app.articles.reload()
-    {
-        let _ = jobs.send(Job::Articles {
-            query,
-            read,
-            day,
-            cursor,
-            generation,
-        });
-    }
-}
-
 pub fn run(silent: bool) -> Result<i32> {
     let cfg = Config::load()?;
     let client = Client::new(&cfg)?;
@@ -896,51 +785,6 @@ pub fn run(silent: bool) -> Result<i32> {
     let net_tx = tx.clone();
     std::thread::spawn(move || {
         while let Ok(job) = work.recv() {
-            match &job {
-                Job::Articles {
-                    query,
-                    read,
-                    day,
-                    cursor,
-                    generation,
-                } => {
-                    let _ = net_tx.send(
-                        match client.article_page(
-                            read,
-                            Some(query),
-                            cursor.as_deref(),
-                            day.as_deref(),
-                        ) {
-                            Ok(page) => Msg::Articles {
-                                page,
-                                generation: *generation,
-                                first: cursor.is_none(),
-                            },
-                            Err(error) => Msg::ArticlesFailed {
-                                error: format!("articles failed: {error}"),
-                                generation: *generation,
-                            },
-                        },
-                    );
-                    continue;
-                }
-                Job::OpenArticle(id) => {
-                    let error = crate::articles::open_with_client(&client, id)
-                        .err()
-                        .map(|error| format!("article open failed: {error}"));
-                    let _ = net_tx.send(Msg::Article {
-                        article: None,
-                        error,
-                    });
-                    continue;
-                }
-                Job::ArticleUnread { id, version } => {
-                    let (article, error) = mark_article_unread(&client, id, *version);
-                    let _ = net_tx.send(Msg::Article { article, error });
-                    continue;
-                }
-                _ => {}
-            }
             if let Job::ReloadItem(id) = job {
                 reload_item(&client, &id, &net_tx);
                 continue;
@@ -971,11 +815,7 @@ pub fn run(silent: bool) -> Result<i32> {
                     Ok(())
                 }
                 Job::SetCheck { id, index, done } => client.set_check(&id, index, done).map(|_| ()),
-                Job::History { .. }
-                | Job::ReloadItem(_)
-                | Job::Articles { .. }
-                | Job::OpenArticle(_)
-                | Job::ArticleUnread { .. } => unreachable!("handled above"),
+                Job::History { .. } | Job::ReloadItem(_) => unreachable!("handled above"),
             };
             if let Err(e) = outcome {
                 let _ = net_tx.send(Msg::Failed(format!("{e}")));
@@ -993,13 +833,6 @@ pub fn run(silent: bool) -> Result<i32> {
         }
     });
 
-    let article_cfg = cfg.clone();
-    let article_tx = tx.clone();
-    std::thread::spawn(move || {
-        crate::article_events::subscribe(&article_cfg, || {
-            let _ = article_tx.send(Msg::ArticleInvalidated);
-        })
-    });
     let stream_cfg = cfg.clone();
     std::thread::spawn(move || {
         watch::subscribe(
@@ -1064,36 +897,6 @@ fn event_loop(
 
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                Msg::ArticleInvalidated => refresh_articles(app, jobs),
-                Msg::Articles {
-                    page,
-                    generation,
-                    first,
-                } => {
-                    app.articles.add(page, generation, first);
-                    if generation == app.articles.generation && app.articles.invalidated {
-                        refresh_articles(app, jobs);
-                    }
-                    app.set_busy(false);
-                }
-                Msg::ArticlesFailed { error, generation } => {
-                    if generation == app.articles.generation {
-                        app.articles.loading = false;
-                        app.articles.error = Some(error);
-                        if app.articles.invalidated {
-                            refresh_articles(app, jobs);
-                        }
-                    }
-                    app.set_busy(false);
-                }
-                Msg::Article { article, error } => {
-                    if let Some(article) = article {
-                        app.articles.reconcile(*article);
-                    }
-                    app.set_busy(false);
-                    app.articles.error = error;
-                    app.set_status("live");
-                }
                 Msg::Items(items) => refresh_items(app, items, jobs),
                 Msg::Item(item) => {
                     app.reconcile_item(*item);
@@ -1152,21 +955,6 @@ fn event_loop(
             continue;
         };
         let job = match action {
-            Action::LoadArticles {
-                query,
-                read,
-                day,
-                cursor,
-                generation,
-            } => Job::Articles {
-                query,
-                read,
-                day,
-                cursor,
-                generation,
-            },
-            Action::OpenArticle(id) => Job::OpenArticle(id),
-            Action::ArticleUnread { id, version } => Job::ArticleUnread { id, version },
             Action::Quit => return Ok(()),
             Action::Refresh => Job::Refresh,
             Action::LoadHistory { before } => Job::History { before },
@@ -1253,11 +1041,11 @@ mod tests {
         let mut a = App::new("host".into());
         assert_eq!(a.handle(key('a')), None);
         assert_eq!(a.tab, Tab::Requests);
-        for expected in [Tab::Pending, Tab::History, Tab::Articles, Tab::Requests] {
+        for expected in [Tab::Pending, Tab::History, Tab::Requests] {
             a.handle(key('l'));
             assert_eq!(a.tab, expected);
         }
-        for expected in [Tab::Articles, Tab::History, Tab::Pending, Tab::Requests] {
+        for expected in [Tab::History, Tab::Pending, Tab::Requests] {
             a.handle(key('h'));
             assert_eq!(a.tab, expected);
         }
@@ -1265,7 +1053,7 @@ mod tests {
 
     #[test]
     fn hl_and_a_remain_text_when_editing() {
-        for tab in [Tab::Requests, Tab::Pending, Tab::History, Tab::Articles] {
+        for tab in [Tab::Requests, Tab::Pending, Tab::History] {
             let mut a = App::new("host".into());
             a.set_tab(tab);
             a.handle(key('/'));
@@ -1273,14 +1061,7 @@ mod tests {
                 a.handle(key(c));
             }
             assert_eq!(a.tab, tab);
-            assert_eq!(
-                if tab == Tab::Articles {
-                    &a.articles.query
-                } else {
-                    &a.filter
-                },
-                "hla"
-            );
+            assert_eq!(&a.filter, "hla");
         }
         let mut a = app();
         a.handle(key('r'));
@@ -1291,20 +1072,6 @@ mod tests {
         assert_eq!(a.tab, Tab::Requests);
     }
     use super::*;
-
-    #[test]
-    fn articles_ctrl_shortcut_does_not_change_request_choices() {
-        let mut a = app();
-        a.handle(ctrl('4'));
-        assert_eq!(format!("{:?}", a.tab), "Articles");
-        assert_eq!(a.handle(key('1')), None);
-        a.handle(ctrl('1'));
-        assert!(matches!(a.handle(key('1')), Some(Action::Resolve { .. })));
-        a.handle(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL));
-        assert_eq!(format!("{:?}", a.tab), "Articles");
-        a.handle(key('h'));
-        assert_eq!(a.tab, Tab::History);
-    }
 
     pub(super) fn item(id: &str, status: &str, choices: &[&str], link: &str) -> Item {
         Item {
@@ -1789,10 +1556,7 @@ mod tests {
         }
         assert_eq!(a.requests.selected, 2);
         assert_eq!(a.handle(key('o')), None);
-        assert!(matches!(
-            a.handle(ctrl('4')),
-            Some(Action::LoadArticles { .. })
-        ));
+        assert_eq!(a.handle(ctrl('4')), None);
         assert_eq!(a.handle(key('q')), Some(Action::Quit));
     }
 

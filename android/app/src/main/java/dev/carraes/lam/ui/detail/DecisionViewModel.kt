@@ -101,7 +101,6 @@ class DecisionViewModel(
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
-            // The loaded article remains readable when marking it seen fails.
             succeeded = false
         } finally {
             mutableState.update { it.copy(markingSeen = false, seenFailed = !succeeded) }

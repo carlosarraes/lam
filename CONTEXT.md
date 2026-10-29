@@ -10,9 +10,6 @@ _Avoid_: Chat message, notification
 **FYI**: An informational item for Carlos that does not require a decision.
 _Avoid_: Request
 
-**Article**: A saved report for reading, with explicit read or unread state.
-_Avoid_: Chat attachment
-
 **Chat message**: An attributed coordination message addressed to specific participants. It is not a human approval request.
 _Avoid_: Request, FYI
 

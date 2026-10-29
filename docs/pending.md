@@ -24,7 +24,7 @@ Default item lists exclude pending items. `lam pending list` requests only open 
 
 ## TUI and Android
 
-Pending follows Requests in the TUI. Press `p` on an open item to toggle its lane. `h`/`l` cycle the tabs; `Ctrl+1`, `Ctrl+2`, `Ctrl+3` and `Ctrl+4` select Requests, Pending, History and Articles. Android has a Pending screen next to Requests with the same item list controls.
+Pending follows Requests in the TUI. Press `p` on an open item to toggle its lane. `h`/`l` cycle the tabs; `Ctrl+1`, `Ctrl+2` and `Ctrl+3` select Requests, Pending and History. Android has a Pending screen next to Requests with the same item list controls.
 
 ## API
 

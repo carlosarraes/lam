@@ -4,7 +4,6 @@ import android.content.Context
 import android.util.Log
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.room.Room
-import dev.carraes.lam.articles.*
 import dev.carraes.lam.diagnostics.Diagnostics
 import dev.carraes.lam.items.*
 import dev.carraes.lam.notifications.LamNotifications
@@ -30,7 +29,7 @@ class AppContainer(
     private val credentials: CredentialComposition = createCredentialComposition(applicationContext)
     private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val database = Room.databaseBuilder(applicationContext, LamDatabase::class.java, "lam-items.db")
-        .addMigrations(LamDatabase.MIGRATION_1_2, LamDatabase.MIGRATION_2_3, LamDatabase.MIGRATION_3_4).build()
+        .addMigrations(LamDatabase.MIGRATION_1_2, LamDatabase.MIGRATION_2_3, LamDatabase.MIGRATION_3_4, LamDatabase.MIGRATION_4_5).build()
     private val connectivity = AndroidConnectivityMonitor(applicationContext)
 
     private val items = DefaultItemRepository(
@@ -45,14 +44,7 @@ class AppContainer(
 
     val credentialStore: CredentialStore = items.credentialStore
 
-    private val articleSessions = ArticleSessionBinding(items.pairedSession, credentials::articleApi)
-    val articleRepository = ArticleRepository(RoomArticleStorage(database), articleSessions::api, articleSessions::current,
-        onUnauthorized = { items.rejectCredential(it.generation) })
-
     init {
-        applicationScope.launch {
-            items.pairedSession.collect { articleRepository.sessionChanged() }
-        }
         applicationScope.launch {
             currentFirebaseInstallationId()?.let { Log.i("LamPush", "Startup installation upload: ${items.updatePushToken(it)}") }
         }
@@ -62,7 +54,6 @@ class AppContainer(
         itemRepository, items.reconciliationSession, ProcessLifecycleOwner.get().lifecycle,
         CoroutineScope(applicationScope.coroutineContext + Dispatchers.Main.immediate),
         connectivity.state,
-        synchronizeForeground = articleRepository::reconcileForeground,
     )
 
     init {
