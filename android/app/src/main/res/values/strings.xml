@@ -106,9 +106,9 @@
     <string name="detail_reconciling">Replies unavailable until synchronization completes.</string>
     <string name="detail_related_link">Open related link</string>
     <string name="detail_open_link">Open this link?</string>
-    <string name="detail_open_browser">Open in browser</string>
-    <string name="detail_unsupported_link">Only full HTTP and HTTPS web addresses can be opened.</string>
-    <string name="detail_browser_unavailable">No browser could open this link.</string>
+    <string name="detail_open_app">Open link</string>
+    <string name="detail_unsupported_link">Only http://, https:// and grokbot:// links can be opened.</string>
+    <string name="detail_no_app_for_link">No app to open this link</string>
     <string name="detail_resolved">Resolved</string>
     <string name="detail_dismissed">Dismissed</string>
     <string name="detail_retracted">Retracted</string>

@@ -185,7 +185,7 @@ fun DecisionDetailScreen(
     }
     DecisionActionSheets(state, checklist, onChoice, onCheck, onWriteReply, onEditReply, onReviewReply,
         onDismissReply, onConfirm, onDismissConfirmation, onCloseQuick, snackbar)
-    destination?.let { link -> LinkDestinationDialog(link, { destination = null }, onOpenLink ?: { openWebLink(context, it) }) }
+    destination?.let { link -> LinkDestinationDialog(link, { destination = null }, onOpenLink ?: { openLink(context, it) }) }
 }
 
 @Composable

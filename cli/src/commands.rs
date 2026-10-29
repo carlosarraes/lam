@@ -128,6 +128,19 @@ fn validate_request_fields(a: &PushArgs) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn is_supported_link(link: &str) -> bool {
+    let Some((scheme, destination)) = link.split_once("://") else {
+        return false;
+    };
+    ["http", "https", "grokbot"]
+        .iter()
+        .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+        && !destination.is_empty()
+        && !destination
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+}
+
 fn validate_push(a: &PushArgs) -> Result<()> {
     match a.kind {
         ItemKind::Fyi => validate_fyi_fields(a)?,
@@ -150,9 +163,9 @@ fn validate_push(a: &PushArgs) -> Result<()> {
     for check in &a.checks {
         validate_max_characters("--check", check, MAX_CHECK_CHARACTERS)?;
     }
-    if let Some(l) = &a.link {
-        if !l.starts_with("http://") && !l.starts_with("https://") {
-            bail!("--link must be an http(s) URL");
+    if let Some(link) = &a.link {
+        if !is_supported_link(link) {
+            bail!("--link must be an http://, https:// or grokbot:// URL");
         }
     }
     Ok(())

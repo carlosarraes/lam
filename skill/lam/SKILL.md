@@ -65,7 +65,7 @@ FYIs reject `--wait`, `--choice`, `--check`, `--recommendation`, and `--recommen
 - Retrying an identical open push returns that item's ID without notifying again. Kind, name, title, body, priority, ordered choices/checks, link, TTL seconds, and recommendation fields determine identity. Source host and project do not.
 - Never invent a name that hides who you are: the inferred `session:window` is what Carlos looks for when several agents are running.
 - Request title = the decision; recommendation = what you recommend and why; body = context and where to act. FYI title/body = the update and its result. Host and project are attached automatically.
-- Pass `--link` when there is a relevant URL, and `--ttl` when the item stops mattering after a while.
+- Pass `--link` on `lam push` or `lam pending add` for a relevant `http://`, `https://` or `grokbot://` URL. Schemes are case-insensitive and require a destination after `://`. Use `--ttl` when the item stops mattering after a while.
 - The phone notification shows at most 3 buttons; with 3 choices the Open/Reply buttons are still available inside the ntfy app.
 - Leave answering, marking seen, dismissing, and ticking checks to Carlos. As the sending agent, use `lam retract` to withdraw an obsolete item and `lam check add` to extend a checklist. Do not use `lam done` or `lam check tick` to answer your own requests.
 

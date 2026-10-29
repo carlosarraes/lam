@@ -979,8 +979,8 @@ fn event_loop(
 }
 
 fn open_link(url: &str) -> Result<()> {
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        anyhow::bail!("refusing to open non-http link: {url}");
+    if !crate::commands::is_supported_link(url) {
+        anyhow::bail!("refusing to open link: expected an http://, https:// or grokbot:// URL");
     }
     let opener = if cfg!(target_os = "macos") {
         "open"

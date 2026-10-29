@@ -100,7 +100,9 @@ const NewItemCommon = {
   body: Schema.optionalWith(Body, { default: () => "" }),
   source_host: Schema.optionalWith(Schema.String, { default: () => "" }),
   source_project: Schema.optionalWith(Schema.String, { default: () => "" }),
-  link: Schema.optional(Schema.String.pipe(Schema.pattern(/^https?:\/\//))),
+  link: Schema.optional(Schema.String.pipe(Schema.filter((value) =>
+    /^(https?|grokbot):\/\/\S+/i.test(value) || "link must be an http://, https:// or grokbot:// URL",
+  ))),
   /** Seconds until the item expires; omitted = never. */
   ttl: Schema.optional(Schema.Int.pipe(Schema.positive())),
 };

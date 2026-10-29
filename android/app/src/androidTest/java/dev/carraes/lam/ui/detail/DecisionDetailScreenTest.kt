@@ -191,11 +191,11 @@ class DecisionDetailScreenTest {
         compose.onNodeWithText("Documentation").performTouchInput { click(center) }
         compose.onNodeWithText("https://example.com/docs").assertExists()
         compose.runOnIdle { assertTrue(opened.isEmpty()) }
-        compose.onNodeWithText("Open in browser").performClick()
+        compose.onNodeWithText("Open link").performClick()
         compose.runOnIdle { assertEquals(listOf("https://example.com/docs"), opened) }
         compose.onNodeWithText("Open related link").performScrollTo().performClick()
         compose.onNodeWithText("javascript:alert(1)").assertExists()
-        compose.onNodeWithText("Open in browser").assertIsNotEnabled()
+        compose.onNodeWithText("Open link").assertIsNotEnabled()
     }
 
     @Test fun htmlIsLiteralAndRemoteImagesNeverFetch() {

@@ -46,6 +46,81 @@ fn assert_success(out: &std::process::Output) {
     );
 }
 
+#[tokio::test]
+async fn push_and_pending_add_accept_only_supported_link_schemes() {
+    let (server, dir) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/items"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(item()))
+        .mount(&server)
+        .await;
+    let links = [
+        "grokbot://app/v1/agent?id=agent-42&view=chat",
+        "GrOkBoT://app/v1/agent?id=agent-42",
+        "http://example.com/task",
+        "https://example.com/task",
+        "HTTPS://example.com/task",
+    ];
+    for prefix in [
+        vec![
+            "push",
+            "Open task",
+            "--recommendation",
+            "Review the linked task",
+        ],
+        vec!["pending", "add", "Track task", "--key", "task:42"],
+    ] {
+        for link in links {
+            let args = [prefix.clone(), vec!["-l", link]].concat();
+            assert_success(&lam(&dir, &args));
+        }
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2 * links.len());
+    for (request, link) in requests.iter().zip(links.iter().cycle()) {
+        assert_eq!(request.body_json::<Value>().unwrap()["link"], *link);
+    }
+}
+
+#[tokio::test]
+async fn push_and_pending_add_reject_unsupported_links_before_http() {
+    let (server, dir) = setup().await;
+    for prefix in [
+        vec![
+            "push",
+            "Open task",
+            "--recommendation",
+            "Review the linked task",
+        ],
+        vec!["pending", "add", "Track task", "--key", "task:42"],
+    ] {
+        for link in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "ftp://x",
+            "data:text/html,x",
+            "mailto:user@example.com",
+            "bare text",
+            "grokbot:",
+            "grokbot:app",
+            "grokbot://",
+            "http://",
+            "https://",
+            "grokbot:// ",
+        ] {
+            let args = [prefix.clone(), vec!["--link", link]].concat();
+            let out = lam(&dir, &args);
+            assert_eq!(out.status.code(), Some(1), "{link}");
+            let error = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                error.contains("lam: --link must be an http://, https:// or grokbot:// URL"),
+                "{link}: {error}"
+            );
+        }
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
 #[test]
 fn pending_help_explains_silence_dedupe_and_lifecycle_commands() {
     let out = Command::new(env!("CARGO_BIN_EXE_lam"))

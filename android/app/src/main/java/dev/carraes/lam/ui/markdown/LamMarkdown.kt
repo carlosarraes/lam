@@ -2,7 +2,8 @@ package dev.carraes.lam.ui.markdown
 
 import android.content.ActivityNotFoundException
 import android.content.Context
-import androidx.browser.customtabs.CustomTabsIntent
+import android.content.Intent
+import android.widget.Toast
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -78,19 +79,21 @@ fun LamMarkdown(content: String, onLink: (String) -> Unit, modifier: Modifier = 
     }
 }
 
-fun isSupportedWebLink(destination: String): Boolean {
+fun isSupportedLink(destination: String): Boolean {
     if (destination.any { it.isISOControl() }) return false
+    if (!Regex("(https?|grokbot)://\\S+", RegexOption.IGNORE_CASE).matches(destination)) return false
     val uri = runCatching { URI(destination) }.getOrNull() ?: return false
-    return (uri.scheme.equals("https", true) || uri.scheme.equals("http", true)) &&
-        !uri.host.isNullOrBlank() && uri.rawUserInfo == null
+    return uri.rawAuthority?.contains('@') != true &&
+        (uri.scheme.equals("grokbot", true) || !uri.host.isNullOrBlank())
 }
 
-fun openWebLink(context: Context, destination: String): Boolean {
-    if (!isSupportedWebLink(destination)) return false
+fun openLink(context: Context, destination: String): Boolean {
+    if (!isSupportedLink(destination)) return false
     return try {
-        CustomTabsIntent.Builder().setShowTitle(true).build().launchUrl(context, destination.toUri())
+        context.startActivity(Intent(Intent.ACTION_VIEW, destination.toUri().normalizeScheme()))
         true
     } catch (_: ActivityNotFoundException) {
+        Toast.makeText(context, R.string.detail_no_app_for_link, Toast.LENGTH_SHORT).show()
         false
     } catch (_: SecurityException) {
         false
@@ -100,17 +103,17 @@ fun openWebLink(context: Context, destination: String): Boolean {
 @Composable
 fun LinkDestinationDialog(destination: String, onDismiss: () -> Unit, onOpen: (String) -> Boolean) {
     var failed by remember(destination) { mutableStateOf(false) }
-    val supported = isSupportedWebLink(destination)
+    val supported = isSupportedLink(destination)
     AlertDialog(onDismissRequest = onDismiss, title = { Text(stringResource(R.string.detail_open_link)) },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState())) {
                 Text(destination)
                 if (!supported) Text(stringResource(R.string.detail_unsupported_link))
-                if (failed) Text(stringResource(R.string.detail_browser_unavailable))
+                if (failed) Text(stringResource(R.string.detail_no_app_for_link))
             }
         },
         confirmButton = { TextButton(onClick = { if (onOpen(destination)) onDismiss() else failed = true }, enabled = supported) {
-            Text(stringResource(R.string.detail_open_browser))
+            Text(stringResource(R.string.detail_open_app))
         } },
         dismissButton = { TextButton(onDismiss) { Text(stringResource(R.string.pairing_cancel)) } })
 }

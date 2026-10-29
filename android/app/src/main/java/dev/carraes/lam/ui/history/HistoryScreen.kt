@@ -90,7 +90,7 @@ fun HistoryScreen(state: HistoryState, onQuery: (String) -> Unit, onType: (ItemT
         }
     }
     if (filters) FilterSheet(state.query.type, state.query.priority, onType, onPriority, onClearFilters, { filters = false })
-    destination?.let { LinkDestinationDialog(it, { destination = null }, { url -> openWebLink(context, url) }) }
+    destination?.let { LinkDestinationDialog(it, { destination = null }, { url -> openLink(context, url) }) }
 }
 
 private fun historyTime(value: String): String = runCatching {

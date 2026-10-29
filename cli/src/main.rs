@@ -71,7 +71,7 @@ enum Cmd {
         /// Sub-item the human ticks off; the item resolves when all are done (exclusive with --choice)
         #[arg(long = "check")]
         checks: Vec<String>,
-        /// URL shown as an "Open" button on the phone
+        /// http://, https:// or grokbot:// URL shown as an "Open" button on the phone
         #[arg(short, long)]
         link: Option<String>,
         /// Expire the item after this long (e.g. 2h); expired items leave the queue
@@ -172,7 +172,7 @@ enum PendingCmd {
         /// Markdown body describing the tracked work
         #[arg(short, long, default_value = "")]
         body: String,
-        /// HTTP(S) URL to the tracked work
+        /// http://, https:// or grokbot:// URL to the tracked work
         #[arg(short, long)]
         link: Option<String>,
     },
