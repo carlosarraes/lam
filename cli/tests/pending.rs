@@ -46,6 +46,34 @@ fn assert_success(out: &std::process::Output) {
     );
 }
 
+#[test]
+fn pending_help_explains_silence_dedupe_and_lifecycle_commands() {
+    let out = Command::new(env!("CARGO_BIN_EXE_lam"))
+        .args(["pending", "--help"])
+        .output()
+        .unwrap();
+    assert_success(&out);
+    let help = String::from_utf8(out.stdout)
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for phrase in [
+        "silent (no ntfy/FCM/bell alerts)",
+        "hidden from lam list and Requests",
+        "--key is a stable dedupe key",
+        "same open key updates title/body/link and returns the same id",
+        "after it closes the key can be reused",
+        "lam pending resolve ID",
+        "lam pending resolve --key KEY",
+        "-m NOTE",
+        "lam pending move ID",
+        "lam pending unmove ID",
+    ] {
+        assert!(help.contains(phrase), "missing {phrase:?} in {help}");
+    }
+}
+
 #[tokio::test]
 async fn pending_add_creates_keyed_fyi_and_accepts_upsert_response() {
     let (server, dir) = setup().await;

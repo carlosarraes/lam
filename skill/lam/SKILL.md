@@ -89,11 +89,11 @@ lam pending move "$ID"
 lam pending unmove "$ID"
 ```
 
-`pending add TITLE --key KEY [-n NAME] [-b BODY] [-l URL]` creates a pending FYI. It needs no recommendation and never waits. `lam push ... --pending [--key KEY]` keeps the chosen kind, so requests still require a recommendation or checklist. An external key identifies one open item across title/body changes; upserts print the same id. After it closes, reusing its key creates a new item.
+Pending items are silent, with no ntfy/FCM/bell alerts, and hidden from `lam list` and Requests. `lam pending list [--json]` shows them. `pending add TITLE --key KEY [-n NAME] [-b BODY] [-l URL]` creates an FYI without a recommendation or wait. `lam push ... --pending [--key KEY]` keeps the chosen kind and its validation.
 
-`lam list` excludes pending items. `lam pending list [--json]` shows only open pending items. Pending creation and lane changes do not alert or re-alert. Moving a critical item into Pending cancels its phone notification while the item stays open. Moving preserves the name, kind, link and other origin fields. In the TUI, Pending follows Requests, `p` toggles the selected open item's lane, and `Ctrl+1` through `Ctrl+4` select Requests, Pending, History and Articles.
+`--key` is a stable dedupe key. The same open key upserts title/body/link/priority and returns the same id; after it closes the key can be reused. Resolve with `lam pending resolve ID` or `lam pending resolve --key KEY`, optionally adding `-m NOTE`. Resolution prints the updated item as JSON. Close completed trackers; leave decisions and approvals to Carlos.
 
-`lam pending resolve ID` or `lam pending resolve --key KEY` accepts an optional `-m NOTE` and prints the updated item as JSON. Use resolution to close completed trackers; leave decisions and approvals to Carlos. See `docs/pending.md` for the API contract.
+`lam pending move ID` moves an open item into Pending; `lam pending unmove ID` returns it to Requests without re-alerting. Moving preserves origin fields and cancels any critical phone notification while the item stays open. In the TUI, `p` toggles the lane, and `Ctrl+1` through `Ctrl+4` select Requests, Pending, History and Articles. See `docs/pending.md` for the API contract.
 
 ## Saved HTML Articles
 

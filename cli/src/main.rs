@@ -81,10 +81,10 @@ enum Cmd {
         /// Expire the item after this long (e.g. 2h); expired items leave the queue
         #[arg(long)]
         ttl: Option<String>,
-        /// Keep the item in Pending without notifications
+        /// Keep the item silent in Pending (no ntfy/FCM/bell alerts)
         #[arg(long)]
         pending: bool,
-        /// Update the open item with this stable external key, if one exists
+        /// Stable dedupe key; silently update the matching open item and return the same id
         #[arg(long)]
         key: Option<String>,
         /// Block until answered (same as `lam wait`)
@@ -107,8 +107,19 @@ enum Cmd {
         #[arg(long, default_value = "2h")]
         timeout: String,
     },
-    /// Track items quietly in a separate lane
-    #[command(subcommand)]
+    /// Quiet lane for items Carlos triages later (no notifications); --key dedupes
+    #[command(
+        subcommand,
+        long_about = concat!(
+            "Pending items are silent (no ntfy/FCM/bell alerts) and hidden from lam list and Requests. ",
+            "Use lam pending list to see them.\n\n",
+            "--key is a stable dedupe key: the same open key updates title/body/link and returns the same id; ",
+            "after it closes the key can be reused.\n\n",
+            "Resolve with lam pending resolve ID or lam pending resolve --key KEY, adding an optional -m NOTE. ",
+            "Use lam pending move ID to move an open item into Pending and lam pending unmove ID to return it ",
+            "to Requests without re-alerting. Moving a critical item into Pending cancels its existing phone notification."
+        )
+    )]
     Pending(PendingCmd),
     /// List items (open by default)
     List {
@@ -187,34 +198,49 @@ enum ArticleCmd {
 enum PendingCmd {
     /// Add or update a quiet FYI with a stable external key; prints its id
     Add {
+        /// Title of the pending FYI
         title: String,
+        /// Stable dedupe key; update the matching open item and return its id
         #[arg(long)]
         key: String,
+        /// Agent name; inferred when omitted
         #[arg(short = 'n', long)]
         name: Option<String>,
+        /// Markdown body describing the tracked work
         #[arg(short, long, default_value = "")]
         body: String,
+        /// HTTP(S) URL to the tracked work
         #[arg(short, long)]
         link: Option<String>,
     },
     /// List open items in Pending
     List {
+        /// Print pending items as JSON
         #[arg(long)]
         json: bool,
     },
     /// Resolve an item by id or stable external key
     Resolve {
+        /// Item id to resolve; use either ID or --key
         #[arg(required_unless_present = "key", conflicts_with = "key")]
         id: Option<String>,
+        /// Stable dedupe key of the open item to resolve
         #[arg(long)]
         key: Option<String>,
+        /// Optional resolution note
         #[arg(short, long)]
         message: Option<String>,
     },
     /// Move an open item into Pending without notifying
-    Move { id: String },
+    Move {
+        /// Open item id to move into Pending
+        id: String,
+    },
     /// Return an open item to Requests without notifying
-    Unmove { id: String },
+    Unmove {
+        /// Pending item id to return to Requests
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
