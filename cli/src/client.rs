@@ -33,6 +33,10 @@ pub struct Item {
     #[serde(default)]
     pub seen_at: Option<String>,
     #[serde(default)]
+    pub pending_at: Option<String>,
+    #[serde(default)]
+    pub external_key: Option<String>,
+    #[serde(default)]
     pub name: String,
     pub title: String,
     pub body: String,
@@ -127,6 +131,10 @@ pub struct NewItem {
     pub link: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -571,6 +579,32 @@ impl Client {
             req = req.query(&[("status", s)]);
         }
         Ok(Self::ok(req.send()?)?.json()?)
+    }
+
+    pub fn pending_list(&self) -> Result<Vec<Item>> {
+        Ok(Self::ok(
+            self.get("/items")
+                .query(&[("pending", "1"), ("status", "open")])
+                .send()?,
+        )?
+        .json()?)
+    }
+
+    pub fn set_pending(&self, id: &str, pending: bool) -> Result<Item> {
+        Ok(Self::ok(
+            self.post(&format!("/v2/items/{id}/pending"))
+                .json(&serde_json::json!({ "pending": pending }))
+                .send()?,
+        )?
+        .json()?)
+    }
+
+    pub fn resolve_key(&self, external_key: &str, text: Option<String>) -> Result<Item> {
+        let mut body = serde_json::json!({ "external_key": external_key });
+        if let Some(text) = text {
+            body["text"] = text.into();
+        }
+        Ok(Self::ok(self.post("/v2/items/resolve").json(&body).send()?)?.json()?)
     }
 
     /// A page of the queue, newest first. `before` is an exclusive `created_at` cursor: pass the

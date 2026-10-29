@@ -20,6 +20,7 @@ export class Notify extends Effect.Service<Notify>()("lam/Notify", {
     return {
       itemCreated: (item: Item, baseUrl: string) =>
         Effect.gen(function* () {
+          if (item.pending_at !== null) return;
           const t = yield* auth.itemToken(item.id);
           const page = `${baseUrl}/r/${item.id}?t=${t}`;
           const actions: Draft["actions"] = [];
@@ -55,6 +56,7 @@ export class Notify extends Effect.Service<Notify>()("lam/Notify", {
 
       checkAdded: (item: Item, label: string, baseUrl: string) =>
         Effect.gen(function* () {
+          if (item.pending_at !== null) return;
           const t = yield* auth.itemToken(item.id);
           yield* publish({
             title: `${item.title} [${item.id}]`,
@@ -66,7 +68,7 @@ export class Notify extends Effect.Service<Notify>()("lam/Notify", {
         }),
 
       itemClosed: (item: Item) =>
-        publish({
+        item.pending_at !== null ? Effect.void : publish({
           title: `${item.title} [${item.id}]`,
           message: `${item.status} via ${item.response_by}: ${
             item.response_choice ?? item.response_text ?? (item.checks.length ? `${item.checksDone}/${item.checks.length} checks` : item.status)

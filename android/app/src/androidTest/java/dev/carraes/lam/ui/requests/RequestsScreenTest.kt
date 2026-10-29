@@ -24,6 +24,27 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class RequestsScreenTest {
+    @Test fun pendingQueueReusesListAndOpensAnItemAndReturnsToRequests() {
+        val pending = item("pending", "Wait for deployment", "Builder").copy(pendingAt = now.toString())
+        compose.setContent { LamTheme { LamNav(RequestsState(loading = false), {}, {}, {}, {}, {},
+            pendingContent = { onRequests, onHistory, onSettings, onItem ->
+                RequestsScreen(RequestsState(items = listOf(pending), loading = false, now = now, pending = true),
+                    {}, {}, {}, {}, {}, onHistory, onSettings, onItem, onRequests = onRequests)
+            }, detailContent = { _, onBack ->
+                DecisionDetailScreen(DecisionState(item = pending, loading = false), onBack)
+            }) } }
+        compose.onNodeWithContentDescription("Switch queue").performClick()
+        compose.onNodeWithText("Pending").performClick()
+        compose.onNodeWithText("Wait for deployment", useUnmergedTree = true).assertExists()
+        compose.onNodeWithContentDescription("Search pending").assertExists()
+        compose.onNodeWithContentDescription("Wait for deployment, Builder, Warning priority, Decision, 2 choices, No recommendation, Open request").performClick()
+        compose.onNodeWithText("Request detail").assertExists()
+        compose.onNodeWithContentDescription("Back").performClick()
+        compose.onNodeWithContentDescription("Switch queue").performClick()
+        compose.onNodeWithText("Requests").performClick()
+        compose.onNodeWithText("No open requests").assertExists()
+    }
+
     @Test fun inboxCountsFyiSeparatelyAndHistoryDistinguishesSeenFromDismissed() {
         val fyi = item("notice", "Read this", "Builder").copy(kind = ItemKindDto.FYI, choices = emptyList())
         val legacy = item("legacy", "Legacy request", "Builder", PriorityDto.LOW)

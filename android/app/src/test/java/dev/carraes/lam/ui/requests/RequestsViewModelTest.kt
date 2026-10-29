@@ -16,6 +16,24 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class RequestsViewModelTest {
+    @Test fun requestsAndPendingShowSeparateOpenLanes() = runTest {
+        val repo = RequestsFakeRepository().apply { openItems.value = listOf(
+            request("request"), request("pending").copy(pendingAt = "2026-09-04T12:00:00Z"),
+            request("closed").copy(pendingAt = "2026-09-04T12:00:00Z", status = StatusDto.RESOLVED)) }
+        val requests = RequestsViewModel(repo, { true }, fixedClock)
+        val pending = RequestsViewModel(repo, { true }, fixedClock, pending = true)
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { requests.state.collect() }
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { pending.state.collect() }
+        runCurrent()
+        assertEquals(listOf("request"), requests.state.value.items.map { it.id })
+        assertEquals(listOf("pending"), pending.state.value.items.map { it.id })
+
+        repo.openItems.value = repo.openItems.value.map { it.copy(pendingAt = null) }
+        runCurrent()
+        assertEquals(setOf("request", "pending"), requests.state.value.items.map { it.id }.toSet())
+        assertTrue(pending.state.value.items.isEmpty())
+    }
+
     @Test fun pendingCountsSeparateFyiFromLegacyLowRequests() = runTest {
         val repo = RequestsFakeRepository().apply { openItems.value = listOf(
             request("legacy").copy(priority = PriorityDto.LOW), request("notice").copy(kind = ItemKindDto.FYI),

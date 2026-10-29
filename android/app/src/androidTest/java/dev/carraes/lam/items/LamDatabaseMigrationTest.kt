@@ -37,12 +37,13 @@ class LamDatabaseMigrationTest {
                 old.execSQL("INSERT INTO history_membership VALUES ('saved-query', 'closed')")
                 old.version = 1
             }
-            val database = Room.databaseBuilder(context, LamDatabase::class.java, name).addMigrations(LamDatabase.MIGRATION_1_2, LamDatabase.MIGRATION_2_3).build()
+            val database = Room.databaseBuilder(context, LamDatabase::class.java, name).addMigrations(LamDatabase.MIGRATION_1_2, LamDatabase.MIGRATION_2_3, LamDatabase.MIGRATION_3_4).build()
             try {
                 val store = RoomItemStorage(database)
                 val legacy = store.get("legacy")!!.canonical
                 assertEquals(ItemKindDto.REQUEST, legacy.kind)
                 assertNull(legacy.seenAt)
+                assertNull(legacy.pendingAt)
                 assertEquals(PriorityDto.LOW, legacy.priority)
                 assertEquals("Preserve this", legacy.body)
                 assertEquals(listOf(CheckDto("Review", false, null)), legacy.checks)
@@ -50,6 +51,9 @@ class LamDatabaseMigrationTest {
                 assertEquals(Instant.parse("2026-09-04T12:00:00Z"), store.lastSuccess())
                 assertEquals("closed", store.history("saved-query").first().single().canonical.id)
                 assertEquals("legacy", store.openItems().first().single().canonical.id)
+                val pending = legacy.copy(id = "pending", pendingAt = "2026-09-04T12:00:00Z")
+                store.upsert(listOf(ItemMapper.toEntity(pending)))
+                assertEquals(pending, store.get("pending")!!.canonical)
                 val seen = legacy.copy(id = "notice", kind = ItemKindDto.FYI, checks = emptyList(), status = StatusDto.DISMISSED,
                     seenAt = "2026-09-04T12:00:00Z", resolvedAt = "2026-09-04T12:00:00Z")
                 store.upsert(listOf(ItemMapper.toEntity(seen)))

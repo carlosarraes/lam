@@ -57,6 +57,20 @@ class PushNotificationPlanTest {
     }
 
     @Test
+    fun `pending invalidation cancels an existing alert while the item stays open`() {
+        val pending = PushEventParser.parse(mapOf(
+            "event" to "item.changed", "item_id" to "abc29", "version" to "2",
+            "status" to "open", "kind" to "request", "name" to "pm",
+            "priority" to "critical", "title" to "Release decision", "pending" to "true",
+        ))!!
+
+        assertTrue(PushNotificationPlan.forEvent(event(CriticalPushEvent.Type.CREATED)) is PushNotificationPlan.Show)
+        assertEquals("open", pending.status)
+        assertEquals(CriticalPushEvent.Type.CHANGED, pending.event)
+        assertEquals(PushNotificationPlan.Cancel("item:abc29"), PushNotificationPlan.forEvent(pending))
+    }
+
+    @Test
     fun `canonical state keeps only open critical notifications`() {
         val item = Item(
             id = "abc29", name = "pm", title = "Release decision", body = "", sourceHost = "box",
@@ -69,6 +83,7 @@ class PushNotificationPlanTest {
         assertTrue(PushNotificationPlan.shouldRemain(item))
         assertFalse(PushNotificationPlan.shouldRemain(item.copy(status = StatusDto.RESOLVED)))
         assertFalse(PushNotificationPlan.shouldRemain(item.copy(priority = PriorityDto.NORMAL)))
+        assertFalse(PushNotificationPlan.shouldRemain(item.copy(pendingAt = "2026-10-29T12:00:00Z")))
         assertFalse(PushNotificationPlan.shouldRemain(null))
     }
 }

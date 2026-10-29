@@ -46,6 +46,10 @@ pub enum Action {
         text: Option<String>,
     },
     Dismiss(String),
+    SetPending {
+        id: String,
+        pending: bool,
+    },
     Seen {
         id: String,
         version: u64,
@@ -81,6 +85,7 @@ enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Requests,
+    Pending,
     History,
     Articles,
 }
@@ -96,6 +101,7 @@ pub struct App {
     tab: Tab,
     articles: articles::ArticlesPane,
     requests: Pane,
+    pending: Pane,
     history: Pane,
     /// `created_at` of the last row the server returned, however few of them we kept. Paging from
     /// the last *displayed* item would stall whenever a page ended on an open row.
@@ -104,7 +110,7 @@ pub struct App {
     history_end: bool,
     /// A page is in flight. The network thread is serial, so there is at most one.
     history_loading: bool,
-    /// The terminal granted the kitty flags, so Ctrl+1/Ctrl+2 actually arrive.
+    /// The terminal granted the kitty flags, so Ctrl+number jumps actually arrive.
     kitty: bool,
     filter: String,
     /// Cursor within the selected item's checks.
@@ -131,6 +137,7 @@ impl App {
             tab: Tab::Requests,
             articles: articles::ArticlesPane::default(),
             requests: Pane::default(),
+            pending: Pane::default(),
             history: Pane::default(),
             history_cursor: None,
             history_end: false,
@@ -158,6 +165,7 @@ impl App {
     fn pane(&self) -> &Pane {
         match self.tab {
             Tab::Requests => &self.requests,
+            Tab::Pending => &self.pending,
             Tab::History => &self.history,
             Tab::Articles => &self.requests,
         }
@@ -166,6 +174,7 @@ impl App {
     fn pane_mut(&mut self) -> &mut Pane {
         match self.tab {
             Tab::Requests => &mut self.requests,
+            Tab::Pending => &mut self.pending,
             Tab::History => &mut self.history,
             Tab::Articles => &mut self.requests,
         }
@@ -173,7 +182,7 @@ impl App {
 
     /// Refreshes never move you: the same item stays selected, keeping its scroll position and
     /// check cursor. Only when it is gone (resolved, filtered away) does the cursor reset. This
-    /// feeds the requests tab only — a refresh landing while you read history must not move it.
+    /// feeds the open lanes only — a refresh landing while you read history must not move it.
     pub fn set_items(&mut self, items: Vec<Item>) {
         if let Some(item) = self
             .reader_item
@@ -182,25 +191,39 @@ impl App {
         {
             self.reconcile_item(item);
         }
-        let previous = self
-            .visible_of(Tab::Requests)
-            .get(self.requests.selected)
-            .map(|i| i.id.clone());
-        self.requests.items = items;
-        let same = previous.and_then(|id| {
-            self.visible_of(Tab::Requests)
-                .iter()
-                .position(|i| i.id == id)
-        });
+        let (pending, requests) = items
+            .into_iter()
+            .partition(|item| item.pending_at.is_some());
+        self.set_pane_items(Tab::Requests, requests);
+        self.set_pane_items(Tab::Pending, pending);
+    }
+
+    fn set_pane_items(&mut self, tab: Tab, items: Vec<Item>) {
+        let selected = match tab {
+            Tab::Requests => self.requests.selected,
+            Tab::Pending => self.pending.selected,
+            _ => return,
+        };
+        let previous = self.visible_of(tab).get(selected).map(|i| i.id.clone());
+        match tab {
+            Tab::Requests => self.requests.items = items,
+            Tab::Pending => self.pending.items = items,
+            _ => return,
+        }
+        let same = previous.and_then(|id| self.visible_of(tab).iter().position(|i| i.id == id));
         match same {
             Some(pos) => {
-                self.requests.selected = pos;
-                if self.tab == Tab::Requests {
+                match tab {
+                    Tab::Requests => self.requests.selected = pos,
+                    Tab::Pending => self.pending.selected = pos,
+                    _ => return,
+                }
+                if self.tab == tab {
                     let checks = self.current().map_or(0, |i| i.checks.len());
                     self.check_sel = self.check_sel.min(checks.saturating_sub(1));
                 }
             }
-            None => self.clamp_of(Tab::Requests),
+            None => self.clamp_of(tab),
         }
     }
 
@@ -250,6 +273,7 @@ impl App {
         let n = self.visible_of(tab).len();
         let pane = match tab {
             Tab::Requests => &mut self.requests,
+            Tab::Pending => &mut self.pending,
             Tab::History => &mut self.history,
             Tab::Articles => return,
         };
@@ -293,7 +317,7 @@ impl App {
         match (self.reader, self.kitty) {
             (true, _) => "j/k move · J/K scroll · g/G top/end · m close · / filter · q quit",
             (false, true) => {
-                "h/l prev/next tab · ^1/^2/^3 tabs · j/k move · m read · / filter · R refresh · q quit"
+                "h/l prev/next tab · ^1/^2/^3/^4 tabs · j/k move · m read · / filter · R refresh · q quit"
             }
             (false, false) => "h/l prev/next tab · j/k move · m read · / filter · R refresh · q quit",
         }
@@ -309,6 +333,7 @@ impl App {
     fn visible_of(&self, tab: Tab) -> Vec<&Item> {
         let items = match tab {
             Tab::Requests => &self.requests.items,
+            Tab::Pending => &self.pending.items,
             Tab::History => &self.history.items,
             Tab::Articles => return vec![],
         };
@@ -393,11 +418,23 @@ impl App {
         {
             *row = item.clone();
         }
+        if let Some(row) = self
+            .pending
+            .items
+            .iter_mut()
+            .find(|row| row.id == item.id && row.version <= item.version)
+        {
+            *row = item.clone();
+        }
         if item.status != "open" {
             self.requests
                 .items
                 .retain(|row| row.id != item.id || row.version > item.version);
             self.clamp_of(Tab::Requests);
+            self.pending
+                .items
+                .retain(|row| row.id != item.id || row.version > item.version);
+            self.clamp_of(Tab::Pending);
         }
     }
 
@@ -451,7 +488,7 @@ impl App {
         if !matches!(
             self.mode,
             Mode::Filter | Mode::Reply { .. } | Mode::ArticleDate(_)
-        ) && key.code == KeyCode::Char('3')
+        ) && key.code == KeyCode::Char('4')
             && key.modifiers.contains(KeyModifiers::CONTROL)
         {
             return self.set_tab(Tab::Articles);
@@ -460,7 +497,7 @@ impl App {
             let global = !matches!(self.mode, Mode::Filter | Mode::ArticleDate(_))
                 && (matches!(key.code, KeyCode::Char('h' | 'l' | 'q') | KeyCode::Esc)
                     || (key.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(key.code, KeyCode::Char('1' | '2' | 'c'))));
+                        && matches!(key.code, KeyCode::Char('1' | '2' | '3' | 'c'))));
             if !global {
                 return self.handle_articles(key);
             }
@@ -527,6 +564,9 @@ impl App {
                 self.set_tab(Tab::Requests)
             }
             KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.set_tab(Tab::Pending)
+            }
+            KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.set_tab(Tab::History)
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -586,11 +626,13 @@ impl App {
             }
             KeyCode::Char('h') => self.set_tab(match self.tab {
                 Tab::Requests => Tab::Articles,
-                Tab::History => Tab::Requests,
+                Tab::Pending => Tab::Requests,
+                Tab::History => Tab::Pending,
                 Tab::Articles => Tab::History,
             }),
             KeyCode::Char('l') => self.set_tab(match self.tab {
-                Tab::Requests => Tab::History,
+                Tab::Requests => Tab::Pending,
+                Tab::Pending => Tab::History,
                 Tab::History => Tab::Articles,
                 Tab::Articles => Tab::Requests,
             }),
@@ -631,6 +673,10 @@ impl App {
                 self.load_more()
             }
             KeyCode::Char('R') => Some(Action::Refresh),
+            KeyCode::Char('p') => self.open_current().map(|item| Action::SetPending {
+                id: item.id.clone(),
+                pending: item.pending_at.is_none(),
+            }),
             KeyCode::Char('d') => self.open_current().map(|i| Action::Dismiss(i.id.clone())),
             KeyCode::Char('o') => self
                 .current()
@@ -685,6 +731,10 @@ impl App {
 /// or hung request cannot freeze the screen — and `q`/Ctrl-C keep working, which in raw mode they
 /// only do if the loop is still reading keys.
 enum Job {
+    SetPending {
+        id: String,
+        pending: bool,
+    },
     Articles {
         query: String,
         read: String,
@@ -909,6 +959,7 @@ pub fn run(silent: bool) -> Result<i32> {
             }
             let outcome = match job {
                 Job::Refresh => Ok(()),
+                Job::SetPending { id, pending } => client.set_pending(&id, pending).map(|_| ()),
                 Job::Resolve { id, choice, text } => client
                     .resolve(&id, &Resolution { choice, text })
                     .map(|item| {
@@ -930,10 +981,15 @@ pub fn run(silent: bool) -> Result<i32> {
                 let _ = net_tx.send(Msg::Failed(format!("{e}")));
             }
             // Every job ends by re-reading the queue, so the screen always catches up.
-            let _ = net_tx.send(match client.list(Some("open")) {
-                Ok(items) => Msg::Items(items),
-                Err(e) => Msg::Failed(format!("refresh failed: {e}")),
-            });
+            let _ = net_tx.send(
+                match client.list(Some("open")).and_then(|mut items| {
+                    items.extend(client.pending_list()?);
+                    Ok(items)
+                }) {
+                    Ok(items) => Msg::Items(items),
+                    Err(e) => Msg::Failed(format!("refresh failed: {e}")),
+                },
+            );
         }
     });
 
@@ -1116,6 +1172,7 @@ fn event_loop(
             Action::LoadHistory { before } => Job::History { before },
             Action::Resolve { id, choice, text } => Job::Resolve { id, choice, text },
             Action::Dismiss(id) => Job::Dismiss(id),
+            Action::SetPending { id, pending } => Job::SetPending { id, pending },
             Action::Seen { id, version } => Job::Seen { id, version },
             Action::SetCheck { id, index, done } => Job::SetCheck { id, index, done },
             Action::OpenLink(url) => {
@@ -1155,15 +1212,52 @@ fn open_link(url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn p_toggles_pending_and_lanes_hide_each_others_items() {
+        let mut a = App::new("host".into());
+        let active = item("active", "open", &[], "");
+        let mut pending = item("waiting", "open", &[], "https://example.com");
+        pending.pending_at = Some("2026-10-29T12:00:00Z".into());
+        a.set_items(vec![active, pending]);
+        assert_eq!(
+            a.visible()
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["active"]
+        );
+        assert_eq!(
+            a.handle(key('p')),
+            Some(Action::SetPending {
+                id: "active".into(),
+                pending: true
+            })
+        );
+        a.set_busy(false);
+        a.handle(key('l'));
+        assert_eq!(a.tab, Tab::Pending);
+        assert_eq!(a.current().unwrap().id, "waiting");
+        assert_eq!(
+            a.handle(key('p')),
+            Some(Action::SetPending {
+                id: "waiting".into(),
+                pending: false
+            })
+        );
+        a.tab = Tab::History;
+        a.history.items = vec![item("closed", "resolved", &[], "")];
+        assert_eq!(a.handle(key('p')), None);
+    }
+
+    #[test]
     fn hl_cycles_all_tabs_and_a_is_not_a_shortcut() {
         let mut a = App::new("host".into());
         assert_eq!(a.handle(key('a')), None);
         assert_eq!(a.tab, Tab::Requests);
-        for expected in [Tab::History, Tab::Articles, Tab::Requests] {
+        for expected in [Tab::Pending, Tab::History, Tab::Articles, Tab::Requests] {
             a.handle(key('l'));
             assert_eq!(a.tab, expected);
         }
-        for expected in [Tab::Articles, Tab::History, Tab::Requests] {
+        for expected in [Tab::Articles, Tab::History, Tab::Pending, Tab::Requests] {
             a.handle(key('h'));
             assert_eq!(a.tab, expected);
         }
@@ -1171,7 +1265,7 @@ mod tests {
 
     #[test]
     fn hl_and_a_remain_text_when_editing() {
-        for tab in [Tab::Requests, Tab::History, Tab::Articles] {
+        for tab in [Tab::Requests, Tab::Pending, Tab::History, Tab::Articles] {
             let mut a = App::new("host".into());
             a.set_tab(tab);
             a.handle(key('/'));
@@ -1201,12 +1295,12 @@ mod tests {
     #[test]
     fn articles_ctrl_shortcut_does_not_change_request_choices() {
         let mut a = app();
-        a.handle(ctrl('3'));
+        a.handle(ctrl('4'));
         assert_eq!(format!("{:?}", a.tab), "Articles");
         assert_eq!(a.handle(key('1')), None);
         a.handle(ctrl('1'));
         assert!(matches!(a.handle(key('1')), Some(Action::Resolve { .. })));
-        a.handle(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL));
+        a.handle(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL));
         assert_eq!(format!("{:?}", a.tab), "Articles");
         a.handle(key('h'));
         assert_eq!(a.tab, Tab::History);
@@ -1236,6 +1330,8 @@ mod tests {
             created_at: String::new(),
             resolved_at: None,
             expires_at: None,
+            pending_at: None,
+            external_key: None,
         }
     }
 
@@ -1552,7 +1648,7 @@ mod tests {
     #[test]
     fn fyi_history_enter_is_inert_but_m_opens_reader() {
         let mut a = App::new("host".into());
-        a.handle(key('l'));
+        a.handle(ctrl('3'));
         let mut seen = fyi();
         seen.status = "dismissed".into();
         seen.seen_at = Some("2026-09-08T12:00:00Z".into());
@@ -1694,7 +1790,7 @@ mod tests {
         assert_eq!(a.requests.selected, 2);
         assert_eq!(a.handle(key('o')), None);
         assert!(matches!(
-            a.handle(ctrl('3')),
+            a.handle(ctrl('4')),
             Some(Action::LoadArticles { .. })
         ));
         assert_eq!(a.handle(key('q')), Some(Action::Quit));
@@ -1963,17 +2059,19 @@ mod tests {
     #[test]
     fn tabs_switch_with_h_l_and_ctrl_digits() {
         let mut a = app();
+        assert_eq!(a.handle(ctrl('2')), None);
+        assert_eq!(a.tab, Tab::Pending);
         assert_eq!(
             a.handle(key('l')),
             Some(Action::LoadHistory { before: None }),
             "the first visit loads the newest page"
         );
         assert_eq!(a.tab, Tab::History);
-        assert_eq!(a.handle(ctrl('2')), None, "already there");
-        assert_eq!(a.handle(key('h')), None);
+        assert_eq!(a.handle(ctrl('3')), None, "already there");
+        assert_eq!(a.handle(ctrl('1')), None);
         assert_eq!(a.tab, Tab::Requests);
 
-        assert!(a.handle(ctrl('2')).is_none(), "the page is already loading");
+        assert!(a.handle(ctrl('3')).is_none(), "the page is already loading");
         assert_eq!(a.tab, Tab::History);
         a.handle(ctrl('1'));
         assert_eq!(a.tab, Tab::Requests);
@@ -2038,7 +2136,7 @@ mod tests {
     #[test]
     fn a_refresh_landing_mid_page_does_not_release_the_paging_guard() {
         let mut a = app();
-        assert!(a.handle(key('l')).is_some());
+        assert!(a.handle(ctrl('3')).is_some());
         // an unrelated refresh completes while the history page is still queued
         a.set_items(vec![item("new", "open", &[], "")]);
         a.set_busy(false);
@@ -2053,7 +2151,7 @@ mod tests {
     #[test]
     fn history_stops_when_a_page_adds_nothing() {
         let mut a = app();
-        a.handle(key('l'));
+        a.handle(ctrl('3'));
         let page = vec![closed("res", "resolved", 2)];
         a.add_history(page.clone(), false);
         assert!(!a.history_end);
@@ -2069,7 +2167,7 @@ mod tests {
     #[test]
     fn history_pages_when_the_cursor_nears_the_bottom() {
         let mut a = app();
-        a.handle(key('l'));
+        a.handle(ctrl('3'));
         let page: Vec<Item> = (0..HISTORY_PAGE)
             .map(|n| closed(&format!("i{n:03}"), "resolved", n as i64 + 1))
             .collect();
@@ -2088,7 +2186,7 @@ mod tests {
     #[test]
     fn history_items_are_inert() {
         let mut a = app();
-        a.handle(key('l'));
+        a.handle(ctrl('3'));
         a.add_history(vec![closed("res", "resolved", 2)], true);
         for k in ['1', 'd', 'r', ' '] {
             assert_eq!(
@@ -2105,23 +2203,23 @@ mod tests {
         let mut a = app();
         a.handle(key('j'));
         assert_eq!(a.requests.selected, 1);
-        a.handle(key('l'));
+        a.handle(ctrl('3'));
         a.add_history(
             vec![closed("r1", "resolved", 2), closed("r2", "dismissed", 3)],
             true,
         );
         a.handle(key('j'));
         assert_eq!(a.history.selected, 1);
-        a.handle(key('h'));
+        a.handle(ctrl('1'));
         assert_eq!(a.requests.selected, 1, "requests kept its place");
-        a.handle(key('l'));
+        a.handle(ctrl('3'));
         assert_eq!(a.history.selected, 1, "and so did history");
     }
 
     #[test]
     fn a_refresh_does_not_move_the_history_cursor() {
         let mut a = app();
-        a.handle(key('l'));
+        a.handle(ctrl('3'));
         a.add_history(
             vec![closed("r1", "resolved", 2), closed("r2", "dismissed", 3)],
             true,
@@ -2143,7 +2241,7 @@ mod tests {
             3,
             "every queued item is titled t"
         );
-        a.handle(key('l'));
+        a.handle(ctrl('3'));
         assert_eq!(
             a.visible().len(),
             0,

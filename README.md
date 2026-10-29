@@ -41,21 +41,27 @@ Every item records **who asked**. `lam push` resolves the name in this order: `-
 
 ## CLI
 
-FYIs accept one optional text reply from Android's **Reply** action, `r` in the TUI, or `lam done ID -m "reply"`. Seen FYIs can still be replied to in History. They stay out of the pending queue; Enter still only marks seen. Agents retrieve the saved reply through `lam show ID` → `response_text`. Replies do not automatically wake the sending agent. Retracted, expired, explicitly dismissed, and already-replied FYIs cannot receive another reply.
+FYIs accept one optional text reply from Android's **Reply** action, `r` in the TUI, or `lam done ID -m "reply"`. Seen FYIs can still be replied to in History. They stay out of Requests; Enter still only marks seen. Agents retrieve the saved reply through `lam show ID` → `response_text`. Replies do not automatically wake the sending agent. Retracted, expired, explicitly dismissed, and already-replied FYIs cannot receive another reply.
 
 | cmd | |
 |---|---|
-| `lam push <title> [-n name] [-b body] [-p low\|normal\|critical] [--recommendation TEXT] [-c choice]… [--recommended-choice CHOICE] \| [--check part]… [--link URL] [--ttl 2h] [--wait]` | prints id; every decision requires `--recommendation` (the action and rationale); choices also require an exact `--recommended-choice`; `--check` makes a checklist that resolves when all parts are ticked and is the only exception |
+| `lam push <title> [-n name] [-b body] [-p low\|normal\|critical] [--recommendation TEXT] [-c choice]… [--recommended-choice CHOICE] \| [--check part]… [--link URL] [--ttl 2h] [--pending] [--key KEY] [--wait]` | prints id; every decision requires `--recommendation` (the action and rationale); choices also require an exact `--recommended-choice`; `--check` makes a checklist that resolves when all parts are ticked and is the only exception |
+| `lam pending add TITLE --key KEY [-n NAME] [-b BODY] [-l URL]` | add or update a quiet FYI in Pending; prints its id |
+| `lam pending list [--json]` | list open pending items |
+| `lam pending resolve <id> \| --key KEY [-m NOTE]` | close a tracked item by id or stable external key |
+| `lam pending move <id>`, `lam pending unmove <id>` | move an open item into Pending or return it to Requests |
 | `lam wait <id>… \| --any [--timeout 2h]` | first item to change (a check ticked) or close, as JSON; `--any` covers every open item under this agent's name; exit 0 resolved/changed / 2 dismissed / 3 timeout / 4 expired / 5 retracted |
 | `lam retract <id>`, `lam check add <id> <label>` | agent withdraws its ask / appends a check |
 | `lam check tick\|untick <id> <n>` | Carlos's side, from the terminal |
 | `lam list [--all] [--json]`, `lam show <id>` | |
 | `lam done <id> [choice] [-m text]`, `lam dismiss <id>` | Carlos's side |
-| `lam` / `lam tui` | interactive queue in the terminal: `1-3` choose, `Enter` done or mark FYI seen, `Space` tick the next check, `Tab` + `j/k` pick a check, `r` reply text, `d` dismiss, `o` open link, `m` markdown reader, `/` filter by agent; `h`/`l` cycle Requests, History and Articles, or `Ctrl+1` through `Ctrl+3` select a tab; live updates |
+| `lam` / `lam tui` | interactive queue in the terminal: `1-3` choose, `Enter` done or mark FYI seen, `Space` tick the next check, `Tab` + `j/k` pick a check, `r` reply text, `d` dismiss, `o` open link, `m` markdown reader, `/` filter by agent; `p` moves an item to or from Pending; `h`/`l` cycle Requests, Pending, History and Articles, or `Ctrl+1` through `Ctrl+4` select a tab; live updates |
 | `lam article publish --file PATH --title TITLE --summary TEXT [--asset PATH]… [--silent]` | save a static HTML report and its explicitly listed assets to Articles |
 | `lam article list [--day YYYY-MM-DD] [--read all\|unread\|read] [--query TEXT]` | list articles by creation day in `America/Sao_Paulo`; omit `--day` for all dates |
 | `lam article open ID`, `lam article read ID`, `lam article unread ID` | open the browser reader or explicitly change read state |
 | `lam watch` | mirror ntfy → desktop notifications |
 | `lam --llm` | print the agent guide (the `lam` skill) — for agents that don't have the skill installed |
+
+Pending is a quiet lane for tracked work. `lam push --pending` preserves the selected item kind and its required fields. `--key KEY` updates an existing open item with that key and returns the same id, even when its title or body changes. Default lists exclude Pending; `lam pending list` shows it. Pending creation and lane changes do not alert; moving a critical item to Pending cancels its phone notification. See [Pending](docs/pending.md) for commands and API details.
 
 The Articles tab opens on Today. In the TUI, `[`/`]` move one calendar day, `t` returns to Today, `D` accepts a date, and `U` shows All unread across dates. `/` searches, `f` cycles All/Unread/Read, `Enter` opens, and `u` marks unread. The browser reader keeps theme, zoom and attachments behind one sliders button. See [Articles](docs/articles.md) for publishing, navigation and reading controls.

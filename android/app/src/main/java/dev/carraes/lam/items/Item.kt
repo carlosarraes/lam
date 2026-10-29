@@ -23,6 +23,7 @@ data class Item(
     val version: Long,
     val kind: ItemKindDto = ItemKindDto.REQUEST,
     val seenAt: String? = null,
+    val pendingAt: String? = null,
 ) {
     val isFyi: Boolean get() = kind == ItemKindDto.FYI
     val canReply: Boolean get() = if (isFyi) responseText == null &&

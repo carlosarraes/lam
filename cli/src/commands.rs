@@ -50,6 +50,8 @@ pub struct PushArgs {
     pub checks: Vec<String>,
     pub link: Option<String>,
     pub ttl: Option<String>,
+    pub pending: bool,
+    pub key: Option<String>,
     pub wait: bool,
 }
 
@@ -183,6 +185,8 @@ pub fn push(a: PushArgs) -> Result<i32> {
         recommended_choice: a.recommended_choice,
         link: a.link,
         ttl,
+        pending: a.pending.then_some(true),
+        external_key: a.key,
     })?;
     if a.wait {
         eprintln!("pushed {} — waiting", item.id);
@@ -279,11 +283,15 @@ pub fn wait(ids: &[String], any: bool, name: Option<String>, timeout: &str) -> R
 
 pub fn list(all: bool, json: bool) -> Result<i32> {
     let items = client()?.list(if all { None } else { Some("open") })?;
+    print_items(&items, json)
+}
+
+fn print_items(items: &[Item], json: bool) -> Result<i32> {
     if json {
         print_json(&items)?;
         return Ok(0);
     }
-    for i in &items {
+    for i in items {
         let src = [i.name.as_str()]
             .iter()
             .filter(|s| !s.is_empty())
@@ -322,18 +330,71 @@ pub fn list(all: bool, json: bool) -> Result<i32> {
     Ok(0)
 }
 
+pub fn pending_add(
+    title: String,
+    key: String,
+    name: Option<String>,
+    body: String,
+    link: Option<String>,
+) -> Result<i32> {
+    push(PushArgs {
+        title,
+        kind: ItemKind::Fyi,
+        name,
+        body,
+        priority: "normal".into(),
+        choices: Vec::new(),
+        recommendation: None,
+        recommended_choice: None,
+        checks: Vec::new(),
+        link,
+        ttl: None,
+        pending: true,
+        key: Some(key),
+        wait: false,
+    })
+}
+
+pub fn pending_list(json: bool) -> Result<i32> {
+    print_items(&client()?.pending_list()?, json)
+}
+
+pub fn pending_move(id: &str, pending: bool) -> Result<i32> {
+    print_json(&client()?.set_pending(id, pending)?)?;
+    Ok(0)
+}
+
+pub fn pending_resolve(
+    id: Option<&str>,
+    key: Option<&str>,
+    message: Option<String>,
+) -> Result<i32> {
+    if let Some(key) = key {
+        validate_reply(&message)?;
+        print_json(&client()?.resolve_key(key, message)?)?;
+        Ok(0)
+    } else {
+        done(id.context("an id or --key is required")?, None, message)
+    }
+}
+
 pub fn show(id: &str) -> Result<i32> {
     print_json(&client()?.show(id)?)?;
     Ok(0)
 }
 
-pub fn done(id: &str, choice: Option<String>, message: Option<String>) -> Result<i32> {
+fn validate_reply(message: &Option<String>) -> Result<()> {
     if message
         .as_deref()
         .is_some_and(|text| text.len() > MAX_REPLY_BYTES)
     {
         bail!("--message must be at most {MAX_REPLY_BYTES} UTF-8 bytes");
     }
+    Ok(())
+}
+
+pub fn done(id: &str, choice: Option<String>, message: Option<String>) -> Result<i32> {
+    validate_reply(&message)?;
     let item = client()?.resolve(
         id,
         &Resolution {

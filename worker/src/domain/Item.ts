@@ -65,6 +65,8 @@ export class Item extends Schema.Class<Item>("Item")({
   resolved_at: Schema.NullOr(Schema.String),
   seen_at: Schema.NullOr(Schema.String),
   expires_at: Schema.NullOr(Schema.String),
+  pending_at: Schema.optionalWith(Schema.NullOr(Schema.String), { default: () => null }),
+  external_key: Schema.optionalWith(Schema.NullOr(Schema.String), { default: () => null }),
   /** Bumped on every mutation; `wait?since=` returns once it moves. */
   version: Schema.Number,
 }) {
@@ -90,6 +92,8 @@ export const ItemRow = Schema.Struct({
 export type ItemRow = typeof ItemRow.Type;
 
 const NewItemCommon = {
+  pending: Schema.optional(Schema.Boolean),
+  external_key: Schema.optional(Schema.NonEmptyTrimmedString),
   /** The CLI always sends this; the API tolerates its absence so an older binary mid-run keeps working. */
   name: Schema.optionalWith(Schema.String, { default: () => "" }),
   title: Title,

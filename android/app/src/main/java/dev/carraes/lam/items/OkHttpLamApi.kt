@@ -44,9 +44,12 @@ class OkHttpLamApi(
         .addInterceptor(BearerInterceptor(credentialProvider))
         .build()
 
-    override suspend fun listOpenItems(): List<ItemDto> {
+    override suspend fun listOpenItems(pending: Boolean): List<ItemDto> {
         val request = authenticatedRequest("items")
-            .url(url("items").newBuilder().addQueryParameter("status", "open").build())
+            .url(url("items").newBuilder().apply {
+                addQueryParameter("status", "open")
+                if (pending) addQueryParameter("pending", "1")
+            }.build())
             .get()
             .build()
         return execute(request, ReadPolicy.RETRY_ONCE, ListSerializer(ItemDto.serializer()))

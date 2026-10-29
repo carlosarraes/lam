@@ -19,6 +19,7 @@ const CommaNumbers = Schema.transform(Schema.String, Schema.Array(Schema.Number)
 const WaitMany = Schema.Struct({ ids: Schema.NonEmptyString, since: Schema.optional(CommaNumbers) });
 /** Every field optional, and absent means today's behaviour — binaries in the field send none of them. */
 const ListParams = Schema.Struct({
+  pending: Schema.optional(Schema.Literal("1")),
   status: Schema.optional(Status),
   limit: Schema.optional(Schema.NumberFromString.pipe(Schema.int(), Schema.between(1, 500))),
   before: Schema.optional(Schema.String),
@@ -76,14 +77,46 @@ export const api = HttpRouter.empty.pipe(
         input = { ...fields, recommendation: fields.recommendation ?? null, recommended_choice: fields.recommended_choice ?? null };
       }
       const items = yield* Items;
-      const existing = yield* items.findDuplicate(input, { kind, legacyFallback: false });
+      const existing = input.external_key === undefined
+        ? yield* items.findDuplicate(input, { kind, legacyFallback: false })
+        : Option.none<Item>();
       if (Option.isSome(existing)) return yield* HttpServerResponse.json(existing.value, { status: 200 });
       const item = yield* items.create(input, kind);
+      if (item.version > 0) {
+        yield* background((yield* Events).publish({ event: "item.changed", item_id: item.id, version: item.version, status: item.status }));
+        return yield* HttpServerResponse.json(item, { status: 200 });
+      }
       const baseUrl = yield* origin;
       yield* background((yield* Events).publish({ event: "item.created", item_id: item.id, version: item.version, status: item.status }));
       yield* background((yield* Notify).itemCreated(item, baseUrl));
       yield* background((yield* Push).deliver("item.created", item));
       return yield* HttpServerResponse.json(item, { status: 201 });
+    }),
+  ),
+  HttpRouter.post(
+    "/v2/items/:id/pending",
+    Effect.gen(function* () {
+      yield* RequestAuthority;
+      const { id } = yield* HttpRouter.schemaPathParams(IdParam);
+      const { pending } = yield* HttpServerRequest.schemaBodyJson(Schema.Struct({ pending: Schema.Boolean }), strict);
+      const item = yield* (yield* Items).setPending(id, pending);
+      yield* background((yield* Events).publish({ event: "item.changed", item_id: item.id, version: item.version, status: item.status }));
+      if (item.pending_at !== null) yield* background((yield* Push).deliver("item.changed", item));
+      return yield* HttpServerResponse.json(item);
+    }),
+  ),
+  HttpRouter.post(
+    "/v2/items/resolve",
+    Effect.gen(function* () {
+      const authority = yield* RequestAuthority;
+      const { external_key, text } = yield* HttpServerRequest.schemaBodyJson(
+        Schema.Struct({ external_key: Schema.NonEmptyTrimmedString, text: Resolution.fields.text }), strict,
+      );
+      const item = yield* (yield* Items).resolveKey(external_key, text, authority.kind === "device" ? "phone" : "cli");
+      yield* background((yield* Events).publish({ event: "item.closed", item_id: item.id, version: item.version, status: item.status }));
+      yield* background((yield* Notify).itemClosed(item));
+      yield* background((yield* Push).deliver("item.closed", item));
+      return yield* HttpServerResponse.json(item);
     }),
   ),
   HttpRouter.post(
@@ -109,6 +142,9 @@ export const api = HttpRouter.empty.pipe(
       const authority = yield* RequestAuthority;
       yield* (yield* Auth).requireMaster(authority);
       const input = yield* HttpServerRequest.schemaBodyJson(NewItem);
+      if (input.pending !== undefined || input.external_key !== undefined) {
+        return yield* new BadRequest({ message: "pending and external_key require POST /v2/items" });
+      }
       const items = yield* Items;
       // A retry of a push whose response was lost must not queue (and notify) twice.
       const existing = yield* items.findDuplicate(input);
@@ -125,7 +161,7 @@ export const api = HttpRouter.empty.pipe(
     Effect.gen(function* () {
       yield* RequestAuthority;
       const query = yield* HttpServerRequest.schemaSearchParams(ListParams);
-      return yield* HttpServerResponse.json(yield* (yield* Items).list(query));
+      return yield* HttpServerResponse.json(yield* (yield* Items).list({ ...query, pending: query.pending === "1" }));
     }),
   ),
   HttpRouter.get(

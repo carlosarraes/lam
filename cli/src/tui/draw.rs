@@ -79,10 +79,11 @@ impl App {
         // Brackets replace the surrounding spaces, keeping all tab states the same width.
         let labels = [
             (Tab::Requests, "requests"),
+            (Tab::Pending, "pending"),
             (Tab::History, "history"),
             (Tab::Articles, "articles"),
         ];
-        let full = 29;
+        let full = 38;
         if width >= full + HEADER_SIDES {
             return labels
                 .iter()
@@ -100,6 +101,7 @@ impl App {
         }
         let active = match self.tab {
             Tab::Requests => "[requests]",
+            Tab::Pending => "[pending]",
             Tab::History => "[history]",
             Tab::Articles => "[articles]",
         };
@@ -185,7 +187,9 @@ impl App {
         // third of the screen, so the body — where the agent's message lives — keeps the rest.
         // History is a browsing view, so there the list takes the screen and the detail is fixed.
         let list_h = match self.tab {
-            Tab::Requests => (visible.len() as u16 + 1).clamp(3, (f.area().height / 3).max(3)),
+            Tab::Requests | Tab::Pending => {
+                (visible.len() as u16 + 1).clamp(3, (f.area().height / 3).max(3))
+            }
             Tab::History => body.height.saturating_sub(HISTORY_DETAIL).max(3),
             Tab::Articles => unreachable!("other tabs draw separately"),
         };
@@ -324,6 +328,7 @@ impl App {
             None => vec![Line::from(Span::styled(
                 match self.tab {
                     Tab::Requests => "nothing here — all caught up",
+                    Tab::Pending => "nothing pending",
                     Tab::History => "nothing closed yet",
                     Tab::Articles => "no articles",
                 },
@@ -372,6 +377,14 @@ impl App {
                 if i.status == "open" {
                     spans.extend(key("Enter", "seen"));
                     spans.extend(key("d", "dismiss"));
+                    spans.extend(key(
+                        "p",
+                        if i.pending_at.is_some() {
+                            "unmove"
+                        } else {
+                            "pending"
+                        },
+                    ));
                 }
                 if !i.link.is_empty() {
                     spans.extend(key("o", "open"));
@@ -408,6 +421,14 @@ impl App {
                 }
                 spans.extend(key("r", "reply"));
                 spans.extend(key("d", "dismiss"));
+                spans.extend(key(
+                    "p",
+                    if i.pending_at.is_some() {
+                        "unmove"
+                    } else {
+                        "pending"
+                    },
+                ));
                 vec![Line::from(spans), self.nav_line()]
             }
             _ => vec![Line::raw(""), self.nav_line()],
@@ -1141,14 +1162,14 @@ mod tests {
                 .map(|s| s.content.chars().count())
                 .sum()
         };
-        assert_eq!(width(&a, 81), 29);
+        assert_eq!(width(&a, 100), 38);
         a.handle(super::super::tests::key('l'));
-        assert_eq!(width(&a, 81), 29, "all tab states keep the bar width");
+        assert_eq!(width(&a, 100), 38, "all tab states keep the bar width");
 
         a.handle(super::super::tests::key('l'));
-        assert_eq!(width(&a, 81), 29);
+        assert_eq!(width(&a, 100), 38);
         a.handle(super::super::tests::key('l'));
-        assert_eq!(width(&a, 81), 29);
+        assert_eq!(width(&a, 100), 38);
         assert_eq!(width(&a, 60), 10, "squeezed down to the active label");
         assert_eq!(width(&a, 40), 0, "and out entirely rather than colliding");
     }
@@ -1157,20 +1178,20 @@ mod tests {
     fn the_header_centres_the_tab_bar() {
         let mut a = App::new("archlinux".into());
         a.set_items(vec![item("aaa", "open", &[], "")]);
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(81, 12)).unwrap();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
         term.draw(|f| a.draw(f)).unwrap();
         let buf = term.backend().buffer().clone();
-        let head: String = (0..81).map(|x| buf[(x, 0)].symbol()).collect();
+        let head: String = (0..100).map(|x| buf[(x, 0)].symbol()).collect();
 
         assert!(head.starts_with("lam  1 requests · 0 FYI"), "{head:?}");
         assert!(
             head.trim_end().ends_with("archlinux  ● connecting"),
             "{head:?}"
         );
-        // 81 columns less the 29-column bar leaves 26 on each side.
+        // 100 columns less the 38-column bar leaves 31 on each side.
         assert_eq!(
-            head.chars().skip(26).take(29).collect::<String>(),
-            "[requests] history  articles ",
+            head.chars().skip(31).take(38).collect::<String>(),
+            "[requests] pending  history  articles ",
             "{head:?}"
         );
     }

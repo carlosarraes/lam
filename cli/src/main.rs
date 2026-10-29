@@ -81,6 +81,12 @@ enum Cmd {
         /// Expire the item after this long (e.g. 2h); expired items leave the queue
         #[arg(long)]
         ttl: Option<String>,
+        /// Keep the item in Pending without notifications
+        #[arg(long)]
+        pending: bool,
+        /// Update the open item with this stable external key, if one exists
+        #[arg(long)]
+        key: Option<String>,
         /// Block until answered (same as `lam wait`)
         #[arg(short, long)]
         wait: bool,
@@ -101,6 +107,9 @@ enum Cmd {
         #[arg(long, default_value = "2h")]
         timeout: String,
     },
+    /// Track items quietly in a separate lane
+    #[command(subcommand)]
+    Pending(PendingCmd),
     /// List items (open by default)
     List {
         #[arg(short, long)]
@@ -175,6 +184,40 @@ enum ArticleCmd {
 }
 
 #[derive(Subcommand)]
+enum PendingCmd {
+    /// Add or update a quiet FYI with a stable external key; prints its id
+    Add {
+        title: String,
+        #[arg(long)]
+        key: String,
+        #[arg(short = 'n', long)]
+        name: Option<String>,
+        #[arg(short, long, default_value = "")]
+        body: String,
+        #[arg(short, long)]
+        link: Option<String>,
+    },
+    /// List open items in Pending
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve an item by id or stable external key
+    Resolve {
+        #[arg(required_unless_present = "key", conflicts_with = "key")]
+        id: Option<String>,
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(short, long)]
+        message: Option<String>,
+    },
+    /// Move an open item into Pending without notifying
+    Move { id: String },
+    /// Return an open item to Requests without notifying
+    Unmove { id: String },
+}
+
+#[derive(Subcommand)]
 enum CheckCmd {
     /// Append a check to an open item (agent side); re-notifies
     Add { id: String, label: String },
@@ -246,6 +289,8 @@ fn run(cmd: Cmd) -> Result<i32> {
             checks,
             link,
             ttl,
+            pending,
+            key,
             wait,
         } => commands::push(commands::PushArgs {
             title,
@@ -259,6 +304,8 @@ fn run(cmd: Cmd) -> Result<i32> {
             checks,
             link,
             ttl,
+            pending,
+            key,
             wait,
         }),
         Cmd::Wait {
@@ -267,6 +314,19 @@ fn run(cmd: Cmd) -> Result<i32> {
             name,
             timeout,
         } => commands::wait(&ids, any, name, &timeout),
+        Cmd::Pending(PendingCmd::Add {
+            title,
+            key,
+            name,
+            body,
+            link,
+        }) => commands::pending_add(title, key, name, body, link),
+        Cmd::Pending(PendingCmd::List { json }) => commands::pending_list(json),
+        Cmd::Pending(PendingCmd::Resolve { id, key, message }) => {
+            commands::pending_resolve(id.as_deref(), key.as_deref(), message)
+        }
+        Cmd::Pending(PendingCmd::Move { id }) => commands::pending_move(&id, true),
+        Cmd::Pending(PendingCmd::Unmove { id }) => commands::pending_move(&id, false),
         Cmd::List { all, json } => commands::list(all, json),
         Cmd::Show { id } => commands::show(&id),
         Cmd::Done {

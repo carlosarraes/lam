@@ -1,10 +1,17 @@
 import { env } from "cloudflare:test";
+import { HttpApp, HttpRouter } from "@effect/platform";
 import { Effect, Layer } from "effect";
 import { describe, expect, it } from "vitest";
 import { Env, type Bindings } from "../src/Env";
 import { Item } from "../src/domain/Item";
 import type { PushMessage } from "../src/domain/PushMessage";
 import { Devices } from "../src/services/Devices";
+import { api, bearer } from "../src/http/api";
+import { Auth } from "../src/services/Auth";
+import { Events } from "../src/services/Events";
+import { Items } from "../src/services/Items";
+import { Notify } from "../src/services/Notify";
+import { FcmClient, Push } from "../src/services/Push";
 
 const bindings = env as unknown as Bindings;
 let sequence = 0;
@@ -44,6 +51,37 @@ async function seed(token: string, revoked = false) {
 }
 
 describe("Push", () => {
+  it("moves an alerted critical item to pending with a cancellation invalidation and no unmove alert", async () => {
+    await env.DB.prepare("DELETE FROM devices").run();
+    await seed("pending-device");
+    const sent: PushMessage[] = [];
+    const services = Layer.mergeAll(
+      Items.Default, Auth.Default, Events.Default, Notify.Default, Devices.Default, Push.Default,
+      Layer.succeed(FcmClient, { send: (_token, message) => Effect.sync(() => { sent.push(message); }) }),
+    ).pipe(Layer.provideMerge(Layer.succeed(Env, { ...bindings, LAM_TOKEN: "test-token", LAM_HMAC_SECRET: "test-secret", NTFY_TOPIC: "test-topic" })));
+    const runtime = HttpApp.toWebHandlerLayer(api.pipe(HttpRouter.use(bearer)), services);
+    const post = (path: string, body: unknown) => runtime.handler(new Request(`http://lam${path}`, {
+      method: "POST", headers: { Authorization: "Bearer test-token", "content-type": "application/json" }, body: JSON.stringify(body),
+    }));
+    try {
+      const created = await post("/v2/items", { kind: "request", title: "Move alerted item", recommendation: "Continue", priority: "critical" });
+      expect(created.status).toBe(201);
+      const first = await created.json<Item>();
+      const moved = await post(`/v2/items/${first.id}/pending`, { pending: true });
+      expect(moved.status).toBe(200);
+      expect(await moved.json()).toMatchObject({ id: first.id, status: "open", pending_at: expect.any(String) });
+      expect(sent.map(message => message.data)).toEqual([
+        expect.objectContaining({ event: "item.created", item_id: first.id, status: "open" }),
+        expect.objectContaining({ event: "item.changed", item_id: first.id, status: "open", pending: "true" }),
+      ]);
+      expect((await post(`/v2/items/${first.id}/pending`, { pending: false })).status).toBe(200);
+      expect(sent).toHaveLength(2);
+    } finally {
+      await runtime.dispose();
+      await env.DB.prepare("DELETE FROM devices").run();
+    }
+  });
+
   it("delivers critical invalidations to every active registered device", async () => {
     const module = await import("../src/services/Push").catch(() => null);
     expect(module).not.toBeNull();

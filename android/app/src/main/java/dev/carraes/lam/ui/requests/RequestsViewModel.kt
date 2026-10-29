@@ -21,12 +21,13 @@ data class RequestsState(
     val lastSuccess: Instant? = null,
     val actionsEnabled: Boolean = false,
     val now: Instant = Instant.now(),
+    val pending: Boolean = false,
 ) {
     val actionableCount: Int get() = items.count { !it.isFyi }
     val informationalCount: Int get() = items.count { it.isFyi }
 }
 
-class RequestsViewModel(repository: ItemRepository, private val reconcile: suspend () -> Boolean, clock: Clock = Clock.systemUTC()) : ViewModel() {
+class RequestsViewModel(repository: ItemRepository, private val reconcile: suspend () -> Boolean, clock: Clock = Clock.systemUTC(), private val pending: Boolean = false) : ViewModel() {
     private data class Filters(val query: String = "", val type: ItemTypeDto? = null, val priority: PriorityDto? = null)
     private val filters = MutableStateFlow(Filters())
     // This updates labels only while a screen collects state. It never performs network work.
@@ -40,6 +41,7 @@ class RequestsViewModel(repository: ItemRepository, private val reconcile: suspe
         val query = filter.query.trim()
         val visible = items.filter { item ->
             item.status == StatusDto.OPEN &&
+                (item.pendingAt != null) == pending &&
                 (filter.type == null || item.requestType == filter.type) &&
                 (filter.priority == null || item.priority == filter.priority) &&
                 (query.isEmpty() || listOf(item.title, item.agentDisplay, item.body).any { it.contains(query, ignoreCase = true) })
@@ -50,8 +52,8 @@ class RequestsViewModel(repository: ItemRepository, private val reconcile: suspe
             stale = sync is SyncState.Stale,
             lastSuccess = when (sync) { is SyncState.Current -> sync.lastSuccess; is SyncState.Stale -> sync.lastSuccess; else -> null },
             actionsEnabled = sync.mutationsEnabled,
-            now = now)
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(), RequestsState(now = clock.instant()))
+            now = now, pending = pending)
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(), RequestsState(now = clock.instant(), pending = pending))
 
     fun setQuery(query: String) { filters.update { it.copy(query = query) } }
     fun setType(type: ItemTypeDto?) { filters.update { it.copy(type = type) } }

@@ -13,12 +13,13 @@ export interface PushMessage {
     readonly name: string;
     readonly priority: "critical";
     readonly title: string;
+    readonly pending?: "true";
   };
 }
 
 /** FCM carries only lock-screen-safe metadata. D1 remains authoritative. */
 export function pushMessage(event: PushEvent, item: Item): PushMessage | null {
-  if (item.priority !== "critical") return null;
+  if (item.priority !== "critical" || (item.pending_at !== null && event === "item.created")) return null;
   return {
     android: { priority: "high" },
     data: {
@@ -30,6 +31,7 @@ export function pushMessage(event: PushEvent, item: Item): PushMessage | null {
       name: item.name,
       priority: "critical",
       title: item.title,
+      ...(item.pending_at !== null ? { pending: "true" as const } : {}),
     },
   };
 }

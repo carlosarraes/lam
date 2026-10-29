@@ -66,6 +66,15 @@ private fun PairedApp(container: AppContainer, articleRoute: String?, onArticleR
             articleRoute = articleRoute, onArticleRouteConsumed = onArticleRouteConsumed,
             itemRoute = itemRoute, onItemRouteConsumed = onItemRouteConsumed,
             onRequestAction = { id, dismiss -> action = id to dismiss },
+            pendingContent = { onRequests, onHistory, onSettings, onItem ->
+                val pending = viewModel(key = "pending") {
+                    RequestsViewModel(container.itemRepository, container.lifecycleReconciler::refresh, pending = true)
+                }
+                val pendingState by pending.state.collectAsStateWithLifecycle()
+                dev.carraes.lam.ui.requests.RequestsScreen(pendingState, pending::setQuery, pending::setType, pending::setPriority,
+                    pending::clearFilters, pending::refresh, onHistory, onSettings, onItem,
+                    onQuickResponse = { action = it to false }, onDismiss = { action = it to true }, onRequests = onRequests)
+            },
             historyContent = { onRequests, onSettings ->
                 LifecycleStartEffect(history) {
                     history.setVisible(true)

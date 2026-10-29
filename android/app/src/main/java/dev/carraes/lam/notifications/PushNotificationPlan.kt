@@ -17,11 +17,11 @@ internal sealed interface PushNotificationPlan {
 
     companion object {
         fun shouldRemain(item: Item?): Boolean =
-            item?.priority == PriorityDto.CRITICAL && item.status == StatusDto.OPEN
+            item?.priority == PriorityDto.CRITICAL && item.status == StatusDto.OPEN && item.pendingAt == null
 
         fun forEvent(event: CriticalPushEvent): PushNotificationPlan {
             val tag = "item:${event.itemId}"
-            if (event.event == CriticalPushEvent.Type.CLOSED || event.status != "open") return Cancel(tag)
+            if (event.pending || event.event == CriticalPushEvent.Type.CLOSED || event.status != "open") return Cancel(tag)
             val source = event.name.ifBlank { "agent" }
             val type = if (event.kind == "fyi") "Critical FYI" else "Critical request"
             return Show(tag, event.title, "$source · $type", "Critical lam from $source", event.itemId)

@@ -19,6 +19,19 @@ import org.junit.Before
 import org.junit.Test
 
 class OkHttpLamApiTest {
+    @Test fun `pending listing selects open pending items and retains their timestamp`() = runTest {
+        val timestamp = "2026-09-04T12:00:00Z"
+        val pendingJson = ITEM_JSON.replace("\"id\":", "\"pending_at\":\"$timestamp\",\"id\":")
+        server.enqueue(jsonResponse(body = "[$pendingJson]"))
+
+        val item = api.listOpenItems(pending = true).single()
+
+        assertEquals(timestamp, item.pendingAt)
+        assertEquals(timestamp, ItemMapper.toItem(ItemMapper.toEntity(item)).pendingAt)
+        assertEquals(StatusDto.OPEN, item.status)
+        assertEquals("/api/items?status=open&pending=1", server.takeRequest().target)
+    }
+
     @Test fun `seen conflict is surfaced without automatic replay`() = runTest {
         server.enqueue(jsonResponse(409, "{\"error\":\"concurrent update, retry\"}"))
         val error = expectError<ApiError.Server> { api.markSeen("notice", 1L) }
@@ -44,6 +57,7 @@ class OkHttpLamApiTest {
         val item = api.getItem("legacy")
         assertEquals(ItemKindDto.REQUEST, item.kind)
         assertNull(item.seenAt)
+        assertNull(item.pendingAt)
     }
     private lateinit var server: MockWebServer
     private lateinit var api: LamApi

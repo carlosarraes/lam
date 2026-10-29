@@ -31,16 +31,17 @@ import java.time.format.FormatStyle
 fun RequestsScreen(state: RequestsState, onQuery: (String) -> Unit, onType: (ItemTypeDto?) -> Unit,
     onPriority: (PriorityDto?) -> Unit, onClearFilters: () -> Unit, onRefresh: () -> Unit,
     onHistory: () -> Unit, onSettings: () -> Unit, onItem: (String) -> Unit,
-    onQuickResponse: (String) -> Unit = {}, onDismiss: (String) -> Unit = {}) {
+    onQuickResponse: (String) -> Unit = {}, onDismiss: (String) -> Unit = {}, onRequests: () -> Unit = {}) {
     var search by rememberSaveable { mutableStateOf(false) }
     var filters by rememberSaveable { mutableStateOf(false) }
     val activeFilters = listOfNotNull(state.type, state.priority).size
     val filtered = activeFilters > 0 || state.query.isNotBlank()
-    val refreshLabel = stringResource(R.string.requests_refresh)
+    val refreshLabel = stringResource(if (state.pending) R.string.pending_refresh else R.string.requests_refresh)
     val filterLabel = stringResource(R.string.filters)
-    Surface(Modifier.fillMaxSize().testTag("requests-surface"), color = Graphite) {
+    Surface(Modifier.fillMaxSize().testTag(if (state.pending) "pending-surface" else "requests-surface"), color = Graphite) {
         Column(Modifier.safeDrawingPadding()) {
-            QueueTopBar(stringResource(R.string.requests_title), {}, onHistory, onSettings, { search = !search })
+            QueueTopBar(stringResource(if (state.pending) R.string.pending_title else R.string.requests_title), onRequests, onHistory, onSettings,
+                { search = !search }, stringResource(if (state.pending) R.string.pending_search else R.string.search_requests))
             if (search || state.query.isNotEmpty()) {
                 OutlinedTextField(value = state.query, onValueChange = onQuery, singleLine = true,
                     label = { Text(stringResource(R.string.search_hint)) }, shape = RoundedCornerShape(8.dp),
@@ -78,12 +79,12 @@ fun RequestsScreen(state: RequestsState, onQuery: (String) -> Unit, onType: (Ite
                             verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             if (state.loading) CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
                             Text(stringResource(when {
-                                state.loading -> R.string.requests_loading
-                                filtered -> R.string.requests_no_matches
-                                state.stale -> R.string.requests_error
-                                else -> R.string.requests_empty
+                                state.loading -> if (state.pending) R.string.pending_loading else R.string.requests_loading
+                                filtered -> if (state.pending) R.string.pending_no_matches else R.string.requests_no_matches
+                                state.stale -> if (state.pending) R.string.pending_error else R.string.requests_error
+                                else -> if (state.pending) R.string.pending_empty else R.string.requests_empty
                             }), style = MaterialTheme.typography.titleMedium)
-                            if (!state.loading && !state.stale) Text(stringResource(if (filtered) R.string.requests_no_matches_hint else R.string.requests_empty_hint),
+                            if (!state.loading && !state.stale) Text(stringResource(if (filtered) R.string.requests_no_matches_hint else if (state.pending) R.string.pending_empty_hint else R.string.requests_empty_hint),
                                 style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }

@@ -1,11 +1,11 @@
 ---
 name: lam
-description: Use when Carlos needs a decision request, FYI, or HTML Article in LAM.
+description: Use when Carlos needs a decision request, FYI, pending tracker, or HTML Article in LAM.
 ---
 
 # lam: Look At Me
 
-`lam` is a queue Carlos reads from his phone and PC. Requests collect decisions; FYIs deliver updates and close when read; Articles save HTML reports in a separate reading library with read/unread state.
+`lam` is a queue Carlos reads from his phone and PC. Requests collect decisions; FYIs deliver updates and close when read; Pending keeps tracked items quiet; Articles save HTML reports in a separate reading library with read/unread state.
 
 ## When
 
@@ -13,6 +13,7 @@ Choose the kind from what Carlos needs to do:
 
 - If an action needs his decision, approval, credentials, or other input, send a request with your recommendation and wait for his answer. Omitted `--kind` defaults to `request`.
 - If already-authorized work has progressed or finished and only an update is needed, send `--kind fyi` and continue. FYIs never grant approval. Any action still lacking authorization remains a request.
+- If an item should be tracked quietly for later, use `lam pending add` with a stable key. Use `lam push --pending` when it needs request fields or a specific kind. Pending creates no approval or notification.
 - If Carlos asks to save an HTML report or show-me artifact for reading in LAM, publish an Article using the recipe below. Publication continues without waiting for acknowledgement.
 
 Send one item per useful update or blocking event. For an informational update rejected for a missing recommendation, switch to `--kind fyi` and remove wait/decision flags. Never invent a filler recommendation such as "No action needed" to satisfy request validation.
@@ -54,7 +55,7 @@ Checklist loop: `lam wait` exits 0 both on progress and on resolution. Check `st
 
 Every non-checklist request requires `--recommendation <action and rationale>`. With `--choice`, also pass `--recommended-choice <CHOICE>` exactly matching a choice. Checklist requests omit both recommendation flags. `--check` and `--choice` are exclusive.
 
-FYIs reject `--wait`, `--choice`, `--check`, `--recommendation`, and `--recommended-choice` when created. Carlos can optionally save one text reply from Android or with `r` in the TUI, including after the FYI is seen in History. Read it with `lam show ID` in `response_text`; `response_by` identifies the client. A reply keeps the FYI seen and out of the pending queue, and cannot be overwritten. It does not automatically wake or notify the sending agent. Continue after publishing an FYI; use a request when an answer is required. Never call `lam wait ID` on an FYI or include one in an explicit multi-ID wait. `lam wait --any` selects requests only and returns immediately if only FYIs exist.
+FYIs reject `--wait`, `--choice`, `--check`, `--recommendation`, and `--recommended-choice` when created. Carlos can optionally save one text reply from Android or with `r` in the TUI, including after the FYI is seen in History. Read it with `lam show ID` in `response_text`; `response_by` identifies the client. A reply keeps the FYI seen and out of Requests, and cannot be overwritten. It does not automatically wake or notify the sending agent. Continue after publishing an FYI; use a request when an answer is required. Never call `lam wait ID` on an FYI or include one in an explicit multi-ID wait. `lam wait --any` selects requests only and returns immediately if only FYIs exist.
 
 `lam list` and `lam show ID` inspect without marking an FYI seen. In the TUI, Enter marks an open FYI seen without opening the reader; `m` opens the reader and marks it seen. Selecting a row does not acknowledge it, and Enter on a closed FYI in History does nothing. A visible phone page also marks it seen after rendering, with a Mark seen button when scripting is unavailable or the automatic request fails. Fetching or prefetching the page alone changes nothing. Seen FYIs leave the open queue and remain readable in history. Explicit Dismiss also closes them, but leaves `seen_at` empty and history says Dismissed, not Seen.
 
@@ -68,6 +69,31 @@ FYIs reject `--wait`, `--choice`, `--check`, `--recommendation`, and `--recommen
 - Pass `--link` when there is a relevant URL, and `--ttl` when the item stops mattering after a while.
 - The phone notification shows at most 3 buttons; with 3 choices the Open/Reply buttons are still available inside the ntfy app.
 - Leave answering, marking seen, dismissing, and ticking checks to Carlos. As the sending agent, use `lam retract` to withdraw an obsolete item and `lam check add` to extend a checklist. Do not use `lam done` or `lam check tick` to answer your own requests.
+
+## Pending trackers
+
+```bash
+# Quietly track work with a stable key; prints the new or existing open item's id.
+lam pending add "PR #42 awaiting review" --key github:org/repo:pr:42 -b "Waiting for the reviewer." -l https://github.com/org/repo/pull/42
+
+# Reuse the key to update its title, body and link without creating another open item.
+lam pending add "PR #42 review complete" --key github:org/repo:pr:42 -b "Ready to merge." -l https://github.com/org/repo/pull/42
+lam pending list --json
+
+# Close a tracker when the underlying work has finished.
+lam pending resolve --key github:org/repo:pr:42 -m "Merged"
+lam pending resolve "$ID" -m "Finished"
+
+# Move an existing open item between Requests and Pending.
+lam pending move "$ID"
+lam pending unmove "$ID"
+```
+
+`pending add TITLE --key KEY [-n NAME] [-b BODY] [-l URL]` creates a pending FYI. It needs no recommendation and never waits. `lam push ... --pending [--key KEY]` keeps the chosen kind, so requests still require a recommendation or checklist. An external key identifies one open item across title/body changes; upserts print the same id. After it closes, reusing its key creates a new item.
+
+`lam list` excludes pending items. `lam pending list [--json]` shows only open pending items. Pending creation and lane changes do not alert or re-alert. Moving a critical item into Pending cancels its phone notification while the item stays open. Moving preserves the name, kind, link and other origin fields. In the TUI, Pending follows Requests, `p` toggles the selected open item's lane, and `Ctrl+1` through `Ctrl+4` select Requests, Pending, History and Articles.
+
+`lam pending resolve ID` or `lam pending resolve --key KEY` accepts an optional `-m NOTE` and prints the updated item as JSON. Use resolution to close completed trackers; leave decisions and approvals to Carlos. See `docs/pending.md` for the API contract.
 
 ## Saved HTML Articles
 

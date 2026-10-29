@@ -171,7 +171,7 @@ private class ChecklistApi : LamApi by FakeApi() {
         return value
     }
     override suspend fun getItem(id: String): ItemDto { beforeGet(); return value }
-    override suspend fun listOpenItems() = listOf(value).filter { it.status == StatusDto.OPEN }
+    override suspend fun listOpenItems(pending: Boolean) = listOf(value).filter { it.status == StatusDto.OPEN && (it.pendingAt != null) == pending }
     override suspend fun replyChoice(id: String, choice: String): ItemDto = error("unused")
     override suspend fun replyText(id: String, text: String): ItemDto = error("unused")
     override suspend fun dismiss(id: String): ItemDto = error("unused")

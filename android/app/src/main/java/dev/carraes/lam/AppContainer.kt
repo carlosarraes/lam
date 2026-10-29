@@ -8,6 +8,7 @@ import dev.carraes.lam.articles.*
 import dev.carraes.lam.diagnostics.Diagnostics
 import dev.carraes.lam.items.*
 import dev.carraes.lam.notifications.LamNotifications
+import dev.carraes.lam.notifications.PushNotificationPlan
 import dev.carraes.lam.notifications.currentFirebaseInstallationId
 import dev.carraes.lam.pairing.DeviceIdentity
 import dev.carraes.lam.pairing.PairingRepository
@@ -29,7 +30,7 @@ class AppContainer(
     private val credentials: CredentialComposition = createCredentialComposition(applicationContext)
     private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val database = Room.databaseBuilder(applicationContext, LamDatabase::class.java, "lam-items.db")
-        .addMigrations(LamDatabase.MIGRATION_1_2, LamDatabase.MIGRATION_2_3).build()
+        .addMigrations(LamDatabase.MIGRATION_1_2, LamDatabase.MIGRATION_2_3, LamDatabase.MIGRATION_3_4).build()
     private val connectivity = AndroidConnectivityMonitor(applicationContext)
 
     private val items = DefaultItemRepository(
@@ -68,7 +69,7 @@ class AppContainer(
         applicationScope.launch {
             lifecycleReconciler.completedReconciliations.dropWhile { it == 0L }.collect {
                 val openCriticalIds = items.openItems.first()
-                    .filter { item -> item.priority == PriorityDto.CRITICAL }
+                    .filter { item -> PushNotificationPlan.shouldRemain(item) }
                     .mapTo(mutableSetOf()) { item -> item.id }
                 LamNotifications(applicationContext).reconcile(openCriticalIds)
             }

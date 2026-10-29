@@ -27,6 +27,14 @@
     <string name="article_zoom_out">Smaller text</string>
     <string name="article_content">Article content</string>
     <string name="app_name">lam</string>
+    <string name="pending_title">Pending</string>
+    <string name="pending_search">Search pending</string>
+    <string name="pending_refresh">Refresh pending</string>
+    <string name="pending_loading">Loading pending items…</string>
+    <string name="pending_empty">No pending items</string>
+    <string name="pending_empty_hint">Pending items will appear here.</string>
+    <string name="pending_no_matches">No matching pending items</string>
+    <string name="pending_error">Could not load pending items</string>
     <string name="requests_title">Requests</string>
     <string name="history_title">History</string>
     <string name="settings_title">Settings</string>

@@ -15,6 +15,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import dev.carraes.lam.R
 
+val LocalPendingNavigation = staticCompositionLocalOf<(() -> Unit)?> { null }
+
 val LocalArticlesNavigation = staticCompositionLocalOf<(() -> Unit)?> { null }
 
 @Composable
@@ -32,6 +34,9 @@ fun QueueTopBar(title: String, onRequests: () -> Unit, onHistory: () -> Unit, on
             }
             DropdownMenu(queueMenu, onDismissRequest = { queueMenu = false }) {
                 DropdownMenuItem(text = { Text(stringResource(R.string.requests_title)) }, onClick = { queueMenu = false; onRequests() })
+                LocalPendingNavigation.current?.let { onPending ->
+                    DropdownMenuItem(text = { Text(stringResource(R.string.pending_title)) }, onClick = { queueMenu = false; onPending() })
+                }
                 DropdownMenuItem(text = { Text(stringResource(R.string.history_title)) }, onClick = { queueMenu = false; onHistory() })
                 LocalArticlesNavigation.current?.let { onArticles ->
                     DropdownMenuItem(text = { Text(stringResource(R.string.articles_title)) }, onClick = { queueMenu = false; onArticles() })

@@ -38,7 +38,7 @@ class ArticleStorageTest {
                 old.execSQL("INSERT INTO history_membership VALUES ('saved-query', 'fyi')")
                 old.version = 2
             }
-            val database = Room.databaseBuilder(context, LamDatabase::class.java, name).addMigrations(LamDatabase.MIGRATION_2_3).build()
+            val database = Room.databaseBuilder(context, LamDatabase::class.java, name).addMigrations(LamDatabase.MIGRATION_2_3, LamDatabase.MIGRATION_3_4).build()
             try {
                 val items = RoomItemStorage(database)
                 assertEquals("Keep body", items.get("fyi")!!.canonical.body)

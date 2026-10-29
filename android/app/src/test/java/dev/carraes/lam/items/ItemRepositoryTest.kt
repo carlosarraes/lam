@@ -33,6 +33,30 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ItemRepositoryTest {
+    @Test fun `refresh caches both lanes and keeps pending items when requests are empty`() = runTest {
+        val f = fixture()
+        f.api.pending = listOf(item("pending").copy(pendingAt = NOW.toString()))
+        assertTrue(f.repo.refresh())
+        assertEquals(setOf("a", "pending"), f.repo.openItems.first().map { it.id }.toSet())
+
+        f.api.open = emptyList()
+        assertTrue(f.repo.refresh())
+        assertEquals("pending", f.repo.openItems.first().single().id)
+    }
+
+    @Test fun `failed pending refresh retains the entire previous snapshot`() = runTest {
+        val f = fixture()
+        f.api.pending = listOf(item("pending").copy(pendingAt = NOW.toString()))
+        assertTrue(f.repo.refresh())
+        f.api.open = emptyList()
+        f.api.pendingError = ApiError.Transport("offline")
+
+        assertFalse(f.repo.refresh())
+
+        assertEquals(setOf("a", "pending"), f.repo.openItems.first().map { it.id }.toSet())
+        assertTrue(f.repo.syncState.value is SyncState.Stale)
+    }
+
     @Test fun `rotated push token is uploaded through the current authenticated session`() = runTest {
         val f = fixture()
 
@@ -834,6 +858,8 @@ internal class FakeApi : LamApi {
     var revocations = 0
     var historyRead: (suspend (HistoryQuery, String?) -> HistoryPageDto)? = null
     var open = listOf(ItemRepositoryTest.item())
+    var pending = emptyList<ItemDto>()
+    var pendingError: ApiError? = null
     var fetched = ItemRepositoryTest.item()
     var result = ItemRepositoryTest.item(status = StatusDto.RESOLVED)
     var history = HistoryPageDto(emptyList(), null)
@@ -844,7 +870,10 @@ internal class FakeApi : LamApi {
     var beforeWrite: suspend () -> Unit = {}
     val calls = mutableListOf<String>()
     var submissions = 0
-    override suspend fun listOpenItems(): List<ItemDto> { calls += "open"; beforeRead(); readError?.let { throw it }; return open }
+    override suspend fun listOpenItems(pending: Boolean): List<ItemDto> {
+        if (pending) { pendingError?.let { throw it }; return this.pending }
+        calls += "open"; beforeRead(); readError?.let { throw it }; return open
+    }
     override suspend fun getItem(id: String): ItemDto { calls += "get:$id"; beforeGet(); readError?.let { throw it }; return fetched }
     override suspend fun getHistory(query: String?, priority: PriorityDto?, type: ItemTypeDto?, cursor: String?, limit: Int) =
         historyRead?.invoke(HistoryQuery(query, priority, type), cursor) ?: history

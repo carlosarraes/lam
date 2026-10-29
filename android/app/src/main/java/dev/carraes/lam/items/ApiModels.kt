@@ -92,6 +92,7 @@ data class ItemDto(
     val version: Long,
     @ColumnInfo(defaultValue = "'REQUEST'") val kind: ItemKindDto = ItemKindDto.REQUEST,
     @SerialName("seen_at") val seenAt: String? = null,
+    @SerialName("pending_at") val pendingAt: String? = null,
 )
 
 @Serializable

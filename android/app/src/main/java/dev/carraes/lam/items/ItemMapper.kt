@@ -30,6 +30,7 @@ object ItemMapper {
             version = it.version,
             kind = it.kind,
             seenAt = it.seenAt,
+            pendingAt = it.pendingAt,
         )
     }
 }

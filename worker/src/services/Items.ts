@@ -31,6 +31,8 @@ const toItem = (row: typeof ItemRow.Type) =>
     resolved_at: row.resolved_at,
     seen_at: row.seen_at,
     expires_at: row.expires_at,
+    pending_at: row.pending_at,
+    external_key: row.external_key,
     version: row.version,
   });
 
@@ -43,6 +45,8 @@ const decodeRow = (row: unknown) =>
 /** Stable request identity; optional values use exactly the defaults persisted by `NewItem`. */
 export const canonicalDedupeInput = (input: NewItem, kind: ItemKind = "request") =>
   JSON.stringify({
+    ...(input.pending ? { pending: true } : {}),
+    ...(input.external_key === undefined ? {} : { external_key: input.external_key }),
     ...(kind === "fyi" ? { kind } : {}),
     name: input.name ?? "",
     title: input.title,
@@ -62,6 +66,7 @@ const dedupeKey = async (input: NewItem, kind: ItemKind) => {
 };
 
 export interface ListQuery {
+  pending?: boolean;
   status?: Status;
   ids?: readonly string[];
   /** Page size. Absent means every row. */
@@ -185,7 +190,7 @@ export class Items extends Effect.Service<Items>()("lam/Items", {
   succeed: {
     create: (input: NewItem, kind: ItemKind = "request") =>
       Effect.gen(function* () {
-        const { ttl, link = "", checks, recommendation = null, recommended_choice = null, ...fields } = input;
+        const { ttl, link = "", checks, recommendation = null, recommended_choice = null, pending = false, external_key = null, ...fields } = input;
         const now = Date.now();
         const created_at = new Date(now).toISOString();
         const expires_at = ttl === undefined ? null : new Date(now + ttl * 1000).toISOString();
@@ -207,17 +212,30 @@ export class Items extends Effect.Service<Items>()("lam/Items", {
           resolved_at: null,
           seen_at: null,
           expires_at,
+          pending_at: pending ? created_at : null,
+          external_key,
         });
-        yield* db((d) =>
-          d
+        const row = yield* db(async (d) => {
+          const insert = d
             .prepare(
-              `INSERT INTO items (id, kind, name, title, body, source_host, source_project, priority, choices, checks, recommendation, recommended_choice, link, status, created_at, expires_at, dedupe_key)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)`,
+              `INSERT INTO items (id, kind, name, title, body, source_host, source_project, priority, choices, checks, recommendation, recommended_choice, link, status, created_at, expires_at, dedupe_key, pending_at, external_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)
+               ON CONFLICT(external_key) WHERE status='open' AND external_key IS NOT NULL
+               DO UPDATE SET title = excluded.title, body = excluded.body, link = excluded.link,
+                 priority = excluded.priority, version = items.version + 1
+               RETURNING *`,
             )
-            .bind(item.id, item.kind, item.name, item.title, item.body, item.source_host, item.source_project, item.priority, JSON.stringify(item.choices), JSON.stringify(item.checks), item.recommendation, item.recommended_choice, item.link, item.created_at, item.expires_at, key)
-            .run(),
-        );
-        return item;
+            .bind(item.id, item.kind, item.name, item.title, item.body, item.source_host, item.source_project, item.priority, JSON.stringify(item.choices), JSON.stringify(item.checks), item.recommendation, item.recommended_choice, item.link, item.created_at, item.expires_at, key, item.pending_at, item.external_key);
+          if (external_key === null) return insert.first();
+          // Expiry is derived, so release an expired row's key without changing its stored status.
+          const results = await d.batch([
+            d.prepare("UPDATE items SET external_key = NULL WHERE external_key = ? AND status = 'open' AND expires_at <= ?")
+              .bind(external_key, created_at),
+            insert,
+          ]);
+          return results[1].results[0];
+        });
+        return yield* decodeRow(row);
       }),
 
     /** An open, unexpired item with identical content — a retry of a push whose response was lost. */
@@ -266,9 +284,9 @@ export class Items extends Effect.Service<Items>()("lam/Items", {
      *
      * Absent `limit` means unlimited, which is what every binary already in the field expects.
      */
-    list: ({ status, ids, limit, before }: ListQuery = {}) =>
+    list: ({ status, ids, limit, before, pending = false }: ListQuery = {}) =>
       db((d) => {
-        const where: string[] = [];
+        const where: string[] = ids ? [] : [pending ? "pending_at IS NOT NULL" : "pending_at IS NULL"];
         const binds: unknown[] = [];
         if (ids) {
           where.push(`id IN (${ids.map(() => "?").join(",")})`);
@@ -289,6 +307,32 @@ export class Items extends Effect.Service<Items>()("lam/Items", {
         Effect.flatMap(({ results }) => Effect.forEach(results, decodeRow)),
         Effect.map((items) => (status ? items.filter((i) => i.status === status) : items)),
       ),
+
+    setPending: (id: string, pending: boolean) =>
+      Effect.gen(function* () {
+        const current = yield* Items.get(id);
+        if (current.status !== "open") return yield* new AlreadyClosed({ id });
+        const now = new Date().toISOString();
+        const result = yield* db(d => d.prepare(
+          `UPDATE items SET pending_at = ?, version = version + 1
+           WHERE id = ? AND status = 'open' AND (expires_at IS NULL OR expires_at > ?)
+             AND (pending_at IS NOT NULL) != ?`,
+        ).bind(pending ? now : null, id, now, pending ? 1 : 0).run());
+        const item = yield* Items.get(id);
+        if (!result.meta.changes && item.status !== "open") return yield* new AlreadyClosed({ id });
+        return item;
+      }),
+
+    resolveKey: (key: string, text: string | undefined, by: ResponseBy) =>
+      Effect.gen(function* () {
+        const now = new Date().toISOString();
+        const row = yield* db(d => d.prepare(
+          `UPDATE items SET status = 'resolved', response_text = ?, response_by = ?, resolved_at = ?, version = version + 1
+           WHERE external_key = ? AND status = 'open' AND (expires_at IS NULL OR expires_at > ?) RETURNING *`,
+        ).bind(text ?? null, by, now, key, now).first());
+        if (!row) return yield* new NotFound({ id: key });
+        return yield* decodeRow(row);
+      }),
 
     history: ({ limit, cursor, q, priority, type }: HistoryQuery): Effect.Effect<HistoryPage, BadRequest | DbError, Env> =>
       Effect.gen(function* () {
@@ -364,7 +408,7 @@ export class Items extends Effect.Service<Items>()("lam/Items", {
       Effect.gen(function* () {
         const current = yield* Items.get(id);
         const now = new Date().toISOString();
-        if (current.kind === "fyi" && c.status === "resolved") {
+        if (current.kind === "fyi" && current.pending_at === null && c.status === "resolved") {
           const text = c.text?.trim();
           if (c.choice !== undefined || !text) {
             return yield* new BadRequest({ message: "FYIs accept only a nonblank text reply" });

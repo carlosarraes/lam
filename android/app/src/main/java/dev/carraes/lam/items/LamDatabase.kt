@@ -13,10 +13,15 @@ import dev.carraes.lam.articles.ArticleDao
 @Entity(tableName = "history_membership", primaryKeys = ["queryKey", "itemId"], indices = [Index("itemId")])
 data class HistoryMembership(val queryKey: String, val itemId: String)
 
-@Database(entities = [ItemEntity::class, SyncMetadata::class, HistoryMembership::class, ArticleEntity::class], version = 3, exportSchema = true)
+@Database(entities = [ItemEntity::class, SyncMetadata::class, HistoryMembership::class, ArticleEntity::class], version = 4, exportSchema = true)
 @TypeConverters(ItemConverters::class)
 abstract class LamDatabase : RoomDatabase() {
     companion object {
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE items ADD COLUMN pendingAt TEXT")
+            }
+        }
         val MIGRATION_2_3 = object : Migration(2, 3) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("CREATE TABLE IF NOT EXISTS articles (account TEXT NOT NULL, id TEXT NOT NULL, json TEXT NOT NULL, content TEXT, contentSha256 TEXT, PRIMARY KEY(account, id))")

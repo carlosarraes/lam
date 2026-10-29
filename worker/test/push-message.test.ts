@@ -51,6 +51,15 @@ describe("critical push messages", () => {
     expect(module?.pushMessage("item.created", new Item({ ...critical, id: "normal-1", priority: "normal" }))).toBeNull();
   });
 
+  it("keeps pending critical creation silent but sends cancellation invalidations for changes and closes", async () => {
+    const { pushMessage } = await import("../src/domain/PushMessage");
+    const pending = new Item({ ...critical, pending_at: "2026-10-29T12:00:00Z" });
+    expect(pushMessage("item.created", pending)).toBeNull();
+    for (const event of ["item.changed", "item.closed"] as const) {
+      expect(pushMessage(event, pending)?.data).toMatchObject({ event, item_id: "critical-1", status: "open", pending: "true" });
+    }
+  });
+
   it("sends a close invalidation so Android can cancel a critical notification", async () => {
     const module = await import("../src/domain/PushMessage").catch(() => null);
     const closed = new Item({

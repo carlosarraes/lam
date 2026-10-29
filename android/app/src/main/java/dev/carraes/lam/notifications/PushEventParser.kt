@@ -8,6 +8,7 @@ internal data class CriticalPushEvent(
     val kind: String,
     val name: String,
     val title: String,
+    val pending: Boolean = false,
 ) {
     enum class Type { CREATED, CHANGED, CLOSED }
 }
@@ -29,6 +30,6 @@ internal object PushEventParser {
         val status = data["status"]?.takeIf(statuses::contains) ?: return null
         val kind = data["kind"]?.takeIf(kinds::contains) ?: return null
         val title = data["title"]?.takeIf(String::isNotBlank) ?: return null
-        return CriticalPushEvent(event, itemId, version, status, kind, data["name"].orEmpty(), title)
+        return CriticalPushEvent(event, itemId, version, status, kind, data["name"].orEmpty(), title, pending = data["pending"] == "true")
     }
 }

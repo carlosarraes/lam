@@ -341,7 +341,8 @@ internal class DefaultItemRepository(
             val canonical = session.api.getItem(id)
             if (!commit(session) { storage.upsert(listOf(ItemMapper.toEntity(canonical))) }) return false
         }
-        val items = session.api.listOpenItems().map(ItemMapper::toEntity)
+        val items = (session.api.listOpenItems() + session.api.listOpenItems(pending = true))
+            .map(ItemMapper::toEntity)
         val observedMissing = stateLock.withLock {
             if (session.generation != generation) return false
             observedItems.keys.filter { id ->
