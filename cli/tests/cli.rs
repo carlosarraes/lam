@@ -219,7 +219,7 @@ async fn fyi_explicit_wait_rejects_before_polling() {
         .mount(&server)
         .await;
     for ids in [vec!["news1"], vec!["abc12", "news1"]] {
-        let args = [vec!["wait"], ids, vec!["--timeout", "0s"]].concat();
+        let args = [vec!["wait"], ids, vec!["--timeout", "5s"]].concat();
         let out = lam(&dir, &args);
         assert_eq!(out.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&out.stderr).contains("FYI"));
@@ -248,7 +248,7 @@ async fn fyi_wait_any_excludes_informational_items() {
         .respond_with(ResponseTemplate::new(200).set_body_json(item("abc12", "resolved", None)))
         .mount(&server)
         .await;
-    let out = lam(&dir, &["wait", "--any", "--timeout", "0s"]);
+    let out = lam(&dir, &["wait", "--any", "--timeout", "5s"]);
     assert!(
         out.status.success(),
         "{}",
@@ -270,7 +270,7 @@ async fn fyi_only_wait_any_stops_without_polling() {
         .respond_with(ResponseTemplate::new(200).set_body_json(vec![fyi("news1")]))
         .mount(&server)
         .await;
-    let out = lam(&dir, &["wait", "--any", "--timeout", "0s"]);
+    let out = lam(&dir, &["wait", "--any", "--timeout", "5s"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no open"));
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
@@ -843,7 +843,7 @@ async fn wait_polls_until_closed_and_exits_by_status() {
         )))
         .mount(&server)
         .await;
-    let out = lam(&dir, &["wait", "abc12"]);
+    let out = lam(&dir, &["wait", "abc12", "--json"]);
     assert_eq!(out.status.code(), Some(0));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["response_choice"], "yes");
@@ -1119,10 +1119,11 @@ async fn wait_many_ids_uses_wait_any_endpoint() {
         .expect(1)
         .mount(&server)
         .await;
-    let out = lam(&dir, &["wait", "aaa11", "bbb22"]);
+    let out = lam(&dir, &["wait", "aaa11", "bbb22", "--json"]);
     assert_eq!(out.status.code(), Some(0));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["id"], "bbb22");
+    assert_eq!(v["first"], "bbb22");
+    assert_eq!(v["items"][0]["id"], "bbb22");
 }
 
 #[tokio::test]

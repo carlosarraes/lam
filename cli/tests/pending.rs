@@ -264,6 +264,107 @@ async fn pending_list_requests_only_open_pending_items_and_prints_json() {
     let out = lam(&dir, &["pending", "list"]);
     assert_success(&out);
     assert!(String::from_utf8_lossy(&out.stdout).contains("Track review"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("review:42"));
+}
+
+#[tokio::test]
+async fn show_preserves_external_key() {
+    let (server, dir) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/items/pend1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(item()))
+        .mount(&server)
+        .await;
+    let out = lam(&dir, &["show", "pend1"]);
+    assert_success(&out);
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["external_key"], "review:42");
+}
+
+#[tokio::test]
+async fn pending_add_embeds_recommendation_in_fyi_body() {
+    let (server, dir) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/items"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(item()))
+        .mount(&server)
+        .await;
+    for (body, expected) in [
+        (
+            "Waiting for review",
+            "Waiting for review\n\nRecommendation:\nMerge after CI passes",
+        ),
+        ("", "Recommendation:\nMerge after CI passes"),
+    ] {
+        let out = lam(
+            &dir,
+            &[
+                "pending",
+                "add",
+                "Track review",
+                "--key",
+                "review:42",
+                "--body",
+                body,
+                "--recommendation",
+                "Merge after CI passes",
+            ],
+        );
+        assert_success(&out);
+        let requests = server.received_requests().await.unwrap();
+        let sent: Value = requests.last().unwrap().body_json().unwrap();
+        assert_eq!(sent["kind"], "fyi");
+        assert_eq!(sent["pending"], true);
+        assert_eq!(sent["body"], expected);
+        assert!(sent.get("recommendation").is_none());
+    }
+}
+
+#[tokio::test]
+async fn pending_resolve_missing_key_suggests_up_to_five_open_items_or_none() {
+    for count in [0, 6] {
+        let (server, dir) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/items/resolve"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        let items: Vec<_> = (0..count)
+            .map(|n| {
+                let mut value = item();
+                value["id"] = format!("pending-{n}").into();
+                value["external_key"] = if n == 0 {
+                    Value::Null
+                } else {
+                    format!("key-{n}").into()
+                };
+                value
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/items"))
+            .and(query_param("pending", "1"))
+            .and(query_param("status", "open"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(items))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let out = lam(&dir, &["pending", "resolve", "--key", "missing"]);
+        assert_eq!(out.status.code(), Some(1));
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(error.contains("no open item with key missing"), "{error}");
+        assert!(
+            error.contains("resolve by id: lam pending resolve ID"),
+            "{error}"
+        );
+        if count == 0 {
+            assert!(error.contains("no open pending items"), "{error}");
+        } else {
+            assert!(error.contains("pending-0  -  Track review"), "{error}");
+            assert!(error.contains("pending-4  key-4  Track review"), "{error}");
+            assert!(!error.contains("pending-5"), "{error}");
+        }
+    }
 }
 
 #[tokio::test]

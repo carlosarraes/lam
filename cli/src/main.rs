@@ -87,8 +87,10 @@ enum Cmd {
         #[arg(short, long)]
         wait: bool,
     },
-    /// Block until an item changes (a check ticked) or closes; prints it as JSON.
-    /// Exit 0 resolved/changed, 2 dismissed, 3 timeout, 4 expired, 5 retracted
+    /// Block until an item changes (a check ticked) or closes.
+    /// Transient connect/reset/timeout errors, HTTP 408/429 and 5xx retry with
+    /// 1s, 2s, 4s backoff capped at 30s, within --timeout. Other 4xx fail immediately.
+    /// Exit 0 resolved/changed, 1 hard error, 2 dismissed, 3 timeout, 4 expired, 5 retracted.
     Wait {
         /// One id, or several to return whichever closes first
         #[arg(required_unless_present = "any")]
@@ -102,6 +104,10 @@ enum Cmd {
         /// e.g. 30m, 2h, 90s
         #[arg(long, default_value = "2h")]
         timeout: String,
+        /// Print exactly one JSON object: the item for one id; for multiple ids,
+        /// {"first":"ID","items":[ITEM]} containing only the first changed/closed item
+        #[arg(long)]
+        json: bool,
     },
     /// Quiet lane for items Carlos triages later (no notifications); --key dedupes
     #[command(
@@ -172,6 +178,9 @@ enum PendingCmd {
         /// Markdown body describing the tracked work
         #[arg(short, long, default_value = "")]
         body: String,
+        /// Add a Recommendation: section to the FYI body
+        #[arg(long)]
+        recommendation: Option<String>,
         /// http://, https:// or grokbot:// URL to the tracked work
         #[arg(short, long)]
         link: Option<String>,
@@ -283,14 +292,16 @@ fn run(cmd: Cmd) -> Result<i32> {
             any,
             name,
             timeout,
-        } => commands::wait(&ids, any, name, &timeout),
+            json,
+        } => commands::wait(&ids, any, name, &timeout, json),
         Cmd::Pending(PendingCmd::Add {
             title,
             key,
             name,
             body,
             link,
-        }) => commands::pending_add(title, key, name, body, link),
+            recommendation,
+        }) => commands::pending_add(title, key, name, body, link, recommendation),
         Cmd::Pending(PendingCmd::List { json }) => commands::pending_list(json),
         Cmd::Pending(PendingCmd::Resolve { id, key, message }) => {
             commands::pending_resolve(id.as_deref(), key.as_deref(), message)
