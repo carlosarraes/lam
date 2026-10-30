@@ -2,11 +2,38 @@ use anyhow::{bail, Result};
 use reqwest::blocking::{Client as Http, RequestBuilder, Response};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 
 const PAIRING_CANCEL_TIMEOUT: Duration = Duration::from_millis(500);
+
+#[derive(Debug)]
+pub struct ServerError {
+    pub status: StatusCode,
+    message: String,
+}
+
+impl std::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "server returned {}: {}", self.status, self.message)
+    }
+}
+
+impl std::error::Error for ServerError {}
+
+pub fn is_transient(error: &anyhow::Error) -> bool {
+    if let Some(error) = error.downcast_ref::<ServerError>() {
+        return error.status.is_server_error()
+            || matches!(
+                error.status,
+                StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+            );
+    }
+    error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+        error.is_connect() || error.is_timeout() || error.is_request() || error.is_body()
+    })
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -187,6 +214,7 @@ pub struct Client {
     http: Http,
     base: String,
     token: String,
+    deadline: Option<Instant>,
 }
 
 impl Client {
@@ -195,13 +223,29 @@ impl Client {
             http: Http::builder().timeout(Duration::from_secs(40)).build()?,
             base: cfg.server.clone(),
             token: cfg.token.clone(),
+            deadline: None,
         })
     }
 
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
     fn get(&self, path: &str) -> RequestBuilder {
-        self.http
+        let req = self
+            .http
             .get(format!("{}{}", self.base, path))
-            .bearer_auth(&self.token)
+            .bearer_auth(&self.token);
+        match self.deadline {
+            Some(deadline) => req.timeout(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(40))
+                    .max(Duration::from_millis(1)),
+            ),
+            None => req,
+        }
     }
 
     fn post(&self, path: &str) -> RequestBuilder {
@@ -227,8 +271,8 @@ impl Client {
         if status.is_success() {
             return Ok(res);
         }
-        let msg = res.text().unwrap_or_default();
-        bail!("server returned {status}: {msg}");
+        let message = res.text().unwrap_or_default();
+        Err(ServerError { status, message }.into())
     }
 
     pub fn push(&self, item: &NewItem) -> Result<Item> {

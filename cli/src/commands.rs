@@ -7,7 +7,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use crate::client::{
-    Client, DeviceSummary, Item, ItemKind, NewItem, PairingWait, Resolution, Wait,
+    Client, DeviceSummary, Item, ItemKind, NewItem, PairingWait, Resolution, ServerError, Wait,
 };
 use crate::config::Config;
 
@@ -203,7 +203,7 @@ pub fn push(a: PushArgs) -> Result<i32> {
     })?;
     if a.wait {
         eprintln!("pushed {} — waiting", item.id);
-        return self::wait(&[item.id], false, None, "2h");
+        return self::wait(&[item.id], false, None, "2h", false);
     }
     println!("{}", item.id);
     Ok(0)
@@ -252,11 +252,54 @@ fn my_open_ids(c: &Client, name: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-pub fn wait(ids: &[String], any: bool, name: Option<String>, timeout: &str) -> Result<i32> {
+fn retry_until<T>(deadline: Instant, mut request: impl FnMut() -> Result<T>) -> Result<Option<T>> {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        match request() {
+            Ok(value) => return Ok(Some(value)),
+            Err(error) if crate::client::is_transient(&error) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(None);
+                }
+                let delay = backoff.min(remaining);
+                let error = error
+                    .to_string()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!("lam: {error}; retrying in {:.1}s", delay.as_secs_f64());
+                std::thread::sleep(delay);
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn wait_timed_out(ids: &[String]) -> Result<i32> {
+    eprintln!("lam: timed out waiting for {}", ids.join(","));
+    Ok(EXIT_TIMEOUT)
+}
+
+pub fn wait(
+    ids: &[String],
+    any: bool,
+    name: Option<String>,
+    timeout: &str,
+    json: bool,
+) -> Result<i32> {
     let deadline = Instant::now() + parse_duration(timeout)?;
-    let c = client()?;
+    let c = client()?.with_deadline(deadline);
     let ids: Vec<String> = if any {
-        my_open_ids(&c, &crate::name::resolve(name)?)?
+        let name = crate::name::resolve(name)?;
+        let Some(ids) = retry_until(deadline, || my_open_ids(&c, &name))? else {
+            return wait_timed_out(&[name]);
+        };
+        ids
     } else {
         ids.to_vec()
     };
@@ -264,30 +307,46 @@ pub fn wait(ids: &[String], any: bool, name: Option<String>, timeout: &str) -> R
         bail!("no open items to wait on");
     }
     // Snapshot versions first so a check ticked from now on counts as a change.
-    let since: Vec<u64> = ids
-        .iter()
-        .map(|id| {
-            let item = c.show(id)?;
-            if item.is_fyi() {
-                bail!("FYIs cannot wait for a decision: {id}");
-            }
-            Ok(item.version)
-        })
-        .collect::<Result<_>>()?;
+    let mut since = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let Some(item) = retry_until(deadline, || c.show(id))? else {
+            return wait_timed_out(&ids);
+        };
+        if item.is_fyi() {
+            bail!("FYIs cannot wait for a decision: {id}");
+        }
+        since.push(item.version);
+    }
     loop {
-        let round = if ids.len() == 1 {
-            c.wait_once(&ids[0], Some(since[0]))?
-        } else {
-            c.wait_any_once(&ids, Some(&since))?
+        let round = retry_until(deadline, || {
+            if ids.len() == 1 {
+                c.wait_once(&ids[0], Some(since[0]))
+            } else {
+                c.wait_any_once(&ids, Some(&since))
+            }
+        })?;
+        let Some(round) = round else {
+            return wait_timed_out(&ids);
         };
         match round {
             Wait::Closed(item) => {
-                print_json(&item)?;
+                if json && ids.len() > 1 {
+                    print_json(&serde_json::json!({ "first": item.id, "items": [&item] }))?;
+                } else {
+                    if !json {
+                        println!(
+                            "{} first: {}",
+                            if item.status == "open" {
+                                "changed"
+                            } else {
+                                "resolved"
+                            },
+                            item.id
+                        );
+                    }
+                    print_json(&item)?;
+                }
                 return Ok(exit_for(&item));
-            }
-            Wait::Pending if Instant::now() >= deadline => {
-                eprintln!("lam: timed out waiting for {}", ids.join(","));
-                return Ok(EXIT_TIMEOUT);
             }
             Wait::Pending => {}
         }
@@ -327,10 +386,15 @@ fn print_items(items: &[Item], json: bool) -> Result<i32> {
             .or(i.response_text.as_deref())
             .unwrap_or("");
         println!(
-            "{:<6} {:<9} {:<8} {:<24} {}{}",
+            "{:<6} {:<9} {:<8} {}{:<24} {}{}",
             i.id,
             i.status_label(),
             i.priority_label(),
+            if i.pending_at.is_some() {
+                format!("{:<24} ", i.external_key.as_deref().unwrap_or("-"))
+            } else {
+                String::new()
+            },
             src,
             title,
             if answer.is_empty() {
@@ -349,7 +413,24 @@ pub fn pending_add(
     name: Option<String>,
     body: String,
     link: Option<String>,
+    recommendation: Option<String>,
 ) -> Result<i32> {
+    let body = match recommendation {
+        Some(recommendation) => {
+            validate_max_characters(
+                "--recommendation",
+                &recommendation,
+                MAX_RECOMMENDATION_CHARACTERS,
+            )?;
+            let section = format!("Recommendation:\n{recommendation}");
+            if body.is_empty() {
+                section
+            } else {
+                format!("{body}\n\n{section}")
+            }
+        }
+        None => body,
+    };
     push(PushArgs {
         title,
         kind: ItemKind::Fyi,
@@ -384,7 +465,35 @@ pub fn pending_resolve(
 ) -> Result<i32> {
     if let Some(key) = key {
         validate_reply(&message)?;
-        print_json(&client()?.resolve_key(key, message)?)?;
+        let c = client()?;
+        let item = c.resolve_key(key, message).map_err(|error| {
+            if !error
+                .downcast_ref::<ServerError>()
+                .is_some_and(|error| error.status == reqwest::StatusCode::NOT_FOUND)
+            {
+                return error;
+            }
+            let mut message = format!("no open item with key {key}\n");
+            match c.pending_list() {
+                Ok(items) if items.is_empty() => message.push_str("no open pending items\n"),
+                Ok(items) => {
+                    for item in items.iter().take(5) {
+                        message.push_str(&format!(
+                            "{}  {}  {}\n",
+                            item.id,
+                            item.external_key.as_deref().unwrap_or("-"),
+                            item.title
+                        ));
+                    }
+                }
+                Err(error) => {
+                    message.push_str(&format!("could not list open pending items: {error}\n"))
+                }
+            }
+            message.push_str("resolve by id: lam pending resolve ID");
+            anyhow::anyhow!(message)
+        })?;
+        print_json(&item)?;
         Ok(0)
     } else {
         done(id.context("an id or --key is required")?, None, message)
