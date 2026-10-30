@@ -49,7 +49,7 @@ async fn setup() -> (MockServer, tempfile::TempDir) {
 }
 
 #[tokio::test]
-async fn json_wait_emits_one_value_for_single_and_multiple_ids() {
+async fn wait_stdout_is_one_json_value_with_or_without_json_for_single_and_multiple_ids() {
     let (server, dir) = setup().await;
     for endpoint in ["/items/first/wait", "/items/wait"] {
         Mock::given(method("GET"))
@@ -68,6 +68,8 @@ async fn json_wait_emits_one_value_for_single_and_multiple_ids() {
     for (args, batch) in [
         (vec!["wait", "first", "--json"], false),
         (vec!["wait", "first", "second", "--json"], true),
+        (vec!["wait", "first"], false),
+        (vec!["wait", "first", "second"], false),
     ] {
         let out = lam(&dir, &args);
         assert_eq!(
@@ -88,17 +90,25 @@ async fn json_wait_emits_one_value_for_single_and_multiple_ids() {
 }
 
 #[tokio::test]
-async fn human_wait_names_the_first_item() {
+async fn human_wait_names_the_first_item_on_stderr() {
     let (server, dir) = setup().await;
-    Mock::given(method("GET"))
-        .and(path("/items/wait"))
-        .and(query_param("ids", "first,second"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(item("second", "resolved")))
-        .mount(&server)
-        .await;
-    let out = lam(&dir, &["wait", "first", "second"]);
-    assert_eq!(out.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&out.stdout).contains("resolved first: second"));
+    for (status, expected) in [
+        ("resolved", "resolved first: second"),
+        ("open", "changed first: second"),
+    ] {
+        let mock = Mock::given(method("GET"))
+            .and(path("/items/wait"))
+            .and(query_param("ids", "first,second"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(item("second", status)))
+            .mount_as_scoped(&server)
+            .await;
+        let out = lam(&dir, &["wait", "first", "second"]);
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), expected);
+        let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(value["id"], "second");
+        drop(mock);
+    }
 }
 
 #[tokio::test]
@@ -118,7 +128,7 @@ async fn wait_retries_transient_http_statuses_but_stops_on_hard_errors() {
             .respond_with(ResponseTemplate::new(200).set_body_json(item("first", "resolved")))
             .mount(&server)
             .await;
-        let out = lam(&dir, &["wait", "first", "--timeout", "5s"]);
+        let out = lam(&dir, &["wait", "first", "--json", "--timeout", "5s"]);
         let error = String::from_utf8_lossy(&out.stderr);
         if matches!(status, 408 | 429 | 500 | 503) {
             assert_eq!(out.status.code(), Some(0), "{status}: {error}");

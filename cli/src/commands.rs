@@ -334,7 +334,7 @@ pub fn wait(
                     print_json(&serde_json::json!({ "first": item.id, "items": [&item] }))?;
                 } else {
                     if !json {
-                        println!(
+                        eprintln!(
                             "{} first: {}",
                             if item.status == "open" {
                                 "changed"
