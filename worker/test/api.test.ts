@@ -354,6 +354,24 @@ describe("auth", () => {
     expect((await SELF.fetch(`http://lam/items/${item.id}`, { headers: device.headers })).status).toBe(200);
   });
 
+  it("allows master and device bearers to toggle Pending without changing origin", async () => {
+    const item = await push({ title: "Pending authority", link: "https://example.com/task" });
+    const device = await registerFakeDevice();
+    for (const auth of [AUTH, device.headers]) {
+      for (const pending of [true, false]) {
+        const response = await SELF.fetch(`http://lam/v2/items/${item.id}/pending`, {
+          method: "POST", headers: { ...auth, "Content-Type": "application/json" }, body: JSON.stringify({ pending }),
+        });
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({
+          id: item.id, kind: item.kind, name: item.name, link: item.link,
+          source_host: item.source_host, source_project: item.source_project,
+          status: "open", pending_at: pending ? expect.any(String) : null,
+        });
+      }
+    }
+  });
+
   it("allows a valid device bearer to wait for one closed item", async () => {
     const item = await push({ title: "device single wait" });
     await SELF.fetch(`http://lam/items/${item.id}/dismiss`, { method: "POST", headers: AUTH });

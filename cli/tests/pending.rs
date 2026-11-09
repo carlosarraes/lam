@@ -1,7 +1,7 @@
 use std::process::Command;
 
 use serde_json::{json, Value};
-use wiremock::matchers::{body_json, header, method, path, query_param};
+use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn item() -> Value {
@@ -47,7 +47,7 @@ fn assert_success(out: &std::process::Output) {
 }
 
 #[tokio::test]
-async fn push_and_pending_add_accept_only_supported_link_schemes() {
+async fn push_accepts_only_supported_link_schemes() {
     let (server, dir) = setup().await;
     Mock::given(method("POST"))
         .and(path("/v2/items"))
@@ -61,68 +61,66 @@ async fn push_and_pending_add_accept_only_supported_link_schemes() {
         "https://example.com/task",
         "HTTPS://example.com/task",
     ];
-    for prefix in [
-        vec![
-            "push",
-            "Open task",
-            "--recommendation",
-            "Review the linked task",
-        ],
-        vec!["pending", "add", "Track task", "--key", "task:42"],
-    ] {
-        for link in links {
-            let args = [prefix.clone(), vec!["-l", link]].concat();
-            assert_success(&lam(&dir, &args));
-        }
+    for link in links {
+        assert_success(&lam(
+            &dir,
+            &[
+                "push",
+                "Open task",
+                "--recommendation",
+                "Review the linked task",
+                "-l",
+                link,
+            ],
+        ));
     }
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 2 * links.len());
+    assert_eq!(requests.len(), links.len());
     for (request, link) in requests.iter().zip(links.iter().cycle()) {
         assert_eq!(request.body_json::<Value>().unwrap()["link"], *link);
     }
 }
 
 #[tokio::test]
-async fn push_and_pending_add_reject_unsupported_links_before_http() {
+async fn push_rejects_unsupported_links_before_http() {
     let (server, dir) = setup().await;
-    for prefix in [
-        vec![
-            "push",
-            "Open task",
-            "--recommendation",
-            "Review the linked task",
-        ],
-        vec!["pending", "add", "Track task", "--key", "task:42"],
+    for link in [
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "ftp://x",
+        "data:text/html,x",
+        "mailto:user@example.com",
+        "bare text",
+        "grokbot:",
+        "grokbot:app",
+        "grokbot://",
+        "http://",
+        "https://",
+        "grokbot:// ",
     ] {
-        for link in [
-            "javascript:alert(1)",
-            "file:///etc/passwd",
-            "ftp://x",
-            "data:text/html,x",
-            "mailto:user@example.com",
-            "bare text",
-            "grokbot:",
-            "grokbot:app",
-            "grokbot://",
-            "http://",
-            "https://",
-            "grokbot:// ",
-        ] {
-            let args = [prefix.clone(), vec!["--link", link]].concat();
-            let out = lam(&dir, &args);
-            assert_eq!(out.status.code(), Some(1), "{link}");
-            let error = String::from_utf8_lossy(&out.stderr);
-            assert!(
-                error.contains("lam: --link must be an http://, https:// or grokbot:// URL"),
-                "{link}: {error}"
-            );
-        }
+        let out = lam(
+            &dir,
+            &[
+                "push",
+                "Open task",
+                "--recommendation",
+                "Review the linked task",
+                "--link",
+                link,
+            ],
+        );
+        assert_eq!(out.status.code(), Some(1), "{link}");
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            error.contains("lam: --link must be an http://, https:// or grokbot:// URL"),
+            "{link}: {error}"
+        );
     }
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[test]
-fn pending_help_explains_silence_dedupe_and_lifecycle_commands() {
+fn pending_help_explains_carlos_only_lane_and_agent_lifecycle_commands() {
     let out = Command::new(env!("CARGO_BIN_EXE_lam"))
         .args(["pending", "--help"])
         .output()
@@ -136,94 +134,57 @@ fn pending_help_explains_silence_dedupe_and_lifecycle_commands() {
     for phrase in [
         "silent (no ntfy/FCM/bell alerts)",
         "hidden from lam list and Requests",
-        "--key is a stable dedupe key",
-        "same open key updates title/body/link and returns the same id",
-        "after it closes the key can be reused",
+        "Carlos parks items in Pending from the TUI (p) or the Android Pending screen",
+        "send a request (default) or --kind fyi instead",
+        "lam pending list",
         "lam pending resolve ID",
         "lam pending resolve --key KEY",
         "-m NOTE",
-        "lam pending move ID",
-        "lam pending unmove ID",
     ] {
         assert!(help.contains(phrase), "missing {phrase:?} in {help}");
     }
 }
 
-#[tokio::test]
-async fn pending_add_creates_keyed_fyi_and_accepts_upsert_response() {
-    let (server, dir) = setup().await;
-    Mock::given(method("POST"))
-        .and(path("/v2/items"))
-        .and(header("authorization", "Bearer tok"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(item()))
-        .mount(&server)
-        .await;
-    let out = lam(
-        &dir,
-        &[
-            "pending",
-            "add",
-            "Track review",
-            "--key",
-            "review:42",
-            "-n",
-            "reviewer",
-            "-b",
-            "Waiting for review",
-            "-l",
-            "https://example.com/42",
-        ],
+fn assert_pending_rejected(out: &std::process::Output) {
+    assert_eq!(out.status.code(), Some(1));
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        error.contains("pending is Carlos-only: send a request (default) or --kind fyi instead"),
+        "{error}"
     );
-    assert_success(&out);
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "pend1");
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 1);
-    let body: Value = requests[0].body_json().unwrap();
-    assert_eq!(body["kind"], "fyi");
-    assert_eq!(body["pending"], true);
-    assert_eq!(body["external_key"], "review:42");
-    assert_eq!(body["name"], "reviewer");
-    assert_eq!(body["title"], "Track review");
-    assert_eq!(body["body"], "Waiting for review");
-    assert_eq!(body["link"], "https://example.com/42");
-    assert!(body.get("recommendation").is_none());
 }
 
 #[tokio::test]
-async fn push_pending_preserves_request_fields_and_optional_key() {
+async fn pending_add_is_rejected_before_http() {
     let (server, dir) = setup().await;
-    Mock::given(method("POST"))
-        .and(path("/v2/items"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(item()))
-        .mount(&server)
-        .await;
-    for key in [vec![], vec!["--key", "review:42"]] {
-        let args = [
-            vec![
-                "push",
-                "Review this",
-                "--pending",
-                "--recommendation",
-                "Approve after review",
-            ],
-            key.clone(),
-        ]
-        .concat();
-        let out = lam(&dir, &args);
-        assert_success(&out);
+    let out = lam(
+        &dir,
+        &["pending", "add", "Track review", "--key", "review:42"],
+    );
+    assert_pending_rejected(&out);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn push_pending_is_rejected_for_any_kind_before_validation_or_http() {
+    let (server, dir) = setup().await;
+    for args in [
+        vec!["push", "Review this", "--pending"],
+        vec![
+            "push",
+            "Review this",
+            "--pending",
+            "--recommendation",
+            "Approve after review",
+            "--key",
+            "review:42",
+        ],
+        vec!["push", "An update", "--kind", "fyi", "--pending"],
+        vec!["push", "An update", "--kind", "fyi", "--pending", "--wait"],
+    ] {
+        assert_pending_rejected(&lam(&dir, &args));
     }
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 2);
-    for request in &requests {
-        let body: Value = request.body_json().unwrap();
-        assert_eq!(body["kind"], "request");
-        assert_eq!(body["pending"], true);
-        assert_eq!(body["recommendation"], "Approve after review");
-    }
-    let first: Value = requests[0].body_json().unwrap();
-    assert!(first.get("external_key").is_none());
-    let second: Value = requests[1].body_json().unwrap();
-    assert_eq!(second["external_key"], "review:42");
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -279,45 +240,6 @@ async fn show_preserves_external_key() {
     assert_success(&out);
     let value: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(value["external_key"], "review:42");
-}
-
-#[tokio::test]
-async fn pending_add_embeds_recommendation_in_fyi_body() {
-    let (server, dir) = setup().await;
-    Mock::given(method("POST"))
-        .and(path("/v2/items"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(item()))
-        .mount(&server)
-        .await;
-    for (body, expected) in [
-        (
-            "Waiting for review",
-            "Waiting for review\n\nRecommendation:\nMerge after CI passes",
-        ),
-        ("", "Recommendation:\nMerge after CI passes"),
-    ] {
-        let out = lam(
-            &dir,
-            &[
-                "pending",
-                "add",
-                "Track review",
-                "--key",
-                "review:42",
-                "--body",
-                body,
-                "--recommendation",
-                "Merge after CI passes",
-            ],
-        );
-        assert_success(&out);
-        let requests = server.received_requests().await.unwrap();
-        let sent: Value = requests.last().unwrap().body_json().unwrap();
-        assert_eq!(sent["kind"], "fyi");
-        assert_eq!(sent["pending"], true);
-        assert_eq!(sent["body"], expected);
-        assert!(sent.get("recommendation").is_none());
-    }
 }
 
 #[tokio::test]
@@ -399,21 +321,12 @@ async fn pending_resolve_by_key_or_id_sends_optional_note() {
 }
 
 #[tokio::test]
-async fn pending_move_and_unmove_change_lane_by_id() {
+async fn pending_move_and_unmove_are_rejected_before_http() {
     let (server, dir) = setup().await;
-    for (command, pending) in [("move", true), ("unmove", false)] {
-        Mock::given(method("POST"))
-            .and(path("/v2/items/pend1/pending"))
-            .and(body_json(json!({"pending": pending})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(item()))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let out = lam(&dir, &["pending", command, "pend1"]);
-        assert_success(&out);
-        let value: Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(value["id"], "pend1");
+    for command in ["move", "unmove"] {
+        assert_pending_rejected(&lam(&dir, &["pending", command, "pend1"]));
     }
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]

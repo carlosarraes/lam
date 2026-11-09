@@ -45,11 +45,9 @@ FYIs accept one optional text reply from Android's **Reply** action, `r` in the 
 
 | cmd | |
 |---|---|
-| `lam push <title> [-n name] [-b body] [-p low\|normal\|critical] [--recommendation TEXT] [-c choice]… [--recommended-choice CHOICE] \| [--check part]… [--link URL] [--ttl 2h] [--pending] [--key KEY] [--wait]` | prints id; every decision requires `--recommendation` (the action and rationale); choices also require an exact `--recommended-choice`; `--check` makes a checklist that resolves when all parts are ticked and is the only exception |
-| `lam pending add TITLE --key KEY [-n NAME] [-b BODY] [-l URL]` | add or update a quiet FYI in Pending; prints its id |
+| `lam push <title> [-n name] [-b body] [-p low\|normal\|critical] [--recommendation TEXT] [-c choice]… [--recommended-choice CHOICE] \| [--check part]… [--link URL] [--ttl 2h] [--key KEY] [--wait]` | prints id; every decision requires `--recommendation` (the action and rationale); choices also require an exact `--recommended-choice`; `--check` makes a checklist that resolves when all parts are ticked and is the only exception |
 | `lam pending list [--json]` | list open pending items |
 | `lam pending resolve <id> \| --key KEY [-m NOTE]` | close a tracked item by id or stable external key |
-| `lam pending move <id>`, `lam pending unmove <id>` | move an open item into Pending or return it to Requests |
 | `lam wait <id>… \| --any [--timeout 2h]` | first item to change (a check ticked) or close, as JSON; `--any` covers every open item under this agent's name; exit 0 resolved/changed / 2 dismissed / 3 timeout / 4 expired / 5 retracted |
 | `lam retract <id>`, `lam check add <id> <label>` | agent withdraws its ask / appends a check |
 | `lam check tick\|untick <id> <n>` | Carlos's side, from the terminal |
@@ -59,4 +57,4 @@ FYIs accept one optional text reply from Android's **Reply** action, `r` in the 
 | `lam watch` | mirror ntfy → desktop notifications |
 | `lam --llm` | print the agent guide (the `lam` skill) — for agents that don't have the skill installed |
 
-Pending is a quiet lane for tracked work. `lam push --pending` preserves the selected item kind and its required fields. `--key KEY` updates an existing open item with that key and returns the same id, even when its title or body changes. Default lists exclude Pending; `lam pending list` shows it. Pending creation and lane changes do not alert; moving a critical item to Pending cancels its phone notification. See [Pending](docs/pending.md) for commands and API details.
+Pending is a quiet lane Carlos manages from the TUI (`p`) or the Android Pending screen. Agents send a request (default) or `--kind fyi` when Carlos should see an item now. Creating items as pending and changing lanes from the CLI are rejected. Agents may inspect Pending with `lam pending list` and close their own old trackers with `lam pending resolve` when the world has already resolved them. Default lists exclude Pending. Lane changes do not alert; moving a critical item to Pending cancels its phone notification. `--key KEY` still updates an existing open item with that key and returns the same id, while preserving its lane. See [Pending](docs/pending.md) for commands and API details.

@@ -17,6 +17,9 @@ pub const EXIT_TIMEOUT: i32 = 3;
 pub const EXIT_EXPIRED: i32 = 4;
 pub const EXIT_RETRACTED: i32 = 5;
 
+const PENDING_CARLOS_ONLY: &str =
+    "pending is Carlos-only: send a request (default) or --kind fyi instead";
+
 fn client() -> Result<Client> {
     Client::new(&Config::load()?)
 }
@@ -172,6 +175,9 @@ fn validate_push(a: &PushArgs) -> Result<()> {
 }
 
 pub fn push(a: PushArgs) -> Result<i32> {
+    if a.pending {
+        bail!(PENDING_CARLOS_ONLY);
+    }
     validate_push(&a)?;
     let name = crate::name::resolve(a.name)?;
     let ttl = a
@@ -453,9 +459,8 @@ pub fn pending_list(json: bool) -> Result<i32> {
     print_items(&client()?.pending_list()?, json)
 }
 
-pub fn pending_move(id: &str, pending: bool) -> Result<i32> {
-    print_json(&client()?.set_pending(id, pending)?)?;
-    Ok(0)
+pub fn pending_move(_id: &str, _pending: bool) -> Result<i32> {
+    bail!(PENDING_CARLOS_ONLY)
 }
 
 pub fn pending_resolve(

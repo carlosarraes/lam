@@ -77,8 +77,8 @@ enum Cmd {
         /// Expire the item after this long (e.g. 2h); expired items leave the queue
         #[arg(long)]
         ttl: Option<String>,
-        /// Keep the item silent in Pending (no ntfy/FCM/bell alerts)
-        #[arg(long)]
+        /// Unsupported: Carlos manages Pending from the TUI or Android
+        #[arg(long, hide = true)]
         pending: bool,
         /// Stable dedupe key; silently update the matching open item and return the same id
         #[arg(long)]
@@ -109,17 +109,16 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Quiet lane for items Carlos triages later (no notifications); --key dedupes
+    /// List Pending items or resolve your old trackers; Carlos manages the lane
     #[command(
         subcommand,
         long_about = concat!(
             "Pending items are silent (no ntfy/FCM/bell alerts) and hidden from lam list and Requests. ",
-            "Use lam pending list to see them.\n\n",
-            "--key is a stable dedupe key: the same open key updates title/body/link and returns the same id; ",
-            "after it closes the key can be reused.\n\n",
-            "Resolve with lam pending resolve ID or lam pending resolve --key KEY, adding an optional -m NOTE. ",
-            "Use lam pending move ID to move an open item into Pending and lam pending unmove ID to return it ",
-            "to Requests without re-alerting. Moving a critical item into Pending cancels its existing phone notification."
+            "Use lam pending list for read-only inspection.\n\n",
+            "Carlos parks items in Pending from the TUI (p) or the Android Pending screen. ",
+            "pending is Carlos-only: send a request (default) or --kind fyi instead.\n\n",
+            "When the world has resolved an old tracker you created, close it with lam pending resolve ID ",
+            "or lam pending resolve --key KEY, adding an optional -m NOTE."
         )
     )]
     Pending(PendingCmd),
@@ -165,7 +164,8 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum PendingCmd {
-    /// Add or update a quiet FYI with a stable external key; prints its id
+    /// Unsupported: send a request or --kind fyi instead
+    #[command(hide = true)]
     Add {
         /// Title of the pending FYI
         title: String,
@@ -203,12 +203,14 @@ enum PendingCmd {
         #[arg(short, long)]
         message: Option<String>,
     },
-    /// Move an open item into Pending without notifying
+    /// Unsupported: Carlos manages Pending from the TUI or Android
+    #[command(hide = true)]
     Move {
         /// Open item id to move into Pending
         id: String,
     },
-    /// Return an open item to Requests without notifying
+    /// Unsupported: Carlos manages Pending from the TUI or Android
+    #[command(hide = true)]
     Unmove {
         /// Pending item id to return to Requests
         id: String,

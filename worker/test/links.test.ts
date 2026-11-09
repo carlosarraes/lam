@@ -10,8 +10,8 @@ let sequence = 0;
 const cases = [
   { name: "legacy creation", path: "/items", fields: {}, upsert: false },
   { name: "typed creation", path: "/v2/items", fields: { kind: "request", recommendation: "Continue" }, upsert: false },
-  { name: "pending add", path: "/v2/items", fields: { kind: "fyi", pending: true }, upsert: false },
-  { name: "pending upsert", path: "/v2/items", fields: { kind: "request", recommendation: "Continue", pending: true }, upsert: true },
+  { name: "FYI creation", path: "/v2/items", fields: { kind: "fyi" }, upsert: false },
+  { name: "pending upsert", path: "/v2/items", fields: { kind: "request", recommendation: "Continue" }, upsert: true },
 ];
 
 describe.each(cases)("item links on $name", ({ path, fields, upsert }) => {
@@ -20,7 +20,12 @@ describe.each(cases)("item links on $name", ({ path, fields, upsert }) => {
     const body = { title, ...fields, ...(upsert ? { external_key: title } : {}) };
     const previous = upsert ? await post(path, { ...body, link: "https://example.com/original" }) : null;
     if (previous) expect(previous.status).toBe(201);
-    const original = previous ? await previous.json<{ id: string; link: string; version: number }>() : null;
+    let original = previous ? await previous.json<{ id: string; link: string; version: number }>() : null;
+    if (original) {
+      const moved = await post(`/v2/items/${original.id}/pending`, { pending: true });
+      expect(moved.status).toBe(200);
+      original = await moved.json<{ id: string; link: string; version: number }>();
+    }
     return { response: await post(path, { ...body, link }), original };
   }
 
@@ -36,7 +41,7 @@ describe.each(cases)("item links on $name", ({ path, fields, upsert }) => {
     const item = await response.json<{ id: string; link: string; pending_at: string | null }>();
     expect(item.link).toBe(link);
     if (original) expect(item.id).toBe(original.id);
-    if ("pending" in fields) expect(item.pending_at).toEqual(expect.any(String));
+    if (upsert) expect(item.pending_at).toEqual(expect.any(String));
 
     const stored = await SELF.fetch(`http://lam/items/${item.id}`, { headers });
     expect(stored.status).toBe(200);

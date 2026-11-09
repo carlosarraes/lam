@@ -67,6 +67,9 @@ export const api = HttpRouter.empty.pipe(
       const authority = yield* RequestAuthority;
       yield* (yield* Auth).requireMaster(authority);
       const decoded = yield* HttpServerRequest.schemaBodyJson(NewTypedItem, strict);
+      if (decoded.pending === true) {
+        return yield* new BadRequest({ message: "pending is Carlos-only: send a request (default) or --kind fyi instead" });
+      }
       const kind = decoded.kind;
       let input: NewItem;
       if (decoded.kind === "fyi") {

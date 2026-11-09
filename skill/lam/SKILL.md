@@ -1,6 +1,6 @@
 ---
 name: lam
-description: Use when Carlos needs a decision request, FYI, or pending tracker in LAM.
+description: Use when Carlos needs a decision request or FYI in LAM, or an old pending tracker needs resolving.
 ---
 
 # lam: Look At Me
@@ -13,7 +13,7 @@ Choose the kind from what Carlos needs to do:
 
 - If an action needs his decision, approval, credentials, or other input, send a request with your recommendation and wait for his answer. Omitted `--kind` defaults to `request`.
 - If already-authorized work has progressed or finished and only an update is needed, send `--kind fyi` and continue. FYIs never grant approval. Any action still lacking authorization remains a request.
-- If an item should be tracked quietly for later, use `lam pending add` with a stable key. Use `lam push --pending` when it needs request fields or a specific kind. Pending creates no approval or notification.
+- If Carlos should see an item now, send a request (default) or `--kind fyi`. Carlos parks items in Pending himself from the TUI (`p`) or the Android Pending screen.
 
 Send one item per useful update or blocking event. For an informational update rejected for a missing recommendation, switch to `--kind fyi` and remove wait/decision flags. Never invent a filler recommendation such as "No action needed" to satisfy request validation.
 
@@ -65,31 +65,18 @@ FYIs reject `--wait`, `--choice`, `--check`, `--recommendation`, and `--recommen
 - Retrying an identical open push returns that item's ID without notifying again. Kind, name, title, body, priority, ordered choices/checks, link, TTL seconds, and recommendation fields determine identity. Source host and project do not.
 - Never invent a name that hides who you are: the inferred `session:window` is what Carlos looks for when several agents are running.
 - Request title = the decision; recommendation = what you recommend and why; body = context and where to act. FYI title/body = the update and its result. Host and project are attached automatically.
-- Pass `--link` on `lam push` or `lam pending add` for a relevant `http://`, `https://` or `grokbot://` URL. Schemes are case-insensitive and require a destination after `://`. Use `--ttl` when the item stops mattering after a while.
+- Pass `--link` on `lam push` for a relevant `http://`, `https://` or `grokbot://` URL. Schemes are case-insensitive and require a destination after `://`. Use `--ttl` when the item stops mattering after a while.
 - The phone notification shows at most 3 buttons; with 3 choices the Open/Reply buttons are still available inside the ntfy app.
 - Leave answering, marking seen, dismissing, and ticking checks to Carlos. As the sending agent, use `lam retract` to withdraw an obsolete item and `lam check add` to extend a checklist. Do not use `lam done` or `lam check tick` to answer your own requests.
 
 ## Pending trackers
 
+Carlos manages Pending from the TUI (`p`) or the Android Pending screen. Agents may inspect it read-only and resolve their own old trackers when the world has already resolved them.
+
 ```bash
-# Quietly track work with a stable key; prints the new or existing open item's id.
-lam pending add "PR #42 awaiting review" --key github:org/repo:pr:42 -b "Waiting for the reviewer." -l https://github.com/org/repo/pull/42
-
-# Reuse the key to update its title, body and link without creating another open item.
-lam pending add "PR #42 review complete" --key github:org/repo:pr:42 -b "Ready to merge." -l https://github.com/org/repo/pull/42
 lam pending list --json
-
-# Close a tracker when the underlying work has finished.
 lam pending resolve --key github:org/repo:pr:42 -m "Merged"
 lam pending resolve "$ID" -m "Finished"
-
-# Move an existing open item between Requests and Pending.
-lam pending move "$ID"
-lam pending unmove "$ID"
 ```
 
-Pending items are silent, with no ntfy/FCM/bell alerts, and hidden from `lam list` and Requests. `lam pending list [--json]` shows them. `pending add TITLE --key KEY [-n NAME] [-b BODY] [-l URL]` creates an FYI without a recommendation or wait. `lam push ... --pending [--key KEY]` keeps the chosen kind and its validation.
-
-`--key` is a stable dedupe key. The same open key upserts title/body/link/priority and returns the same id; after it closes the key can be reused. Resolve with `lam pending resolve ID` or `lam pending resolve --key KEY`, optionally adding `-m NOTE`. Resolution prints the updated item as JSON. Close completed trackers; leave decisions and approvals to Carlos.
-
-`lam pending move ID` moves an open item into Pending; `lam pending unmove ID` returns it to Requests without re-alerting. Moving preserves origin fields and cancels any critical phone notification while the item stays open. In the TUI, `p` toggles the lane, and `Ctrl+1` through `Ctrl+3` select Requests, Pending and History. See `docs/pending.md` for the API contract.
+Pending items are silent, with no ntfy/FCM/bell alerts, and hidden from `lam list` and Requests. `lam pending list [--json]` shows open pending items. Resolve accepts an id or an old tracker's stable external key, plus an optional `-m NOTE`, and prints the updated item as JSON. Leave decisions and approvals to Carlos. See `docs/pending.md` for the API contract.
