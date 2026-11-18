@@ -32,6 +32,7 @@ async fn setup() -> (MockServer, tempfile::TempDir) {
 fn lam(dir: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_lam"))
         .env("LAM_CONFIG", dir.path().join("config.toml"))
+        .env("XDG_CACHE_HOME", dir.path())
         .env("LAM_NAME", "test:agent")
         .args(args)
         .output()

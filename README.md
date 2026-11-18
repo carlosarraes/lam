@@ -33,6 +33,8 @@ The schema must land first because the new Worker reads the recommendation colum
 
 Pushing the same agent name, title, body, priority, ordered choices, ordered checks, link, exact TTL seconds, recommendation, and recommended choice while the original is still open returns the existing item (HTTP 200, same id) instead of queueing a second one. Source host and project are metadata, not identity, so a retry from another machine still cannot double-notify.
 
+That de-dup is what makes `lam push` retry safely. Connect errors, timeouts, HTTP 408/429 and 5xx are retried up to 4 attempts with exponential backoff plus jitter, within a 30s total budget, and each retry prints one stderr line. Other 4xx fail immediately. On final failure `lam push` exits 1 and writes `$XDG_CACHE_HOME/lam/last-error.json` (default `~/.cache/lam/last-error.json`) with `command`, `status` (HTTP code or null), `error`, `retryable`, `attempts`, `elapsed_ms` and `timestamp`, and never the token. Tests shrink the timing with `LAM_PUSH_RETRY_BASE_MS` (first backoff, default 1000) and `LAM_PUSH_RETRY_BUDGET_MS` (total budget, default 30000).
+
 Item bodies are markdown. In the TUI, `m` opens a side-by-side reader (list left, rendered markdown right) with `J`/`K`, `PgUp`/`PgDn` and `g`/`G` to scroll — so an agent can send a whole plan, not a teaser.
 
 ## Agent names
@@ -51,7 +53,7 @@ FYIs accept one optional text reply from Android's **Reply** action, `r` in the 
 | `lam wait <id>… \| --any [--timeout 2h]` | first item to change (a check ticked) or close, as JSON; `--any` covers every open item under this agent's name; exit 0 resolved/changed / 2 dismissed / 3 timeout / 4 expired / 5 retracted |
 | `lam retract <id>`, `lam check add <id> <label>` | agent withdraws its ask / appends a check |
 | `lam check tick\|untick <id> <n>` | Carlos's side, from the terminal |
-| `lam list [--all] [--json]`, `lam show <id>` | |
+| `lam list [--open\|--all] [-n NAME] [--json\|--ids\|--count]`, `lam show <id>` | open by default; `--name` keeps items whose agent name equals NAME ignoring case; `--ids` prints one id per line, `--count` only the number |
 | `lam done <id> [choice] [-m text]`, `lam dismiss <id>` | Carlos's side |
 | `lam` / `lam tui` | interactive queue in the terminal: `1-3` choose, `Enter` done or mark FYI seen, `Space` tick the next check, `Tab` + `j/k` pick a check, `r` reply text, `d` dismiss, `o` open link, `m` markdown reader, `/` filter by agent; `p` moves an item to or from Pending; `h`/`l` cycle Requests, Pending and History, or `Ctrl+1` through `Ctrl+3` select a tab; live updates |
 | `lam watch` | mirror ntfy → desktop notifications |

@@ -85,6 +85,7 @@ async fn setup() -> (MockServer, tempfile::TempDir) {
 fn lam(dir: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_lam"))
         .env("LAM_CONFIG", dir.path().join("config.toml"))
+        .env("XDG_CACHE_HOME", dir.path())
         .env("LAM_NAME", "test:agent")
         .args(args)
         .output()
@@ -419,6 +420,7 @@ async fn signal_pairing(
 ) -> (std::process::Output, std::time::Duration) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lam"))
         .env("LAM_CONFIG", dir.path().join("config.toml"))
+        .env("XDG_CACHE_HOME", dir.path())
         .args(["pair"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -811,6 +813,7 @@ async fn push_rejects_oversized_fields_locally_with_readable_errors() {
     for (args, expected) in cases {
         let out = Command::new(env!("CARGO_BIN_EXE_lam"))
             .env("LAM_CONFIG", dir.path().join("config.toml"))
+            .env("XDG_CACHE_HOME", dir.path())
             .env("LAM_NAME", "test:agent")
             .args(args)
             .output()
@@ -1174,6 +1177,7 @@ async fn push_without_any_name_source_fails_with_guidance() {
     let (_server, dir) = setup().await;
     let out = Command::new(env!("CARGO_BIN_EXE_lam"))
         .env("LAM_CONFIG", dir.path().join("config.toml"))
+        .env("XDG_CACHE_HOME", dir.path())
         .env_remove("LAM_NAME")
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")

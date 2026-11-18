@@ -232,11 +232,8 @@ impl Client {
         self
     }
 
-    fn get(&self, path: &str) -> RequestBuilder {
-        let req = self
-            .http
-            .get(format!("{}{}", self.base, path))
-            .bearer_auth(&self.token);
+    /// Clamp the request timeout so no single request outlives the caller's deadline.
+    fn bounded(&self, req: RequestBuilder) -> RequestBuilder {
         match self.deadline {
             Some(deadline) => req.timeout(
                 deadline
@@ -248,10 +245,20 @@ impl Client {
         }
     }
 
+    fn get(&self, path: &str) -> RequestBuilder {
+        self.bounded(
+            self.http
+                .get(format!("{}{}", self.base, path))
+                .bearer_auth(&self.token),
+        )
+    }
+
     fn post(&self, path: &str) -> RequestBuilder {
-        self.http
-            .post(format!("{}{}", self.base, path))
-            .bearer_auth(&self.token)
+        self.bounded(
+            self.http
+                .post(format!("{}{}", self.base, path))
+                .bearer_auth(&self.token),
+        )
     }
 
     fn patch(&self, path: &str) -> RequestBuilder {

@@ -4,6 +4,7 @@ mod config;
 mod herdr;
 mod name;
 mod notify;
+mod retry;
 mod tui;
 mod watch;
 
@@ -46,7 +47,9 @@ enum Cmd {
         #[arg(long)]
         topic: String,
     },
-    /// Queue an item; prints its id
+    /// Queue an item; prints its id.
+    /// Connect errors, timeouts, HTTP 408/429 and 5xx retry up to 4 attempts with jittered
+    /// backoff within 30s; on final failure details go to ~/.cache/lam/last-error.json
     Push {
         title: String,
         /// Request an answer or publish an informational update
@@ -124,10 +127,23 @@ enum Cmd {
     Pending(PendingCmd),
     /// List items (open by default)
     List {
-        #[arg(short, long)]
+        /// Include closed items
+        #[arg(short, long, conflicts_with = "open")]
         all: bool,
+        /// Only open items (the default)
         #[arg(long)]
+        open: bool,
+        /// Only items pushed under this agent name (case-insensitive exact match)
+        #[arg(short = 'n', long)]
+        name: Option<String>,
+        #[arg(long, conflicts_with_all = ["ids", "count"])]
         json: bool,
+        /// Print only the matching ids, one per line
+        #[arg(long, conflicts_with = "count")]
+        ids: bool,
+        /// Print only the number of matching items
+        #[arg(long)]
+        count: bool,
     },
     /// Show one item as JSON
     Show { id: String },
@@ -310,7 +326,26 @@ fn run(cmd: Cmd) -> Result<i32> {
         }
         Cmd::Pending(PendingCmd::Move { id }) => commands::pending_move(&id, true),
         Cmd::Pending(PendingCmd::Unmove { id }) => commands::pending_move(&id, false),
-        Cmd::List { all, json } => commands::list(all, json),
+        Cmd::List {
+            all,
+            open: _,
+            name,
+            json,
+            ids,
+            count,
+        } => commands::list(commands::ListArgs {
+            all,
+            name,
+            output: if json {
+                commands::ListOutput::Json
+            } else if ids {
+                commands::ListOutput::Ids
+            } else if count {
+                commands::ListOutput::Count
+            } else {
+                commands::ListOutput::Table
+            },
+        }),
         Cmd::Show { id } => commands::show(&id),
         Cmd::Done {
             id,

@@ -186,7 +186,7 @@ pub fn push(a: PushArgs) -> Result<i32> {
         .map(parse_duration)
         .transpose()?
         .map(|d| d.as_secs());
-    let item = client()?.push(&NewItem {
+    let item = push_with_retry(&NewItem {
         kind: a.kind,
         name,
         title: a.title,
@@ -213,6 +213,81 @@ pub fn push(a: PushArgs) -> Result<i32> {
     }
     println!("{}", item.id);
     Ok(0)
+}
+
+const PUSH_ATTEMPTS: u32 = 4;
+
+fn env_millis(name: &str, default: u64) -> Result<Duration> {
+    let millis = match std::env::var(name) {
+        Ok(raw) => raw
+            .parse()
+            .with_context(|| format!("{name} must be a whole number of milliseconds"))?,
+        Err(_) => default,
+    };
+    Ok(Duration::from_millis(millis))
+}
+
+/// Retrying is safe: the server returns the existing open item for an identical push (or the
+/// keyed item for --key), so a push whose response was lost never queues twice.
+fn push_with_retry(item: &NewItem) -> Result<Item> {
+    let started = Instant::now();
+    let deadline = started + env_millis("LAM_PUSH_RETRY_BUDGET_MS", 30_000)?;
+    let policy = crate::retry::Policy {
+        deadline,
+        max_attempts: PUSH_ATTEMPTS,
+        base: env_millis("LAM_PUSH_RETRY_BASE_MS", 1_000)?,
+        cap: Duration::from_secs(8),
+        jitter: true,
+    };
+    let c = client()?.with_deadline(deadline);
+    let gave_up = match crate::retry::run(&policy, || c.push(item)) {
+        Ok(item) => return Ok(item),
+        Err(gave_up) => gave_up,
+    };
+    let elapsed = started.elapsed();
+    let error = gave_up
+        .last
+        .unwrap_or_else(|| anyhow::anyhow!("retry budget exhausted before the first attempt"));
+    let status = error
+        .downcast_ref::<ServerError>()
+        .map(|error| error.status.as_u16());
+    let record = serde_json::json!({
+        "command": "push",
+        "status": status,
+        "error": crate::retry::one_line(&error),
+        "retryable": gave_up.transient,
+        "attempts": gave_up.attempts,
+        "elapsed_ms": elapsed.as_millis() as u64,
+        "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    });
+    let saved = match write_last_error(&record) {
+        Ok(path) => format!("details in {}", path.display()),
+        Err(write_error) => format!("could not save details: {write_error:#}"),
+    };
+    bail!(
+        "push failed after {} attempt{} in {:.1}s: {}; {saved}",
+        gave_up.attempts,
+        if gave_up.attempts == 1 { "" } else { "s" },
+        elapsed.as_secs_f64(),
+        crate::retry::one_line(&error)
+    )
+}
+
+/// `$XDG_CACHE_HOME/lam/last-error.json`, falling back to `~/.cache/lam/last-error.json`.
+fn last_error_path() -> Result<std::path::PathBuf> {
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".cache")))
+        .context("neither XDG_CACHE_HOME nor HOME is set")?;
+    Ok(cache.join("lam").join("last-error.json"))
+}
+
+fn write_last_error(record: &serde_json::Value) -> Result<std::path::PathBuf> {
+    let path = last_error_path()?;
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::write(&path, serde_json::to_string_pretty(record)? + "\n")?;
+    Ok(path)
 }
 
 /// Git repo dir name if inside one, else the cwd name.
@@ -258,31 +333,20 @@ fn my_open_ids(c: &Client, name: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-fn retry_until<T>(deadline: Instant, mut request: impl FnMut() -> Result<T>) -> Result<Option<T>> {
-    let mut backoff = Duration::from_secs(1);
-    loop {
-        if Instant::now() >= deadline {
-            return Ok(None);
-        }
-        match request() {
-            Ok(value) => return Ok(Some(value)),
-            Err(error) if crate::client::is_transient(&error) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Ok(None);
-                }
-                let delay = backoff.min(remaining);
-                let error = error
-                    .to_string()
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                eprintln!("lam: {error}; retrying in {:.1}s", delay.as_secs_f64());
-                std::thread::sleep(delay);
-                backoff = (backoff * 2).min(Duration::from_secs(30));
-            }
-            Err(error) => return Err(error),
-        }
+fn retry_until<T>(deadline: Instant, request: impl FnMut() -> Result<T>) -> Result<Option<T>> {
+    let policy = crate::retry::Policy {
+        deadline,
+        max_attempts: u32::MAX,
+        base: Duration::from_secs(1),
+        cap: Duration::from_secs(30),
+        jitter: false,
+    };
+    match crate::retry::run(&policy, request) {
+        Ok(value) => Ok(Some(value)),
+        Err(gave_up) => match gave_up.last {
+            Some(error) if !gave_up.transient => Err(error),
+            _ => Ok(None),
+        },
     }
 }
 
@@ -359,9 +423,37 @@ pub fn wait(
     }
 }
 
-pub fn list(all: bool, json: bool) -> Result<i32> {
-    let items = client()?.list(if all { None } else { Some("open") })?;
-    print_items(&items, json)
+pub enum ListOutput {
+    Table,
+    Json,
+    Ids,
+    Count,
+}
+
+pub struct ListArgs {
+    pub all: bool,
+    pub name: Option<String>,
+    pub output: ListOutput,
+}
+
+pub fn list(a: ListArgs) -> Result<i32> {
+    let mut items = client()?.list(if a.all { None } else { Some("open") })?;
+    if let Some(name) = &a.name {
+        let name = name.to_lowercase();
+        items.retain(|item| item.name.to_lowercase() == name);
+    }
+    match a.output {
+        ListOutput::Table => print_items(&items, false),
+        ListOutput::Json => print_items(&items, true),
+        ListOutput::Ids => {
+            items.iter().for_each(|item| println!("{}", item.id));
+            Ok(0)
+        }
+        ListOutput::Count => {
+            println!("{}", items.len());
+            Ok(0)
+        }
+    }
 }
 
 fn print_items(items: &[Item], json: bool) -> Result<i32> {
