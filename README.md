@@ -21,6 +21,19 @@ agent ──lam push──▶ lam-api (CF Worker: Effect + D1 + Topic DO) ──
 3. Phone: install the ntfy app (Play/F-Droid), *Add subscription* → topic `<NTFY_TOPIC>` → *Use another server* → `https://lam-api.<acct>.workers.dev`. No account. The app keeps one streaming connection ("instant delivery").
 4. Desktop: `lam` opens the TUI to answer items; run `lam watch` (systemd user unit / launchd) for notifications.
 
+## Install and release
+
+Install a prebuilt CLI (macOS Apple Silicon/Intel, Linux x86_64) into `~/.local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/carlosarraes/lam/main/install.sh | sh             # latest
+curl -fsSL https://raw.githubusercontent.com/carlosarraes/lam/main/install.sh | sh -s -- 0.1.3 # pinned (or LAM_VERSION=0.1.3)
+```
+
+The installer verifies the archive against the release's `SHA256SUMS` and swaps the binary in with a rename. `LAM_INSTALL_DIR` changes the target directory. The installer does not copy the config or the skill. `just deploy HOST` still handles both.
+
+To release, run `just release 0.1.3` from a clean `main` that matches `upstream/main`. It bumps `cli/Cargo.toml` and `cli/Cargo.lock`, runs `just check`, commits `chore: release v0.1.3`, and pushes `main` and the tag atomically. The `v*` tag triggers `.github/workflows/release.yml`, which builds `lam-<target>.tar.gz` for each target on its native runner. The workflow publishes those archives and `SHA256SUMS` as a GitHub release, so Mac binaries are never built on a local Mac.
+
 ## Rollout and rollback
 
 Deploy in this order:

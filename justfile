@@ -75,6 +75,11 @@ deploy-all: build
 # Worker + every machine: the one command after any change
 sync: deploy-worker deploy-all
 
+# Bump the version, verify, commit, tag, and push main; CI publishes binaries.
+[positional-arguments]
+release VERSION:
+    bash scripts/release.sh "$1"
+
 # Print version, commit and install dir
 info:
     @echo "lam v{{version}} ({{commit}})"
